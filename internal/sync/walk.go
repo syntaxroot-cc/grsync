@@ -18,14 +18,19 @@ import (
 // interoperability, so paths are normalized at collection time rather than
 // left OS-native and converted later.
 type FileEntry struct {
-	Path       string
-	Size       int64
-	ModTime    time.Time
-	Mode       fs.FileMode
-	UID        uint32
-	GID        uint32
-	LinkTarget string
-	IsDir      bool
+	Path    string
+	Size    int64
+	ModTime time.Time
+	Mode    fs.FileMode
+	UID     uint32
+	GID     uint32
+	// OwnershipAvailable reports whether UID/GID were actually populated.
+	// A real uid/gid of 0 (root) is a valid value, so callers must check
+	// this rather than treating a zero UID/GID as "unavailable" — see
+	// uidgid_windows.go, where it is always false.
+	OwnershipAvailable bool
+	LinkTarget         string
+	IsDir              bool
 }
 
 // WalkOptions controls how far Walk descends, mirroring rsync's own
@@ -92,9 +97,10 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 
 		// lookupUIDGID is platform-specific (see uidgid_unix.go /
 		// uidgid_windows.go): on Windows it always reports unavailable,
-		// leaving UID/GID at their zero value. That zero must not be read
-		// as "owned by root" — see uidgid_windows.go for why.
-		entry.UID, entry.GID, _ = lookupUIDGID(info)
+		// leaving UID/GID at their zero value. OwnershipAvailable carries
+		// that ok flag through so callers can't mistake the zero value for
+		// a real uid/gid of 0 (root) — see uidgid_windows.go for why.
+		entry.UID, entry.GID, entry.OwnershipAvailable = lookupUIDGID(info)
 
 		// info.Mode()&fs.ModeSymlink is only ever set by Lstat (Stat
 		// resolves through it), which is exactly why Lstat was required

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -154,6 +155,30 @@ func TestWalk_RecursiveAndDirsFlags(t *testing.T) {
 			t.Errorf("paths = %v, want %v", got, want)
 		}
 	})
+}
+
+func TestWalk_OwnershipAvailable(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "file.txt"), "content")
+
+	entries, err := Walk(root, WalkOptions{Recursive: true})
+	if err != nil {
+		t.Fatalf("Walk returned error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1: %v", len(entries), entries)
+	}
+	entry := entries[0]
+
+	// Windows has no POSIX uid/gid concept; every other platform this repo
+	// builds for does (see uidgid_unix.go / uidgid_windows.go).
+	wantAvailable := runtime.GOOS != "windows"
+	if entry.OwnershipAvailable != wantAvailable {
+		t.Errorf("OwnershipAvailable = %v, want %v (GOOS=%s)", entry.OwnershipAvailable, wantAvailable, runtime.GOOS)
+	}
+	if runtime.GOOS == "windows" && (entry.UID != 0 || entry.GID != 0) {
+		t.Errorf("UID/GID = %d/%d, want 0/0 when OwnershipAvailable is false", entry.UID, entry.GID)
+	}
 }
 
 func TestWalk_VaryingFileSizes(t *testing.T) {

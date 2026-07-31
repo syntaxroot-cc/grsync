@@ -50,9 +50,9 @@ first-match-wins semantics.
 
 ## File Enumeration
 
-`internal/sync.Walk` recursively lists a source tree into a sorted
-`[]FileEntry` (path, size, mtime, mode, uid/gid, symlink target). Symlinks
-are captured via `Lstat`, never followed.
+`sync.Walk`, in the `internal/sync` package, recursively lists a source tree
+into a sorted `[]FileEntry` (path, size, mtime, mode, uid/gid, symlink
+target). Symlinks are captured via `Lstat`, never followed.
 
 `-r`/`-d` control how far it descends:
 
