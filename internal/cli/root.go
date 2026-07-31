@@ -1,8 +1,8 @@
-// Package cli defines the grsync command-line interface: argument parsing,
-// flags, and the command tree. It does not perform any sync or transport
-// logic itself - it only collects options and hands them off (see the
-// options struct printed in Run below, which will later be passed to
-// internal/sync).
+// Package cli defines the grsync command-line interface: argument
+// parsing, flags, and the command tree. Flag/argument parsing lives here;
+// the actual sync (internal/pipeline, built on internal/sync and
+// internal/transport) is invoked from sync.go, keeping "what the user
+// typed" separate from "what actually runs."
 package cli
 
 import (
@@ -10,8 +10,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-
-	"github.com/syntaxroot-cc/grsync/internal/transport"
 )
 
 // FilterRuleType identifies which kind of rule a FilterRule represents.
@@ -52,6 +50,11 @@ type options struct {
 	dryRun      bool
 	delete      bool
 	progress    bool
+	perms       bool
+	times       bool
+	owner       bool
+	group       bool
+	links       bool
 	filterRules []FilterRule
 	rsh         string
 	server      bool
@@ -96,24 +99,34 @@ func NewRootCmd() *cobra.Command {
 		Use:   "grsync <source>... <destination>",
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
-			"At this stage it only parses arguments and flags; no files are copied yet.",
-		// --server takes no positional source/destination args at all: it
-		// is how a remote-invoked grsync (e.g. `ssh host grsync --server`)
-		// switches into speaking internal/transport's protocol over its
-		// own stdin/stdout, rather than a normal source/destination sync.
-		// A plain MinimumNArgs(2) would reject that invocation outright.
+			"Local-to-local and local-to-remote (SSH) syncs are supported; " +
+			"--dry-run, compression, progress reporting, and full --delete are not yet.",
+		// --server takes exactly one positional arg (the destination path)
+		// rather than the normal <source>...<destination> shape: it is how
+		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
+		// switches into speaking internal/pipeline's protocol over its own
+		// stdin/stdout against that destination, instead of a normal sync.
 		Args: func(cmd *cobra.Command, args []string) error {
 			if opts.server {
-				return nil
+				return cobra.ExactArgs(1)(cmd, args)
 			}
 			return cobra.MinimumNArgs(2)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.server {
-				return transport.ServeHandshake(cmd.InOrStdin(), cmd.OutOrStdout())
+				return runServer(cmd, args[0], opts)
 			}
 			sources, destination := args[:len(args)-1], args[len(args)-1]
-			return run(cmd, sources, destination, opts)
+			if opts.dryRun {
+				// A real dry-run (list what would change, transfer
+				// nothing) is explicitly out of scope for now - falling
+				// through to a real sync here would silently do the
+				// opposite of what --dry-run promises, which is worse
+				// than not supporting it yet. Until real dry-run support
+				// lands, this stays on the flag-echoing placeholder.
+				return run(cmd, sources, destination, opts)
+			}
+			return runSync(cmd, sources, destination, opts)
 		},
 	}
 
@@ -136,6 +149,11 @@ func NewRootCmd() *cobra.Command {
 		"exclude-from", "read exclude patterns from FILE, one per line (repeatable, order preserved)")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleIncludeFrom, rules: &opts.filterRules},
 		"include-from", "read include patterns from FILE, one per line (repeatable, order preserved)")
+	flags.BoolVarP(&opts.perms, "perms", "p", false, "preserve permissions (implied by --archive)")
+	flags.BoolVarP(&opts.times, "times", "t", false, "preserve modification times (implied by --archive)")
+	flags.BoolVarP(&opts.owner, "owner", "o", false, "preserve owner (implied by --archive; requires appropriate privileges)")
+	flags.BoolVarP(&opts.group, "group", "g", false, "preserve group (implied by --archive; requires appropriate privileges)")
+	flags.BoolVarP(&opts.links, "links", "l", false, "recreate symlinks as symlinks (implied by --archive)")
 	flags.StringVarP(&opts.rsh, "rsh", "e", "",
 		"specify the remote shell to use, e.g. \"ssh -p 2222 -i key.pem\" (default: ssh); "+
 			"the sole way to customize port/identity/proxy for remote transport, matching rsync")
@@ -179,11 +197,17 @@ func run(cmd *cobra.Command, sources []string, destination string, opts *options
 			"dry-run:     %t\n"+
 			"delete:      %t\n"+
 			"progress:    %t\n"+
+			"perms:       %t\n"+
+			"times:       %t\n"+
+			"owner:       %t\n"+
+			"group:       %t\n"+
+			"links:       %t\n"+
 			"rsh:         %q\n"+
 			"filters:     %s\n",
 		sources, destination,
 		opts.archive, opts.verbose, opts.compress, opts.recursive, opts.dirs, opts.dryRun,
-		opts.delete, opts.progress, opts.rsh, rules.String(),
+		opts.delete, opts.progress, opts.perms, opts.times, opts.owner, opts.group, opts.links,
+		opts.rsh, rules.String(),
 	)
 
 	_, err := fmt.Fprint(cmd.OutOrStdout(), summary)
