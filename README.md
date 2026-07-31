@@ -4,18 +4,16 @@ An rsync-inspired file synchronization tool written in Go.
 
 ## Status
 
-CLI parsing, file enumeration, filter-rule matching, the delta-transfer
-algorithm, file attribute preservation, and the SSH transport primitives
-are implemented; nothing is wired together into an actual sync yet.
-`internal/sync` can list a source tree (`sync.Walk`), filter it
-(`sync.FilterEntries`), compute/apply binary deltas between two versions
-of a file (`sync.GenerateDelta`/`sync.ApplyDelta`), and apply
-permissions/times/ownership/symlinks/hard links (`sync.ApplyAttributes`
-and friends). `internal/transport` can parse remote endpoints, spawn and
-frame a connection to a remote `grsync --server`, and complete a minimal
-handshake over it. But the CLI's normal sync path still only echoes parsed
-flags - none of this is wired into an actual end-to-end sync yet (see
-[SSH Transport](#ssh-transport) below for exactly what that gap is).
+**grsync can actually sync files now** - local-to-local and local-to-remote
+(SSH) - for the first time in this project's history, not just a
+collection of independently tested components. `grsync SRC... DEST`
+really walks, filters, diffs, transfers, and reconstructs files, applying
+requested attributes along the way. See
+[End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
+how the pieces connect and, just as importantly, what's still explicitly
+out of scope (compression, progress reporting, `--dry-run`, partial/
+append transfers, batch mode, full `--delete`, hard links, and device/
+special files) - this is real, working sync, not yet full feature parity.
 
 ## Build
 
@@ -54,6 +52,11 @@ argument is always the destination.
 | `--exclude-from FILE` | | read exclude patterns from FILE, one per line (repeatable) |
 | `--include-from FILE` | | read include patterns from FILE, one per line (repeatable) |
 | `--rsh COMMAND` | `-e` | remote shell to use for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` (default: `ssh`) |
+| `--perms` | `-p` | preserve permissions (implied by `--archive`) |
+| `--times` | `-t` | preserve modification times (implied by `--archive`) |
+| `--owner` | `-o` | preserve owner (implied by `--archive`; requires appropriate privileges) |
+| `--group` | `-g` | preserve group (implied by `--archive`; requires appropriate privileges) |
+| `--links` | `-l` | recreate symlinks as symlinks (implied by `--archive`) |
 
 All five filter-related flags share one ordered rule list - their relative
 order on the command line is preserved, matching rsync's first-match-wins
@@ -199,41 +202,112 @@ as already configured, instead of being reimplemented.
   corrupt or hostile length prefix).
 - **`--server` mode**: hidden from `--help` (like rsync's own `--server`),
   this is how a remotely-invoked grsync switches into speaking the
-  protocol instead of doing a normal sync. Right now it implements only a
-  minimal handshake (`transport.ServeHandshake`/`transport.Handshake`) - enough to
-  prove the subprocess, pipes, and framing work correctly end to end
-  through a real `ssh` connection, not a full remote sync.
+  protocol instead of doing a normal sync. It now runs the handshake
+  *and* the full receiver pipeline (see
+  [End-to-End Sync Pipeline](#end-to-end-sync-pipeline)) against the
+  destination path passed as its one positional argument.
+- **Remote invocation assumes `grsync` is on the remote `PATH`**, exactly
+  like real rsync assumes `rsync` is (no `--rsync-path`-equivalent
+  override exists yet). `internal/cli/syncToRemote` invokes the remote
+  side as `ssh ... grsync --server DEST`, not a locally-resolved path -
+  this is a real, documented deployment assumption, not an oversight.
 
-**What's genuinely missing, not just untested:** nothing in the normal
-(non-`--server`) CLI path detects a remote `user@host:path` argument or
-calls `transport.Dial`/`transport.Handshake` -
-`transport.ParseRemotePath`, `transport.BuildRSHCommand`,
-`transport.Dial`, and `transport.Handshake` are all implemented and
-independently tested, but not yet invoked from a real sync. Wiring an
-actual file-list/signature/delta exchange on top of this frame/session
-foundation - so a remote sync really happens - is separately-scoped
-follow-up work, not part of this ticket.
+**Testing note**: two tests exercise real `ssh` against `127.0.0.1`
+(`TestSSHLocalhost_HandshakeRoundTrip` in `internal/transport`,
+`TestSSHLocalhost_SyncRoundTrip` in `internal/pipeline`, the latter
+built the real binary and driving a full sync through it), both skipping
+gracefully if no SSH server is reachable there non-interactively. No such
+server was available in this development environment (an `ssh` client is
+present, but nothing was listening), so while both are believed correct
+by code review and by mirroring an already-working pattern, neither has
+been observed to pass against a live server.
 
-**Testing note**: `TestSSHLocalhost_HandshakeRoundTrip` builds the real
-`grsync` binary and drives the full `transport.Dial`/`transport.Session`/
-`transport.Handshake` path through actual `ssh` against `127.0.0.1`,
-skipping gracefully if no SSH server is reachable there
-non-interactively. No such server was available in this development
-environment (an `ssh` client is present, but nothing
-was listening), so while the test is believed correct by code review, it
-has not been observed to pass against a live server.
+## End-to-End Sync Pipeline
+
+`internal/pipeline` is the new package that wires `internal/sync` and
+`internal/transport` together into an actual sync - it imports both, and
+neither of them imports it or each other, keeping that layering intact.
+`pipeline.Sender`/`pipeline.Receiver` run the same protocol whether the
+connection is a real SSH `Session` or, for a local-to-local sync, an
+in-memory `io.Pipe` with both sides running as goroutines in the same
+process - deliberately one code path, not two, so the local case
+(fast to test, no SSH required) exercises the exact logic the harder-to-
+verify remote case depends on.
+
+**Wire encoding**: every message is `encoding/gob`, not upstream rsync's
+actual wire protocol. That's a deliberate scope boundary: rsync's real
+format is an intricate, versioned binary protocol, and reimplementing it
+is separate, substantial work that doesn't belong in this already-large
+integration ticket. gob is a reasonable, low-effort, *correct* choice
+specifically because grsync only ever talks to grsync here, never to real
+rsync - but genuine rsync protocol interoperability, if ever wanted, is
+future work, not something to let "protocol" quietly come to mean "gob."
+
+**Three new frame types**, added to `transport.FrameType` (in
+`internal/transport`):
+`FrameFileList` (sender→receiver, the filtered `[]FileEntry`, sent once),
+`FrameSignature` (receiver→sender, per regular file, sent proactively in
+list order - no separate request message, since the file list itself is
+the implicit request for all of them), and `FrameDelta` (sender→receiver,
+the reply to each signature). Directories and symlinks never enter this
+exchange at all: a directory has no byte content to diff, and a symlink's
+entire "content" is its `LinkTarget`, already present in the file list
+itself - only regular files need a signature/delta round trip.
+
+**A real correctness issue found and fixed during this pass, not just a
+checklist item**: applying a directory's attributes (permissions, mtime)
+immediately upon creating it is wrong, because writing files into it
+afterward changes it again - a restrictive permission mode would block
+creating those children at all, and even a permissive mode's mtime gets
+silently bumped by the filesystem the moment something is created inside
+it, undoing the preservation just performed. `pipeline.Receiver` defers
+directory attribute application to a final pass, applied deepest-first
+(the reverse of `Walk`'s own parent-before-child sort, obtained for free
+rather than needing a second sort). `TestSenderReceiver_DirectoryAttributesSurviveChildCreation`
+proves this: verified to actually fail (mtime bumped to "now") when the
+fix is reverted, not just pass trivially.
+
+**The new-file case** (nothing exists yet at the destination) needs no
+special-casing: `sync.GenerateSignature` on empty/absent data naturally
+produces a `Signature` with zero blocks, which makes `sync.GenerateDelta`
+emit an all-`DataOp` delta - exactly the desired behavior, falling
+straight out of the existing SC-3 API.
+
+**A destination-only file is never touched**: `pipeline.Receiver` only
+ever acts on paths that appear in the list it received from the sender -
+there's no separate destination-side walk to reconcile against it, so
+nothing in this pipeline can delete or modify a file the sender never
+mentioned. (Full `--delete` semantics remain a separate, later ticket.)
+
+**Explicitly out of scope for this pipeline** (some pre-existing gaps,
+restated here so they're not mistaken for oversights specific to this
+ticket): compression, progress reporting, real `--dry-run` (still the
+flag-echoing placeholder, to avoid silently performing a real sync when a
+dry run was requested), partial/append transfers, batch mode, pulling
+from a remote source (only local-source syncs are supported - push, not
+pull), and - carried over from SC-8 - hard links and device/special
+files. `sync.DetectHardLinks`/`sync.ApplyHardLinks`/`sync.ApplySpecialFile`
+exist and are tested, but nothing in `pipeline.Receiver` calls them yet;
+wiring them in is a reasonable, low-risk follow-up (hard links
+particularly, since unlike device files it needs no elevated privilege)
+but was left out of this already-large integration ticket rather than
+expanding its scope further.
 
 ## Architecture
 
 - `cmd/grsync` - CLI entrypoint.
-- `internal/cli` - flag/argument parsing (built on cobra).
+- `internal/cli` - flag/argument parsing (built on cobra) and now the
+  real sync entry point (`sync.go`): local-to-local runs the pipeline
+  in-process over an `io.Pipe`, local-to-remote spawns and drives it over
+  an SSH `Session`.
+- `internal/pipeline` - wires `internal/sync` and `internal/transport`
+  together into an actual sync; see
+  [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) above.
 - `internal/sync` - file-list generation, filter matching, the
-  delta-transfer algorithm, and attribute preservation today; wiring
-  these together into an actual sync comes later.
+  delta-transfer algorithm, and attribute preservation.
 - `internal/transport` - remote endpoint parsing, RSH command
-  construction, frame protocol, subprocess session management, and a
-  minimal `--server` handshake today; the full remote sync pipeline
-  (file list/signature/delta exchange) is not wired up yet.
+  construction, frame protocol, subprocess session management, and the
+  `--server` handshake.
 
 Goal: full feature parity with upstream rsync, including protocol/format
 interoperability where specified (e.g. batch mode's file format).

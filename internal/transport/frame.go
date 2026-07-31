@@ -13,17 +13,28 @@ import (
 type FrameType byte
 
 const (
-	// FrameHello and FrameHelloAck are this ticket's minimal --server
-	// handshake: the client sends FrameHello, the server replies with
-	// FrameHelloAck. Later tickets add the frame types an actual sync
-	// needs (file list, signature, delta ops); this ticket only proves
-	// the pipe, subprocess, and framing work end to end.
+	// FrameHello and FrameHelloAck are the minimal --server handshake:
+	// the client sends FrameHello, the server replies with FrameHelloAck.
 	FrameHello FrameType = iota
 	// FrameHelloAck is the server's reply to FrameHello.
 	FrameHelloAck
 	// FrameError carries a human-readable error message from one side to
 	// the other, rather than the connection just dying silently.
 	FrameError
+	// FrameFileList carries a gob-encoded []sync.FileEntry, sent once by
+	// the sender after a successful handshake: the filtered list of
+	// everything it intends to sync. internal/pipeline owns the encoding;
+	// this package only tags and frames the bytes.
+	FrameFileList
+	// FrameSignature carries a gob-encoded per-file signature, sent by
+	// the receiver for each regular-file entry in the list it received -
+	// proactively, in list order, not in response to a separate request
+	// message (the file list itself is the implicit request for all of
+	// them).
+	FrameSignature
+	// FrameDelta carries a gob-encoded per-file delta (the sender's reply
+	// to a FrameSignature), in the same list order.
+	FrameDelta
 )
 
 // maxFramePayload bounds how large a single frame's payload may be. A
