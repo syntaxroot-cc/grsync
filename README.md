@@ -5,14 +5,17 @@ An rsync-inspired file synchronization tool written in Go.
 ## Status
 
 CLI parsing, file enumeration, filter-rule matching, the delta-transfer
-algorithm, and file attribute preservation are implemented; nothing is
-wired together into an actual sync yet. `internal/sync` can list a source
-tree (`sync.Walk`), filter it (`sync.FilterEntries`), compute/apply binary
-deltas between two versions of a file
-(`sync.GenerateDelta`/`sync.ApplyDelta`), and apply permissions/times/
-ownership/symlinks/hard links (`sync.ApplyAttributes` and friends) - but
-the CLI only echoes parsed flags, and `internal/transport` is still empty,
-so none of this runs end to end yet.
+algorithm, file attribute preservation, and the SSH transport primitives
+are implemented; nothing is wired together into an actual sync yet.
+`internal/sync` can list a source tree (`sync.Walk`), filter it
+(`sync.FilterEntries`), compute/apply binary deltas between two versions
+of a file (`sync.GenerateDelta`/`sync.ApplyDelta`), and apply
+permissions/times/ownership/symlinks/hard links (`sync.ApplyAttributes`
+and friends). `internal/transport` can parse remote endpoints, spawn and
+frame a connection to a remote `grsync --server`, and complete a minimal
+handshake over it. But the CLI's normal sync path still only echoes parsed
+flags - none of this is wired into an actual end-to-end sync yet (see
+[SSH Transport](#ssh-transport) below for exactly what that gap is).
 
 ## Build
 
@@ -50,6 +53,7 @@ argument is always the destination.
 | `--filter RULE` | | add a filter rule (repeatable) |
 | `--exclude-from FILE` | | read exclude patterns from FILE, one per line (repeatable) |
 | `--include-from FILE` | | read include patterns from FILE, one per line (repeatable) |
+| `--rsh COMMAND` | `-e` | remote shell to use for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` (default: `ssh`) |
 
 All five filter-related flags share one ordered rule list - their relative
 order on the command line is preserved, matching rsync's first-match-wins
@@ -161,6 +165,64 @@ capture.
   rather than attempting a syscall that fails for most callers and
   calling that "support."
 
+## SSH Transport
+
+`internal/transport` reaches a remote grsync the same way upstream rsync
+does: by spawning a remote-shell subprocess (`ssh` by default) and
+speaking a protocol over its stdin/stdout, rather than a native Go SSH
+client. This was a deliberate choice, not just the default option: the
+`--rsh`/`-e` flag's real meaning in rsync only makes sense if grsync is
+actually invoking an arbitrary shell command, and shelling out means
+`~/.ssh/config`, `ssh-agent`, and `known_hosts` all keep working exactly
+as already configured, instead of being reimplemented.
+
+- **Endpoint syntax**: `transport.ParseRemotePath` recognizes
+  `[user@]host:path`, including IPv6 literals (`user@[::1]:path`), while
+  correctly treating a Windows drive letter (`C:\...`) as local rather
+  than a remote host.
+- **`--rsh`/`-e`** is the *only* customization mechanism for the remote
+  shell - there's no separate `--port` or `--identity` flag. This matches
+  real rsync: upstream's `--port` only applies to daemon-mode (`rsync://`)
+  connections, and its `-i` flag already means `--itemize-changes`, not
+  "identity file." Port/identity/`ProxyJump`/etc. go through `-e` (e.g.
+  `-e "ssh -p 2222 -i key.pem"`) or `~/.ssh/config`, exactly as with real
+  rsync.
+- **Host-key verification** is not reimplemented at all, in either
+  direction: no flag here ever weakens it (no `StrictHostKeyChecking=no`,
+  no null `UserKnownHostsFile`), and none of its logic is duplicated
+  either. Whatever the invoked shell command does by default is exactly
+  what happens - this is genuinely real, not a stub, precisely because
+  nothing here touches it.
+- **Framing**: `transport.WriteFrame`/`transport.ReadFrame` multiplex the single
+  stdin/stdout stream into typed, length-prefixed messages (4-byte
+  length + 1-byte type + payload, capped at 64 MiB per frame against a
+  corrupt or hostile length prefix).
+- **`--server` mode**: hidden from `--help` (like rsync's own `--server`),
+  this is how a remotely-invoked grsync switches into speaking the
+  protocol instead of doing a normal sync. Right now it implements only a
+  minimal handshake (`transport.ServeHandshake`/`transport.Handshake`) - enough to
+  prove the subprocess, pipes, and framing work correctly end to end
+  through a real `ssh` connection, not a full remote sync.
+
+**What's genuinely missing, not just untested:** nothing in the normal
+(non-`--server`) CLI path detects a remote `user@host:path` argument or
+calls `transport.Dial`/`transport.Handshake` -
+`transport.ParseRemotePath`, `transport.BuildRSHCommand`,
+`transport.Dial`, and `transport.Handshake` are all implemented and
+independently tested, but not yet invoked from a real sync. Wiring an
+actual file-list/signature/delta exchange on top of this frame/session
+foundation - so a remote sync really happens - is separately-scoped
+follow-up work, not part of this ticket.
+
+**Testing note**: `TestSSHLocalhost_HandshakeRoundTrip` builds the real
+`grsync` binary and drives the full `transport.Dial`/`transport.Session`/
+`transport.Handshake` path through actual `ssh` against `127.0.0.1`,
+skipping gracefully if no SSH server is reachable there
+non-interactively. No such server was available in this development
+environment (an `ssh` client is present, but nothing
+was listening), so while the test is believed correct by code review, it
+has not been observed to pass against a live server.
+
 ## Architecture
 
 - `cmd/grsync` - CLI entrypoint.
@@ -168,7 +230,10 @@ capture.
 - `internal/sync` - file-list generation, filter matching, the
   delta-transfer algorithm, and attribute preservation today; wiring
   these together into an actual sync comes later.
-- `internal/transport` - (placeholder) data movement, local and remote.
+- `internal/transport` - remote endpoint parsing, RSH command
+  construction, frame protocol, subprocess session management, and a
+  minimal `--server` handshake today; the full remote sync pipeline
+  (file list/signature/delta exchange) is not wired up yet.
 
 Goal: full feature parity with upstream rsync, including protocol/format
 interoperability where specified (e.g. batch mode's file format).

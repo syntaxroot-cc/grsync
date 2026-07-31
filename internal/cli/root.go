@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/syntaxroot-cc/grsync/internal/transport"
 )
 
 // FilterRuleType identifies which kind of rule a FilterRule represents.
@@ -51,6 +53,8 @@ type options struct {
 	delete      bool
 	progress    bool
 	filterRules []FilterRule
+	rsh         string
+	server      bool
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -93,8 +97,21 @@ func NewRootCmd() *cobra.Command {
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
 			"At this stage it only parses arguments and flags; no files are copied yet.",
-		Args: cobra.MinimumNArgs(2),
+		// --server takes no positional source/destination args at all: it
+		// is how a remote-invoked grsync (e.g. `ssh host grsync --server`)
+		// switches into speaking internal/transport's protocol over its
+		// own stdin/stdout, rather than a normal source/destination sync.
+		// A plain MinimumNArgs(2) would reject that invocation outright.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if opts.server {
+				return nil
+			}
+			return cobra.MinimumNArgs(2)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.server {
+				return transport.ServeHandshake(cmd.InOrStdin(), cmd.OutOrStdout())
+			}
 			sources, destination := args[:len(args)-1], args[len(args)-1]
 			return run(cmd, sources, destination, opts)
 		},
@@ -119,6 +136,18 @@ func NewRootCmd() *cobra.Command {
 		"exclude-from", "read exclude patterns from FILE, one per line (repeatable, order preserved)")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleIncludeFrom, rules: &opts.filterRules},
 		"include-from", "read include patterns from FILE, one per line (repeatable, order preserved)")
+	flags.StringVarP(&opts.rsh, "rsh", "e", "",
+		"specify the remote shell to use, e.g. \"ssh -p 2222 -i key.pem\" (default: ssh); "+
+			"the sole way to customize port/identity/proxy for remote transport, matching rsync")
+	flags.BoolVar(&opts.server, "server", false,
+		"run in server mode, speaking the transport protocol over stdin/stdout "+
+			"(internal use only - invoked remotely via --rsh, never typed directly, matching rsync's own --server)")
+	// Hidden, not just undocumented: real rsync's --server is likewise
+	// absent from its own --help output, since it's a protocol
+	// implementation detail, not a user-facing feature to advertise.
+	if err := flags.MarkHidden("server"); err != nil {
+		panic(err) // only fails if "server" isn't a registered flag name, which would be a programming error caught immediately by any test run
+	}
 
 	return cmd
 }
@@ -150,10 +179,11 @@ func run(cmd *cobra.Command, sources []string, destination string, opts *options
 			"dry-run:     %t\n"+
 			"delete:      %t\n"+
 			"progress:    %t\n"+
+			"rsh:         %q\n"+
 			"filters:     %s\n",
 		sources, destination,
 		opts.archive, opts.verbose, opts.compress, opts.recursive, opts.dirs, opts.dryRun,
-		opts.delete, opts.progress, rules.String(),
+		opts.delete, opts.progress, opts.rsh, rules.String(),
 	)
 
 	_, err := fmt.Fprint(cmd.OutOrStdout(), summary)
