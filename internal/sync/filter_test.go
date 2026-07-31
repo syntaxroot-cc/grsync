@@ -71,7 +71,7 @@ func TestCompileRules_Anchoring(t *testing.T) {
 
 func TestCompileRules_InternalSlashAnchorsWithoutLeadingSlash(t *testing.T) {
 	// Real rsync's actual rule: a pattern anchors to the root if it has a
-	// leading "/", OR contains any other "/", OR contains "**" — not just
+	// leading "/", OR contains any other "/", OR contains "**" - not just
 	// on an explicit leading "/". "src/main.go" (no leading slash, but an
 	// internal one) must behave the same as "/src/main.go" here.
 	rules := mustCompile(t, []RawRule{
@@ -165,7 +165,7 @@ func TestIncluded_FirstMatchWinsOrderMatters(t *testing.T) {
 
 	// Same two rules, opposite order: the first one to match should win in
 	// both cases, so swapping the order must flip the outcome. If it
-	// didn't, evaluation wouldn't actually be "first match wins" — it'd be
+	// didn't, evaluation wouldn't actually be "first match wins" - it'd be
 	// "last match wins" or "most specific wins" or something else.
 	includeFirst := mustCompile(t, []RawRule{
 		{Kind: RuleInclude, Pattern: "keep.log"},
@@ -223,7 +223,7 @@ func TestCompileRules_ExcludeFromPreservesPosition(t *testing.T) {
 
 	// Position matters here: the two patterns read from the file must land
 	// between "first.txt" and "last.txt", not get appended after
-	// "last.txt" — that would silently reorder rules relative to what the
+	// "last.txt" - that would silently reorder rules relative to what the
 	// user typed on the command line, breaking first-match-wins semantics.
 	want := []struct {
 		action  Action

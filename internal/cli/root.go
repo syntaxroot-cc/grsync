@@ -1,6 +1,6 @@
 // Package cli defines the grsync command-line interface: argument parsing,
 // flags, and the command tree. It does not perform any sync or transport
-// logic itself — it only collects options and hands them off (see the
+// logic itself - it only collects options and hands them off (see the
 // options struct printed in Run below, which will later be passed to
 // internal/sync).
 package cli
@@ -32,7 +32,7 @@ const (
 // collects them the same way: Type records which flag produced the rule,
 // and relative order across *all* of them is preserved in the order the
 // user supplied them. For the two "-from" kinds, Pattern is a file path,
-// not a filter pattern — internal/sync reads and expands it.
+// not a filter pattern - internal/sync reads and expands it.
 type FilterRule struct {
 	Type    FilterRuleType
 	Pattern string
@@ -55,7 +55,7 @@ type options struct {
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
 // --filter/--exclude-from/--include-from gets its own instance, fixed to a
-// single FilterRuleType, but all of them share the same backing slice — so
+// single FilterRuleType, but all of them share the same backing slice - so
 // pflag's normal "call Set once per occurrence" behavior naturally builds
 // one ordered rule list regardless of which flag name was used at each
 // position.
