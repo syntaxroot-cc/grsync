@@ -42,6 +42,7 @@ type options struct {
 	verbose     bool
 	compress    bool
 	recursive   bool
+	dirs        bool
 	dryRun      bool
 	delete      bool
 	progress    bool
@@ -95,6 +96,7 @@ func NewRootCmd() *cobra.Command {
 	flags.BoolVarP(&opts.verbose, "verbose", "v", false, "increase output verbosity")
 	flags.BoolVarP(&opts.compress, "compress", "z", false, "compress file data during transfer")
 	flags.BoolVarP(&opts.recursive, "recursive", "r", false, "recurse into directories")
+	flags.BoolVarP(&opts.dirs, "dirs", "d", false, "include directories themselves without recursing into their contents (implied by --recursive)")
 	flags.BoolVarP(&opts.dryRun, "dry-run", "n", false, "show what would be transferred without transferring")
 	flags.BoolVar(&opts.delete, "delete", false, "delete extraneous files from destination")
 	flags.BoolVar(&opts.progress, "progress", false, "show progress during transfer")
@@ -131,12 +133,13 @@ func run(cmd *cobra.Command, sources []string, destination string, opts *options
 			"verbose:     %t\n"+
 			"compress:    %t\n"+
 			"recursive:   %t\n"+
+			"dirs:        %t\n"+
 			"dry-run:     %t\n"+
 			"delete:      %t\n"+
 			"progress:    %t\n"+
 			"filters:     %s\n",
 		sources, destination,
-		opts.archive, opts.verbose, opts.compress, opts.recursive, opts.dryRun,
+		opts.archive, opts.verbose, opts.compress, opts.recursive, opts.dirs, opts.dryRun,
 		opts.delete, opts.progress, rules.String(),
 	)
 
