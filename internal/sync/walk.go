@@ -1,5 +1,5 @@
 // Package sync builds the file list ("flist") that grsync compares between
-// source and destination before any data transfer happens — the same
+// source and destination before any data transfer happens - the same
 // planning phase upstream rsync performs before its delta algorithm runs.
 package sync
 
@@ -13,7 +13,7 @@ import (
 
 // FileEntry describes a single file, directory, or symlink discovered under
 // a source root. Path is always relative to that root, using "/" as the
-// separator regardless of host OS — rsync's wire protocol and file lists
+// separator regardless of host OS - rsync's wire protocol and file lists
 // are always "/"-separated, and grsync targets protocol-level
 // interoperability, so paths are normalized at collection time rather than
 // left OS-native and converted later.
@@ -26,7 +26,7 @@ type FileEntry struct {
 	GID     uint32
 	// OwnershipAvailable reports whether UID/GID were actually populated.
 	// A real uid/gid of 0 (root) is a valid value, so callers must check
-	// this rather than treating a zero UID/GID as "unavailable" — see
+	// this rather than treating a zero UID/GID as "unavailable" - see
 	// uidgid_windows.go, where it is always false.
 	OwnershipAvailable bool
 	LinkTarget         string
@@ -37,13 +37,13 @@ type FileEntry struct {
 // -r/--recursive and -d/--dirs flags:
 //
 //   - Recursive=false, Dirs=false (rsync's default with neither flag):
-//     directories are skipped entirely — not listed, not descended into.
+//     directories are skipped entirely - not listed, not descended into.
 //     Only regular files/symlinks directly under root are collected.
 //   - Recursive=false, Dirs=true (-d): directories are listed (so they can
-//     be created on the receiving end) but their contents are not — Walk
+//     be created on the receiving end) but their contents are not - Walk
 //     does not descend into them.
 //   - Recursive=true (-r): full recursion into every subdirectory,
-//     regardless of Dirs — this matches rsync, where -r makes -d redundant.
+//     regardless of Dirs - this matches rsync, where -r makes -d redundant.
 type WalkOptions struct {
 	Recursive bool
 	Dirs      bool
@@ -99,7 +99,7 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 		// uidgid_windows.go): on Windows it always reports unavailable,
 		// leaving UID/GID at their zero value. OwnershipAvailable carries
 		// that ok flag through so callers can't mistake the zero value for
-		// a real uid/gid of 0 (root) — see uidgid_windows.go for why.
+		// a real uid/gid of 0 (root) - see uidgid_windows.go for why.
 		entry.UID, entry.GID, entry.OwnershipAvailable = lookupUIDGID(info)
 
 		// info.Mode()&fs.ModeSymlink is only ever set by Lstat (Stat
