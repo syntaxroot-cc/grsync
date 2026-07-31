@@ -15,20 +15,24 @@ import (
 // FilterRuleType identifies which kind of rule a FilterRule represents.
 type FilterRuleType string
 
-// The three rule kinds grsync's flags can produce. Kept as their own type
-// (rather than a bare string) so callers can't accidentally pass an
-// arbitrary value through.
+// The rule kinds grsync's filter-related flags can produce. Kept as their
+// own type (rather than a bare string) so callers can't accidentally pass
+// an arbitrary value through.
 const (
-	FilterRuleInclude FilterRuleType = "include"
-	FilterRuleExclude FilterRuleType = "exclude"
-	FilterRuleFilter  FilterRuleType = "filter"
+	FilterRuleInclude     FilterRuleType = "include"
+	FilterRuleExclude     FilterRuleType = "exclude"
+	FilterRuleFilter      FilterRuleType = "filter"
+	FilterRuleExcludeFrom FilterRuleType = "exclude-from"
+	FilterRuleIncludeFrom FilterRuleType = "include-from"
 )
 
-// FilterRule is a single --include/--exclude/--filter rule. rsync treats
-// these three flags as one ordered, first-match-wins rule list rather than
-// three independent lists, so grsync collects them the same way: Type
-// records which flag produced the rule, and relative order across *all*
-// three flags is preserved in the order the user supplied them.
+// FilterRule is a single --include/--exclude/--filter/--exclude-from/
+// --include-from occurrence. rsync treats all of these as one ordered,
+// first-match-wins rule list rather than independent lists, so grsync
+// collects them the same way: Type records which flag produced the rule,
+// and relative order across *all* of them is preserved in the order the
+// user supplied them. For the two "-from" kinds, Pattern is a file path,
+// not a filter pattern — internal/sync reads and expands it.
 type FilterRule struct {
 	Type    FilterRuleType
 	Pattern string
@@ -49,11 +53,12 @@ type options struct {
 	filterRules []FilterRule
 }
 
-// filterRuleFlag implements pflag.Value. Each of --exclude/--include/--filter
-// gets its own instance, fixed to a single FilterRuleType, but all three
-// share the same backing slice — so pflag's normal "call Set once per
-// occurrence" behavior naturally builds one ordered rule list regardless of
-// which of the three flag names was used at each position.
+// filterRuleFlag implements pflag.Value. Each of --exclude/--include/
+// --filter/--exclude-from/--include-from gets its own instance, fixed to a
+// single FilterRuleType, but all of them share the same backing slice — so
+// pflag's normal "call Set once per occurrence" behavior naturally builds
+// one ordered rule list regardless of which flag name was used at each
+// position.
 type filterRuleFlag struct {
 	ruleType FilterRuleType
 	rules    *[]FilterRule
@@ -67,10 +72,14 @@ func (f *filterRuleFlag) Set(pattern string) error {
 }
 
 func (f *filterRuleFlag) Type() string {
-	if f.ruleType == FilterRuleFilter {
+	switch f.ruleType {
+	case FilterRuleFilter:
 		return "rule"
+	case FilterRuleExcludeFrom, FilterRuleIncludeFrom:
+		return "file"
+	default:
+		return "pattern"
 	}
-	return "pattern"
 }
 
 // NewRootCmd builds the root grsync command. It is exported as a
@@ -106,6 +115,10 @@ func NewRootCmd() *cobra.Command {
 		"include", "include files matching PATTERN (repeatable, order preserved relative to --exclude/--filter)")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleFilter, rules: &opts.filterRules},
 		"filter", "add a file-filtering RULE (repeatable, order preserved relative to --exclude/--include)")
+	flags.Var(&filterRuleFlag{ruleType: FilterRuleExcludeFrom, rules: &opts.filterRules},
+		"exclude-from", "read exclude patterns from FILE, one per line (repeatable, order preserved)")
+	flags.Var(&filterRuleFlag{ruleType: FilterRuleIncludeFrom, rules: &opts.filterRules},
+		"include-from", "read include patterns from FILE, one per line (repeatable, order preserved)")
 
 	return cmd
 }
