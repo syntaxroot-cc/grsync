@@ -4,13 +4,15 @@ An rsync-inspired file synchronization tool written in Go.
 
 ## Status
 
-CLI parsing, file enumeration, filter-rule matching, and the delta-transfer
-algorithm are implemented; nothing is wired together into an actual sync
-yet. `internal/sync` can list a source tree (`sync.Walk`), filter it
-(`sync.FilterEntries`), and compute/apply binary deltas between two
-versions of a file (`sync.GenerateDelta`/`sync.ApplyDelta`) - but the CLI
-only echoes parsed flags, and `internal/transport` is still empty, so none
-of this runs end to end yet.
+CLI parsing, file enumeration, filter-rule matching, the delta-transfer
+algorithm, and file attribute preservation are implemented; nothing is
+wired together into an actual sync yet. `internal/sync` can list a source
+tree (`sync.Walk`), filter it (`sync.FilterEntries`), compute/apply binary
+deltas between two versions of a file
+(`sync.GenerateDelta`/`sync.ApplyDelta`), and apply permissions/times/
+ownership/symlinks/hard links (`sync.ApplyAttributes` and friends) - but
+the CLI only echoes parsed flags, and `internal/transport` is still empty,
+so none of this runs end to end yet.
 
 ## Build
 
@@ -116,13 +118,56 @@ Real rsync scales it dynamically based on file size; fixed-size blocks are
 a deliberate simplification here, not a limitation of the algorithm
 itself.
 
+## File Attribute Preservation
+
+`sync.ApplyAttributes(entry, destPath, opts)` applies `--perms`/`--times`/
+`--owner`/`--group`/`--links` to an already-written destination path
+(`AttrOptions` mirrors each flag so they can be toggled independently, the
+same way `--archive` bundles several together). Hard links and device
+files are handled separately, described below, since both are inherently
+multi-file or multi-privilege concerns a single-entry function can't
+capture.
+
+- **Permissions**: only the permission bits (`Mode.Perm()`) are applied,
+  never the type bits `FileMode` also carries.
+- **Times**: `mtime` is preserved; `atime` is set to the same value rather
+  than "now," so reapplying identical attributes twice is idempotent
+  (rsync itself doesn't meaningfully preserve atime either).
+- **Ownership**: applied via `Lchown` (so a symlink's own ownership is set,
+  not its target's) - but only when `FileEntry.OwnershipAvailable` is
+  true. On Windows it never is, so ownership is always explicitly skipped
+  there, not silently attempted with a meaningless zero UID/GID. Changing
+  ownership to another user is a privileged operation on POSIX (needs
+  root/`CAP_CHOWN`) even when available - that's an operational
+  constraint on how grsync is run, not something this code works around.
+- **Symlinks**: created from `LinkTarget` directly, never followed.
+  `Perms`/`Times` are silently *not* applied to a symlink entry even if
+  requested, because `os.Chmod`/`os.Chtimes` both follow symlinks (Go has
+  no portable `Lchmod`/`Lchtimes`) - calling them on a symlink path would
+  modify its target instead of the link.
+- **Hard links** (`sync.DetectHardLinks`/`sync.ApplyHardLinks`): detected
+  via `(device, inode)` identity, POSIX-only. Windows has no equivalent
+  exposed the way this package reads it, so every file is treated as
+  unlinked there - space-saving is lost, but output is still correct.
+  Call `sync.HardLinksSupported()` to tell "this platform can't detect
+  hard links" apart from "this tree just has none," rather than guessing
+  from an empty result.
+- **Device/special files** (`sync.ApplySpecialFile`): deliberately scoped
+  down. Named pipes (FIFOs) are fully created via `Mkfifo`, since that
+  needs no elevated privilege. Sockets and character/block devices are
+  *detected* (`sync.ClassifySpecialFile`) but not recreated -
+  `Mknod`-based device creation needs root and can't be meaningfully
+  tested without it, so this returns `sync.ErrSpecialFileUnsupported`
+  rather than attempting a syscall that fails for most callers and
+  calling that "support."
+
 ## Architecture
 
 - `cmd/grsync` - CLI entrypoint.
 - `internal/cli` - flag/argument parsing (built on cobra).
-- `internal/sync` - file-list generation, filter matching, and the
-  delta-transfer algorithm today; wiring these together into an actual
-  sync comes later.
+- `internal/sync` - file-list generation, filter matching, the
+  delta-transfer algorithm, and attribute preservation today; wiring
+  these together into an actual sync comes later.
 - `internal/transport` - (placeholder) data movement, local and remote.
 
 Goal: full feature parity with upstream rsync, including protocol/format
