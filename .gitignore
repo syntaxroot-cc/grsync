@@ -1,0 +1,11 @@
+# Go build artifacts
+/grsync
+/grsync.exe
+*.exe
+*.test
+*.out
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
