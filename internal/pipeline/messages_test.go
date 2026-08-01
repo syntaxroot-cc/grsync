@@ -35,11 +35,13 @@ func TestFileListRoundTrip(t *testing.T) {
 		},
 	}
 
+	wantGroups := []sync.HardLinkGroup{{"dir/a.txt", "dir/b.txt"}}
+
 	var buf bytes.Buffer
-	if err := sendFileList(&buf, want); err != nil {
+	if err := sendFileList(&buf, want, wantGroups); err != nil {
 		t.Fatalf("sendFileList returned error: %v", err)
 	}
-	got, err := recvFileList(&buf)
+	got, gotGroups, err := recvFileList(&buf)
 	if err != nil {
 		t.Fatalf("recvFileList returned error: %v", err)
 	}
@@ -57,6 +59,20 @@ func TestFileListRoundTrip(t *testing.T) {
 			got[i].OwnershipAvailable != want[i].OwnershipAvailable ||
 			got[i].UID != want[i].UID || got[i].GID != want[i].GID {
 			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	if len(gotGroups) != len(wantGroups) {
+		t.Fatalf("got %d hard-link groups, want %d", len(gotGroups), len(wantGroups))
+	}
+	for i := range wantGroups {
+		if len(gotGroups[i]) != len(wantGroups[i]) {
+			t.Fatalf("group %d = %v, want %v", i, gotGroups[i], wantGroups[i])
+		}
+		for j := range wantGroups[i] {
+			if gotGroups[i][j] != wantGroups[i][j] {
+				t.Errorf("group %d member %d = %q, want %q", i, j, gotGroups[i][j], wantGroups[i][j])
+			}
 		}
 	}
 }

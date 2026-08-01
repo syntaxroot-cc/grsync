@@ -57,6 +57,7 @@ type options struct {
 	owner        bool
 	group        bool
 	links        bool
+	hardLinks    bool
 	filterRules  []FilterRule
 	rsh          string
 	server       bool
@@ -169,6 +170,8 @@ func NewRootCmd() *cobra.Command {
 	flags.BoolVarP(&opts.owner, "owner", "o", false, "preserve owner (implied by --archive; requires appropriate privileges)")
 	flags.BoolVarP(&opts.group, "group", "g", false, "preserve group (implied by --archive; requires appropriate privileges)")
 	flags.BoolVarP(&opts.links, "links", "l", false, "recreate symlinks as symlinks (implied by --archive)")
+	flags.BoolVarP(&opts.hardLinks, "hard-links", "H", false,
+		"preserve hard links between files in the source (NOT implied by --archive, matching real rsync's own -a)")
 	flags.StringVarP(&opts.rsh, "rsh", "e", "",
 		"specify the remote shell to use, e.g. \"ssh -p 2222 -i key.pem\" (default: ssh); "+
 			"the sole way to customize port/identity/proxy for remote transport, matching rsync")
