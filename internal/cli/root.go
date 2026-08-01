@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/syntaxroot-cc/grsync/internal/daemon"
 )
 
 // FilterRuleType identifies which kind of rule a FilterRule represents.
@@ -58,6 +60,9 @@ type options struct {
 	filterRules []FilterRule
 	rsh         string
 	server      bool
+	daemon      bool
+	config      string
+	port        int
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -106,13 +111,22 @@ func NewRootCmd() *cobra.Command {
 		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
 		// switches into speaking internal/pipeline's protocol over its own
 		// stdin/stdout against that destination, instead of a normal sync.
+		// --daemon takes none at all: everything it needs (which modules
+		// exist, where they live) comes from --config's rsyncd.conf, not
+		// from positional args.
 		Args: func(cmd *cobra.Command, args []string) error {
+			if opts.daemon {
+				return cobra.NoArgs(cmd, args)
+			}
 			if opts.server {
 				return cobra.ExactArgs(1)(cmd, args)
 			}
 			return cobra.MinimumNArgs(2)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.daemon {
+				return runDaemon(cmd, opts.config, opts.port)
+			}
 			if opts.server {
 				return runServer(cmd, args[0], opts)
 			}
@@ -166,6 +180,9 @@ func NewRootCmd() *cobra.Command {
 	if err := flags.MarkHidden("server"); err != nil {
 		panic(err) // only fails if "server" isn't a registered flag name, which would be a programming error caught immediately by any test run
 	}
+	flags.BoolVar(&opts.daemon, "daemon", false, "run as an rsync-protocol daemon, serving modules defined in --config")
+	flags.StringVar(&opts.config, "config", "", "path to the rsyncd.conf file to serve (required with --daemon)")
+	flags.IntVar(&opts.port, "port", daemon.DefaultPort, "TCP port to listen on in --daemon mode")
 
 	return cmd
 }

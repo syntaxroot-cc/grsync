@@ -15,6 +15,14 @@ out of scope (compression, progress reporting, `--dry-run`, partial/
 append transfers, batch mode, full `--delete`, hard links, and device/
 special files) - this is real, working sync, not yet full feature parity.
 
+`grsync --daemon` also now speaks a real subset of the rsync daemon
+protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
+listing, and real MD4 challenge-response authentication all match
+upstream rsync, verified against its actual source rather than assumed.
+See [rsync Daemon Mode](#rsync-daemon-mode) below for exactly what that
+covers and where it hands off to grsync's own (non-rsync-wire-format)
+transfer protocol.
+
 ## Build
 
 ```sh
@@ -57,6 +65,9 @@ argument is always the destination.
 | `--owner` | `-o` | preserve owner (implied by `--archive`; requires appropriate privileges) |
 | `--group` | `-g` | preserve group (implied by `--archive`; requires appropriate privileges) |
 | `--links` | `-l` | recreate symlinks as symlinks (implied by `--archive`) |
+| `--daemon` | | run as an rsync-protocol daemon, serving modules from `--config` (see [rsync Daemon Mode](#rsync-daemon-mode)) |
+| `--config PATH` | | path to the `rsyncd.conf` to serve (required with `--daemon`) |
+| `--port PORT` | | TCP port to listen on in `--daemon` mode (default `873`, matching rsync) |
 
 All five filter-related flags share one ordered rule list - their relative
 order on the command line is preserved, matching rsync's first-match-wins
@@ -293,6 +304,141 @@ particularly, since unlike device files it needs no elevated privilege)
 but was left out of this already-large integration ticket rather than
 expanding its scope further.
 
+## rsync Daemon Mode
+
+`internal/daemon` implements grsync's `--daemon` server mode: a second way
+to *reach* a grsync instance, over a plain TCP port instead of SSH,
+speaking a real subset of upstream rsync's own daemon protocol rather
+than an invented one. Every wire-format detail below (the `rsyncd.conf`
+syntax, the `@RSYNCD` greeting, the MD4 authentication algorithm) was
+checked against upstream rsync's actual source (`authenticate.c`,
+`clientserver.c`) while building this, not reconstructed from memory or
+the man page alone.
+
+```sh
+grsync --daemon --config rsyncd.conf --port 8730
+```
+
+### `rsyncd.conf`
+
+`daemon.ParseConfig` reads real `rsyncd.conf` syntax: `[module]` sections,
+`name = value` parameters, `#` comments, blank lines, and trailing-`\`
+line continuation. Parameters that appear before any `[module]` header
+become that module's starting defaults, matching real rsync's own global
+section.
+
+Supported parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `path` | *(required)* | directory the module exposes |
+| `comment` | *(empty)* | shown next to the module name in a listing |
+| `read only` | `true` | rejects uploads (`put`) to this module |
+| `list` | `true` | hides the module from a `#list` request - it is *not* made unreachable; a client who already knows its name can still select it directly, matching real rsync's own documented behavior |
+| `exclude` | *(none)* | space-separated patterns hidden from downloads, compiled via the same `sync.CompileRules`/`sync.Included` machinery `--exclude` uses |
+| `auth users` | *(none)* | comma/space-separated usernames; a non-empty list means the module requires authentication |
+| `secrets file` | *(none)* | path to a `name:password` per-line file |
+| `max connections` | `0` (unlimited) | **parsed but not yet enforced** - see Scope boundaries below |
+
+An unrecognized parameter (real rsyncd.conf has dozens grsync doesn't
+implement - `uid`, `hosts allow`, `log file`, `timeout`, and more) is
+silently accepted, not an error: rejecting an otherwise-valid config file
+over one unimplemented option would be worse than ignoring that line. A
+line that isn't valid `name = value` or `[section]` syntax at all, or a
+recognized parameter with a malformed value, is a hard parse error.
+
+### `rsync://` URLs
+
+`daemon.ParseURL` parses `rsync://[user@]host[:port]/module[/path]`,
+including the bare `rsync://host` and `rsync://host/` forms real rsync
+uses to mean "list this daemon's modules" rather than selecting one, and
+IPv6 literals. This parser is implemented and tested, but **not yet wired
+into the main `grsync SRC... DEST` sync command** - today it's only used
+internally (and by `internal/daemon`'s own tests) to build a connection by
+hand. Making `rsync://...` a valid source/destination argument the same
+way an SSH `user@host:path` already is would be a natural, low-risk
+follow-up.
+
+### Handshake and authentication
+
+The connection sequence matches real rsync: the daemon speaks first
+(`@RSYNCD: 31.0`), the client replies with its own greeting, then sends
+either `#list` (module listing) or a module name. An unknown module gets
+an `@ERROR` line; a `list = false` module is skipped by `#list` but still
+selectable by name.
+
+If the selected module has `auth users` configured, the daemon sends
+`@RSYNCD: AUTHREQD <challenge>` with a fresh random challenge; the client
+answers `<user> <response>` where
+`response = base64_no_padding(MD4(secret + challenge))` - secret hashed
+first, then challenge, no seed byte, exactly matching real rsync's
+`generate_hash()`. **The password itself never crosses the wire, only
+this one-way hash of it** - `TestAuth_NoPlaintextPasswordOnWire` in
+`internal/daemon/auth_test.go` proves this by capturing and inspecting
+the actual bytes each side sends, not just checking the outcome.
+Comparison on the server side uses `crypto/subtle` for constant-time
+comparison, and every authentication failure (unknown user, wrong
+password, unreadable secrets file) returns the same generic
+`@ERROR: auth failed on module <name>`, matching real rsync's refusal to
+let a client distinguish those cases.
+
+**Scoped down from real rsync, deliberately:**
+- **Classic MD4 only** - real rsync protocol 30+ negotiates MD4 vs MD5
+  via a digest list in the greeting line; grsync always uses MD4 and
+  ignores any digest list it receives. Digest negotiation is real,
+  unimplemented scope, not a bug.
+- **Exact-match `auth users` only** - real rsync supports wildcards and
+  `@group` entries in this list; grsync matches usernames literally.
+- **The secrets file's own permissions are never checked** - real rsync's
+  default "strict modes" refuses a world- or group-readable secrets file.
+  grsync reads whatever `secrets file` points to regardless of its
+  permissions. Given this project's cross-platform (including Windows)
+  scope, where POSIX permission bits don't map cleanly, this was left
+  out rather than half-implemented; worth a follow-up on POSIX platforms.
+
+### Access control and transfer
+
+Once authenticated, the client sends `get` (download) or `put` (upload).
+`put` against a `read only` module is refused - with an `@ERROR` line and
+without either side ever committing to the transfer protocol - before any
+file ever moves. `get` walks and filters the module's `path` through the
+module's `exclude` patterns before sending, exactly like `--exclude`
+elsewhere in grsync.
+
+**`exclude` is enforced on downloads only.** That's where the daemon
+itself walks and filters the directory it's about to send from, the same
+mechanism `--exclude` already uses; `pipeline.Receiver` has no per-entry
+filtering hook, so an upload to a non-read-only module is not currently
+filtered against the module's `exclude` list. A deliberate, documented
+boundary, not an oversight.
+
+After a module is selected (and authenticated, if required), this package
+hands the connection straight to `pipeline.Sender`/`pipeline.Receiver` -
+the same functions the SSH transport uses. **The handshake and
+authentication above are real-rsync-protocol-shaped; the transfer that
+follows is not.** Like the SSH transport (see
+[End-to-End Sync Pipeline](#end-to-end-sync-pipeline)), it's
+`encoding/gob`, not upstream rsync's actual binary wire format - so a
+grsync daemon interoperates with another grsync client, not with a real
+`rsync` binary, exactly the same boundary that already exists for SSH.
+
+**Other scope boundaries:**
+- **`max connections` is parsed but not enforced** - nothing currently
+  caps concurrent connections to a module at that number.
+- One connection's panic can't take the daemon process down: `Serve`
+  recovers per-connection, so a bug anywhere in the handshake/auth/
+  transfer chain stays scoped to that one client instead of killing every
+  other in-flight connection.
+- Every line read before a transfer begins (greeting, module selection,
+  auth response) is capped at 8 KiB, so an unauthenticated client can't
+  force unbounded memory growth by sending data with no newline.
+
+Tested with `TestDaemon_RealTCP_*` in `internal/daemon/server_test.go`
+over an actual loopback TCP connection - listen, dial, full handshake,
+auth, and transfer - not just in-memory pipes standing in for a
+connection, since (unlike the SSH tests) nothing external is needed to
+exercise this end to end.
+
 ## Architecture
 
 - `cmd/grsync` - CLI entrypoint.
@@ -308,6 +454,11 @@ expanding its scope further.
 - `internal/transport` - remote endpoint parsing, RSH command
   construction, frame protocol, subprocess session management, and the
   `--server` handshake.
+- `internal/daemon` - the rsync daemon protocol: `rsyncd.conf` and
+  `rsync://` URL parsing, the `@RSYNCD` greeting/handshake and module
+  listing, MD4 challenge-response authentication, and per-module access
+  control, handing off to `internal/pipeline` for the actual transfer.
+  See [rsync Daemon Mode](#rsync-daemon-mode) above.
 
 Goal: full feature parity with upstream rsync, including protocol/format
 interoperability where specified (e.g. batch mode's file format).

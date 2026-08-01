@@ -15,6 +15,19 @@ linters:
     - misspell
     - unconvert
     - gocritic
+  exclusions:
+    rules:
+      # golang.org/x/crypto/md4 is deprecated for general security use,
+      # but internal/daemon/auth.go uses it deliberately: real rsync's own
+      # daemon authentication protocol is defined in terms of classic
+      # MD4, and grsync's client and server can't interoperate with real
+      # rsync (or with each other, if this were "fixed") without it. This
+      # is the one place in the codebase that import is expected to
+      # appear.
+      - path: internal/daemon/auth\.go
+        linters:
+          - staticcheck
+        text: "SA1019.*md4"
 
 formatters:
   enable:
