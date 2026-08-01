@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/syntaxroot-cc/grsync/internal/daemon"
+	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 )
 
@@ -35,7 +36,15 @@ const dialDaemonTimeout = 10 * time.Second
 // is the only AttrOptions field DialClient's Sender-side (DirectionPut)
 // call actually consults, but it's threaded through as a full
 // sync.AttrOptions to match DialClient's own signature.
-func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool) error {
+//
+// dryRun is the only ReceiverOptions field that reaches the daemon at
+// all for this direction: the module's Receiver runs on the server, not
+// here, so DialModule sends it as an extra token on the wire (see
+// daemon.dryRunToken) rather than anything this function does directly.
+// Itemize/Verbose are deliberately not passed through - see runSync's
+// own one-time note about why daemon-PUT reporting output isn't
+// available, printed before this function is ever called.
+func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool) error {
 	port := u.Port
 	if port == 0 {
 		port = daemon.DefaultPort
@@ -49,5 +58,6 @@ func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, w
 	defer func() { _ = nc.Close() }()
 
 	user := resolveUser(u.User)
-	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{HardLinks: hardLinks})
+	ropts := pipeline.ReceiverOptions{DryRun: dryRun}
+	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{HardLinks: hardLinks}, ropts)
 }

@@ -49,6 +49,60 @@ type WalkOptions struct {
 	Dirs      bool
 }
 
+// buildFileEntry constructs a FileEntry for path from its already-Lstat'd
+// info, leaving Path unset - Walk fills it in as a root-relative,
+// "/"-separated string; LstatEntry (below) leaves it empty, since a
+// caller comparing a single existing destination path against a received
+// FileEntry has no use for a second, redundant Path value.
+func buildFileEntry(path string, info fs.FileInfo) (FileEntry, error) {
+	entry := FileEntry{
+		Size:    info.Size(),
+		ModTime: info.ModTime(),
+		Mode:    info.Mode(),
+		IsDir:   info.IsDir(),
+	}
+
+	// lookupUIDGID is platform-specific (see uidgid_unix.go /
+	// uidgid_windows.go): on Windows it always reports unavailable,
+	// leaving UID/GID at their zero value. OwnershipAvailable carries
+	// that ok flag through so callers can't mistake the zero value for
+	// a real uid/gid of 0 (root) - see uidgid_windows.go for why.
+	entry.UID, entry.GID, entry.OwnershipAvailable = lookupUIDGID(info)
+
+	// info.Mode()&fs.ModeSymlink is only ever set by Lstat (Stat
+	// resolves through it), which is exactly why every caller of this
+	// function Lstats rather than Stats: this branch would never be
+	// reachable otherwise.
+	if info.Mode()&fs.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return FileEntry{}, err
+		}
+		entry.LinkTarget = target
+	}
+
+	return entry, nil
+}
+
+// LstatEntry builds a FileEntry for a single existing path the same way
+// Walk builds one for each path it visits (same fields, same Lstat-not-Stat
+// symlink handling), without needing a whole tree walk - for a caller that
+// already knows the one path it cares about, e.g. comparing a sync's
+// incoming FileEntry against whatever currently exists at the destination.
+// Path is left empty; the caller already knows what path it asked about.
+//
+// The returned error satisfies os.IsNotExist(err) when path doesn't exist,
+// exactly like a direct os.Lstat call would - callers should check for
+// that the same way they already do for os.ReadFile/os.Stat elsewhere in
+// this codebase, not a distinct "found bool" out-parameter.
+func LstatEntry(path string) (FileEntry, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	return buildFileEntry(path, info)
+}
+
 // Walk collects a FileEntry for every entry found under root, not including
 // root itself, subject to opts. Paths are relative to root and
 // "/"-separated.
@@ -87,31 +141,11 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 			return err
 		}
 
-		entry := FileEntry{
-			Path:    filepath.ToSlash(rel),
-			Size:    info.Size(),
-			ModTime: info.ModTime(),
-			Mode:    info.Mode(),
-			IsDir:   info.IsDir(),
+		entry, err := buildFileEntry(path, info)
+		if err != nil {
+			return err
 		}
-
-		// lookupUIDGID is platform-specific (see uidgid_unix.go /
-		// uidgid_windows.go): on Windows it always reports unavailable,
-		// leaving UID/GID at their zero value. OwnershipAvailable carries
-		// that ok flag through so callers can't mistake the zero value for
-		// a real uid/gid of 0 (root) - see uidgid_windows.go for why.
-		entry.UID, entry.GID, entry.OwnershipAvailable = lookupUIDGID(info)
-
-		// info.Mode()&fs.ModeSymlink is only ever set by Lstat (Stat
-		// resolves through it), which is exactly why Lstat was required
-		// above: this branch would never be reachable otherwise.
-		if info.Mode()&fs.ModeSymlink != 0 {
-			target, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			entry.LinkTarget = target
-		}
+		entry.Path = filepath.ToSlash(rel)
 
 		entries = append(entries, entry)
 

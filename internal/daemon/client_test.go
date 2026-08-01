@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 )
 
@@ -31,7 +32,7 @@ func TestDialClient_DownloadOverRealTCP(t *testing.T) {
 	nc := dialRawConn(t, addr)
 
 	dest := t.TempDir()
-	err := DialClient(nc, "public", "", StaticPassword(""), DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{})
+	err := DialClient(nc, "public", "", StaticPassword(""), DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{})
 	if err != nil {
 		t.Fatalf("DialClient returned error: %v", err)
 	}
@@ -65,7 +66,7 @@ func TestDialClient_UploadOverRealTCP(t *testing.T) {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
 
-	err = DialClient(nc, "incoming", "alice", StaticPassword("hunter2"), DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{})
+	err = DialClient(nc, "incoming", "alice", StaticPassword("hunter2"), DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{})
 	if err != nil {
 		t.Fatalf("DialClient returned error: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestDialClient_PasswordFuncNotCalledForAnonymousModule(t *testing.T) {
 	})
 
 	dest := t.TempDir()
-	err := DialClient(nc, "public", "", poisonedPassword, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{})
+	err := DialClient(nc, "public", "", poisonedPassword, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{})
 	if err != nil {
 		t.Fatalf("DialClient returned error: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestDialClient_RejectsEmptyModule(t *testing.T) {
 	addr, _ := startTestDaemon(t, cfg)
 	nc := dialRawConn(t, addr)
 
-	err := DialClient(nc, "", "", StaticPassword(""), DirectionGet, t.TempDir(), nil, sync.WalkOptions{}, sync.AttrOptions{})
+	err := DialClient(nc, "", "", StaticPassword(""), DirectionGet, t.TempDir(), nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{})
 	if err == nil {
 		t.Fatalf("DialClient with an empty module returned nil error, want an error")
 	}

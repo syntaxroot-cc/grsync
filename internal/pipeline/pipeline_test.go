@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +30,7 @@ func runSenderReceiver(t *testing.T, src, dest string, walkOpts sync.WalkOptions
 	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
 
 	receiverErrCh := make(chan error, 1)
-	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts) }()
+	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ReceiverOptions{}) }()
 
 	select {
 	case err := <-receiverErrCh:
@@ -310,6 +311,141 @@ func TestSenderReceiver_HardLinksNotPreservedWithoutOptIn(t *testing.T) {
 	}
 }
 
+// runSenderReceiverWithOptions is runSenderReceiver's counterpart for
+// tests that need control over ReceiverOptions (dry-run, itemize
+// reporting) - kept as a separate helper rather than adding a parameter
+// to runSenderReceiver itself, since none of that function's many
+// existing callers care, and ReceiverOptions{} (real writes, no
+// reporting) is exactly what they already get.
+func runSenderReceiverWithOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions) {
+	t.Helper()
+
+	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
+	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
+
+	sender := pipeReadWriter{Reader: senderReadsFromReceiver, Writer: senderWritesToReceiver}
+	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
+
+	senderErrCh := make(chan error, 1)
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
+
+	receiverErrCh := make(chan error, 1)
+	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ropts) }()
+
+	select {
+	case err := <-receiverErrCh:
+		if err != nil {
+			t.Fatalf("Receiver returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Receiver did not complete within 10s")
+	}
+	select {
+	case err := <-senderErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Sender did not complete within 10s")
+	}
+}
+
+// buildRichTree creates a source tree exercising every write path
+// Receiver has: a top-level file, a nested directory with a file inside
+// it, a symlink, and (best-effort - silently omitted if unsupported in
+// this environment) two hard-linked files - so a dry-run test against it
+// genuinely exercises all eight audited write call sites from Receiver's
+// own doc comment, not just the easy ones.
+func buildRichTree(t *testing.T, root string) {
+	t.Helper()
+	mustWriteFile(t, filepath.Join(root, "top.txt"), "top level content")
+	mustMkdirAll(t, filepath.Join(root, "sub"))
+	mustWriteFile(t, filepath.Join(root, "sub", "nested.txt"), "nested content")
+	if err := os.Symlink("nested.txt", filepath.Join(root, "sub", "link.txt")); err != nil {
+		t.Logf("symlink creation unsupported in this environment, tree will not include one: %v", err)
+	}
+	mustWriteFile(t, filepath.Join(root, "original.txt"), "shared content")
+	if err := os.Link(filepath.Join(root, "original.txt"), filepath.Join(root, "linked.txt")); err != nil {
+		t.Logf("hard link creation unsupported in this environment, tree will not include one: %v", err)
+	}
+}
+
+// TestReceiver_DryRunMakesNoFilesystemChanges is SC-11's single most
+// important test: a dry-run sync against a completely empty destination
+// must leave it completely empty afterward - not just "no error was
+// returned." buildRichTree's source is specifically built to exercise
+// every one of Receiver's eight audited write call sites (two regular-
+// file MkdirAlls plus a WriteFile, a symlink's MkdirAll plus
+// ApplyAttributes - which itself calls os.Symlink, not just chmod/
+// chtimes - a directory's deferred ApplyAttributes, and
+// ApplyHardLinks); if any one of them were reachable despite DryRun
+// being set, this test catches it directly, by finding something in
+// destRoot that shouldn't be there, rather than trusting the audit alone.
+func TestReceiver_DryRunMakesNoFilesystemChanges(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+	buildRichTree(t, srcRoot)
+
+	runSenderReceiverWithOptions(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil,
+		sync.AttrOptions{Perms: true, Times: true, Owner: true, Group: true, Links: true, HardLinks: true},
+		ReceiverOptions{DryRun: true})
+
+	entries, err := os.ReadDir(destRoot)
+	if err != nil {
+		t.Fatalf("ReadDir(destRoot): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destRoot is not empty after a dry run: %v", entries)
+	}
+}
+
+// TestReceiver_DryRunItemizeMatchesRealRunItemize is real rsync's own
+// documented dry-run guarantee, made concrete: "The output of
+// --itemize-changes is supposed to be exactly the same on a dry run and
+// a subsequent real run" (rsync.1's --dry-run section) - compared here
+// against a real run on a *separate*, equally fresh destination, not a
+// second real run against the same one (which would legitimately report
+// nothing left to do, proving nothing about the dry run's accuracy).
+func TestReceiver_DryRunItemizeMatchesRealRunItemize(t *testing.T) {
+	srcRoot := t.TempDir()
+	buildRichTree(t, srcRoot)
+
+	attrOpts := sync.AttrOptions{Perms: true, Times: true, Owner: true, Group: true, Links: true, HardLinks: true}
+
+	dryRunDest := t.TempDir()
+	var dryRunOutput bytes.Buffer
+	runSenderReceiverWithOptions(t, srcRoot, dryRunDest,
+		sync.WalkOptions{Recursive: true}, nil, attrOpts,
+		ReceiverOptions{DryRun: true, Itemize: true, Output: &dryRunOutput})
+
+	realRunDest := t.TempDir()
+	var realRunOutput bytes.Buffer
+	runSenderReceiverWithOptions(t, srcRoot, realRunDest,
+		sync.WalkOptions{Recursive: true}, nil, attrOpts,
+		ReceiverOptions{DryRun: false, Itemize: true, Output: &realRunOutput})
+
+	if dryRunOutput.Len() == 0 {
+		t.Fatalf("dry-run produced no itemize output at all - the test tree isn't exercising anything")
+	}
+	if dryRunOutput.String() != realRunOutput.String() {
+		t.Errorf("dry-run itemize output does not match a real run's:\ndry-run:\n%s\nreal run:\n%s",
+			dryRunOutput.String(), realRunOutput.String())
+	}
+
+	// The dry run's destination must still be untouched - what makes the
+	// comparison above meaningful in the first place: if the dry run had
+	// actually written files, it wouldn't be comparable to a real run
+	// against a genuinely fresh destination at all.
+	entries, err := os.ReadDir(dryRunDest)
+	if err != nil {
+		t.Fatalf("ReadDir(dryRunDest): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("dry-run destination is not empty: %v", entries)
+	}
+}
+
 // TestReceiver_AppliesHardLinksFromReceivedGroups exercises Receiver's
 // hard-link handling directly against a hand-built file list, the same
 // way TestReceiver_ConnectionDropsMidTransfer drives Receiver against a
@@ -388,7 +524,7 @@ func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 	}()
 
 	receiverErrCh := make(chan error, 1)
-	go func() { receiverErrCh <- Receiver(receiver, destRoot, sync.AttrOptions{}) }()
+	go func() { receiverErrCh <- Receiver(receiver, destRoot, sync.AttrOptions{}, ReceiverOptions{}) }()
 
 	select {
 	case err := <-receiverErrCh:
@@ -493,7 +629,7 @@ func TestReceiver_ConnectionDropsMidTransfer(t *testing.T) {
 	}()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- Receiver(receiver, destRoot, sync.AttrOptions{}) }()
+	go func() { errCh <- Receiver(receiver, destRoot, sync.AttrOptions{}, ReceiverOptions{}) }()
 
 	select {
 	case err := <-errCh:

@@ -96,6 +96,46 @@ func TestWalk_Symlink(t *testing.T) {
 	}
 }
 
+// TestLstatEntry_MatchesWalk confirms LstatEntry and Walk build identical
+// FileEntry data for the same path (everything except Path itself, which
+// Walk fills in as root-relative and LstatEntry deliberately leaves
+// empty) - proving the extracted buildFileEntry helper didn't silently
+// diverge between the two call sites.
+func TestLstatEntry_MatchesWalk(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "file.txt"), "content")
+
+	walked, err := Walk(root, WalkOptions{Recursive: true})
+	if err != nil {
+		t.Fatalf("Walk returned error: %v", err)
+	}
+	if len(walked) != 1 {
+		t.Fatalf("got %d entries, want 1", len(walked))
+	}
+	want := walked[0]
+
+	got, err := LstatEntry(filepath.Join(root, "file.txt"))
+	if err != nil {
+		t.Fatalf("LstatEntry returned error: %v", err)
+	}
+
+	if got.Path != "" {
+		t.Errorf("LstatEntry Path = %q, want empty", got.Path)
+	}
+	if got.Size != want.Size || got.Mode != want.Mode || !got.ModTime.Equal(want.ModTime) ||
+		got.IsDir != want.IsDir || got.UID != want.UID || got.GID != want.GID ||
+		got.OwnershipAvailable != want.OwnershipAvailable {
+		t.Errorf("LstatEntry = %+v, want the same fields as Walk's entry (ignoring Path) = %+v", got, want)
+	}
+}
+
+func TestLstatEntry_NonexistentPathReturnsNotExist(t *testing.T) {
+	_, err := LstatEntry(filepath.Join(t.TempDir(), "does-not-exist"))
+	if !os.IsNotExist(err) {
+		t.Errorf("LstatEntry on a nonexistent path returned err = %v, want an error satisfying os.IsNotExist", err)
+	}
+}
+
 func TestWalk_RecursiveAndDirsFlags(t *testing.T) {
 	root := t.TempDir()
 

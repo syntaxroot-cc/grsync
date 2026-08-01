@@ -49,6 +49,17 @@ func effectiveAttrOptions(opts *options) sync.AttrOptions {
 	}
 }
 
+// effectiveReceiverOptions computes pipeline.ReceiverOptions from opts:
+// --dry-run, --itemize-changes, and --verbose, all reported to output.
+func effectiveReceiverOptions(opts *options, output io.Writer) pipeline.ReceiverOptions {
+	return pipeline.ReceiverOptions{
+		DryRun:  opts.dryRun,
+		Itemize: opts.itemize,
+		Verbose: opts.verbose,
+		Output:  output,
+	}
+}
+
 // toSyncRawRules converts the CLI's FilterRule list to sync.RawRule.
 // FilterRuleType's string values were chosen to exactly match
 // sync.RuleKind's ("include", "exclude", "filter", "exclude-from",
@@ -64,11 +75,13 @@ func toSyncRawRules(filterRules []FilterRule) []sync.RawRule {
 	return raw
 }
 
-// runSync is the real sync entry point (as opposed to run, the
-// flag-echoing placeholder still used for --dry-run). For each source, it
-// syncs that source into destination - in-process for a local
-// destination, over an SSH-spawned connection for a remote user@host:path
-// one, or over a plain TCP connection to an rsync:// daemon module.
+// runSync is the real sync entry point. For each source, it syncs that
+// source into destination - in-process for a local destination, over an
+// SSH-spawned connection for a remote user@host:path one, or over a
+// plain TCP connection to an rsync:// daemon module. opts.dryRun makes
+// this a full trial run - every planning step still happens, nothing is
+// actually written - see pipeline.Receiver's own doc comment for exactly
+// which calls that skips.
 //
 // Pulling FROM a remote source (SSH or an rsync:// daemon) is not yet
 // supported, only a local source to a local, SSH, or daemon destination -
@@ -123,24 +136,43 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		password = resolvePassword(opts.passwordFile, cmd.InOrStdin())
 	}
 
+	ropts := effectiveReceiverOptions(opts, cmd.OutOrStdout())
+	if isRsyncDaemon && ropts.Reporting() {
+		// The daemon protocol has no channel for this: once the module
+		// handshake ends, the connection is pure binary wire protocol
+		// (see internal/daemon's own doc comment on where the real-vs-gob
+		// boundary sits) with nowhere to carry itemize/verbose text back
+		// to the client, unlike SSH's genuinely separate stderr stream.
+		// --dry-run's actual safety guarantee (no writes happen) still
+		// fully applies; only the reporting text is unavailable here.
+		// Noting this once, up front, rather than silently producing no
+		// output and leaving the user to wonder why.
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --itemize-changes/--verbose output is not available for an rsync:// "+
+			"daemon destination (the daemon protocol has no channel for it); --dry-run's no-write guarantee still applies")
+	}
+
 	for _, src := range sources {
 		switch {
 		case isRsyncDaemon:
-			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks); err != nil {
+			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks, opts.dryRun); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		case isRemote:
-			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks); err != nil {
+			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		default:
-			if err := syncLocal(src, destination, walkOpts, rules, attrOpts); err != nil {
+			if err := syncLocal(src, destination, walkOpts, rules, attrOpts, ropts); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		}
 	}
 
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "synced %d source(s) to %s\n", len(sources), destination)
+	verb := "synced"
+	if opts.dryRun {
+		verb = "would sync"
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s %d source(s) to %s\n", verb, len(sources), destination)
 	return err
 }
 
@@ -149,7 +181,7 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 // way, the exact same pipeline.Sender/pipeline.Receiver functions that
 // carry out a remote sync are what a local sync exercises too, instead of
 // a second, independently-trusted implementation of the same logic.
-func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions) error {
+func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions) error {
 	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
 	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
 
@@ -159,7 +191,7 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 	senderErrCh := make(chan error, 1)
 	go func() { senderErrCh <- pipeline.Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
 
-	receiverErr := pipeline.Receiver(receiver, dest, attrOpts)
+	receiverErr := pipeline.Receiver(receiver, dest, attrOpts, ropts)
 	senderErr := <-senderErrCh
 
 	if receiverErr != nil {
@@ -171,8 +203,29 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // syncToRemote spawns `grsync --server DEST` on the remote host via SSH
 // (or whatever --rsh overrides it to), performs the handshake, then runs
 // the sender side of the pipeline against that connection.
-func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool) error {
-	session, err := transport.Dial(rsh, remote.User, remote.Host, []string{"grsync", "--server", remote.Path})
+//
+// ropts.DryRun/Itemize/Verbose are passed as extra flags on that remote
+// command line (e.g. "grsync --server --dry-run -i DEST"), not over any
+// new wire message: the remote --server process parses them the normal
+// way, via its own real CLI flag handling (see runServer), and the
+// receiving side's dry-run/itemize decision is made entirely on the
+// remote side, exactly where pipeline.Receiver actually runs for this
+// transport - there is nothing for the local, sending side to decide
+// here at all.
+func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions) error {
+	remoteArgs := []string{"grsync", "--server"}
+	if ropts.DryRun {
+		remoteArgs = append(remoteArgs, "--dry-run")
+	}
+	if ropts.Itemize {
+		remoteArgs = append(remoteArgs, "--itemize-changes")
+	}
+	if ropts.Verbose {
+		remoteArgs = append(remoteArgs, "--verbose")
+	}
+	remoteArgs = append(remoteArgs, remote.Path)
+
+	session, err := transport.Dial(rsh, remote.User, remote.Host, remoteArgs)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", remote.Host, err)
 	}
@@ -194,6 +247,19 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 // runServer implements --server mode: perform the handshake, then run the
 // receiver side of the pipeline against dest, reading/writing the
 // command's own stdin/stdout.
+//
+// opts here is this process's own locally-parsed flags - for a real
+// remote invocation, that means whatever syncToRemote put on the ssh
+// command line (see its own doc comment), so --dry-run/-i/-v "just work"
+// through the same argv-parsing path every other flag already does, no
+// separate propagation mechanism required. Itemize/verbose output goes
+// to cmd.ErrOrStderr(), never stdout: stdout here is the framed wire
+// protocol itself (see transport.WriteFrame/ReadFrame), so writing
+// human-readable text there would corrupt it. In real (non-test) use,
+// ErrOrStderr() is this process's actual stderr, which Session (the
+// local side's view of this same subprocess) passes through live to the
+// local user's terminal - see session.go's own doc comment on why that
+// pass-through exists.
 func runServer(cmd *cobra.Command, dest string, opts *options) error {
 	stdin, stdout := cmd.InOrStdin(), cmd.OutOrStdout()
 
@@ -202,5 +268,6 @@ func runServer(cmd *cobra.Command, dest string, opts *options) error {
 	}
 
 	rw := pipeReadWriter{Reader: stdin, Writer: stdout}
-	return pipeline.Receiver(rw, dest, effectiveAttrOptions(opts))
+	ropts := effectiveReceiverOptions(opts, cmd.ErrOrStderr())
+	return pipeline.Receiver(rw, dest, effectiveAttrOptions(opts), ropts)
 }

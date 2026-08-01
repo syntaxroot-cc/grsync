@@ -98,3 +98,56 @@ func TestSSHLocalhost_SyncRoundTrip(t *testing.T) {
 	assertSameContent(t, filepath.Join(src, "top.txt"), filepath.Join(dest, "top.txt"))
 	assertSameContent(t, filepath.Join(src, "sub", "nested.txt"), filepath.Join(dest, "sub", "nested.txt"))
 }
+
+// TestSSHLocalhost_DryRunMakesNoChanges is the real, over-the-wire proof
+// that --dry-run's no-write guarantee holds for the SSH transport
+// specifically: the remote grsync --server process here is invoked with
+// --dry-run on its own command line (exactly what internal/cli's
+// syncToRemote does for a real invocation - see its own doc comment),
+// so this exercises the actual mechanism a real `grsync --dry-run src
+// user@host:dest` run would use, not a stand-in for it.
+func TestSSHLocalhost_DryRunMakesNoChanges(t *testing.T) {
+	requireLocalSSHServer(t)
+	grsyncPath := buildGrsyncBinary(t)
+
+	src := t.TempDir()
+	dest := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "top.txt"), "top level content")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
+
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--dry-run", dest})
+	if err != nil {
+		t.Fatalf("Dial returned error: %v", err)
+	}
+
+	if err := transport.Handshake(session); err != nil {
+		t.Fatalf("Handshake returned error: %v", err)
+	}
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Sender did not complete within 20s")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Errorf("Session.Close returned error: %v", err)
+	}
+
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		t.Fatalf("ReadDir(dest): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("dest is not empty after a --dry-run --server sync over real SSH: %v", entries)
+	}
+}

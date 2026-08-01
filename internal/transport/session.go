@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -21,9 +22,15 @@ type Session struct {
 
 // Dial spawns the remote-shell command built by BuildRSHCommand (ssh, or
 // whatever --rsh/-e overrides it to) and returns a Session wrapping its
-// stdin/stdout. The subprocess's stderr is captured (not connected to
-// this process's own stderr) so it can be surfaced as part of a
-// meaningful error from Close if the process exits non-zero.
+// stdin/stdout. The subprocess's stderr is both captured (so it can be
+// surfaced as part of a meaningful error from Close if the process exits
+// non-zero) and passed straight through to this process's own stderr
+// live, as it arrives - not just replayed after the fact. That passthrough
+// is what lets a remote --server process's own itemize/verbose output
+// (see internal/cli's runServer, which writes exactly there, never to
+// stdout - stdout here is the framed wire protocol itself) actually
+// reach the local user's terminal during a real-time transfer, the same
+// way real rsync's own remote messages do.
 //
 // Host-key verification is never touched here: this deliberately never
 // adds flags like "-o StrictHostKeyChecking=no" or a null
@@ -56,7 +63,7 @@ func Dial(rsh, user, host string, remoteArgs []string) (*Session, error) {
 	}
 
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Start(); err != nil {
 		// Unlike the StdoutPipe case above, Start failing here *does*

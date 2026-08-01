@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 )
 
@@ -59,7 +60,7 @@ func TestDaemon_RealTCP_AnonymousDownload(t *testing.T) {
 		t.Fatalf("DialAuth: %v", err)
 	}
 	dest := t.TempDir()
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -101,7 +102,7 @@ func TestDaemon_RealTCP_AuthenticatedUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
-	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}); err != nil {
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -161,5 +162,90 @@ func TestDaemon_RealTCP_ModuleListing(t *testing.T) {
 	}
 	if bytes.Contains([]byte(joined), []byte("hidden")) {
 		t.Errorf("listing = %q, want it to NOT contain the hidden module", joined)
+	}
+}
+
+// TestDaemon_RealTCP_DryRunPutMakesNoChanges is the daemon protocol's
+// real proof for the dry-run wire extension: a DirectionPut with
+// ReceiverOptions.DryRun set sends "put --dry-run" on the direction line
+// (see dryRunToken), and the module's directory - where ServeModule's
+// Receiver actually runs - must stay completely empty afterward, over an
+// actual TCP connection, not just a same-process pipe.
+func TestDaemon_RealTCP_DryRunPutMakesNoChanges(t *testing.T) {
+	modRoot := t.TempDir()
+	cfg := &Config{Modules: map[string]Module{
+		"incoming": {Name: "incoming", Path: modRoot, ReadOnly: false},
+	}}
+	addr, errLog := startTestDaemon(t, cfg)
+
+	client := dialTestDaemon(t, addr)
+	if _, err := DialGreeting(client, "incoming"); err != nil {
+		t.Fatalf("DialGreeting: %v", err)
+	}
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
+		t.Fatalf("DialAuth: %v", err)
+	}
+
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "upload.txt"), "should never be written to the module")
+	rules, err := sync.CompileRules(nil)
+	if err != nil {
+		t.Fatalf("compiling empty rule set: %v", err)
+	}
+	ropts := pipeline.ReceiverOptions{DryRun: true}
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+		t.Fatalf("DialModule: %v", err)
+	}
+
+	entries, err := os.ReadDir(modRoot)
+	if err != nil {
+		t.Fatalf("ReadDir(modRoot): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("module directory is not empty after a dry-run put: %v", entries)
+	}
+	if errLog.Len() != 0 {
+		t.Errorf("daemon error log = %q, want empty", errLog.String())
+	}
+}
+
+// TestDaemon_RealTCP_DryRunGetMakesNoChanges is DryRun's counterpart for
+// DirectionGet: unlike PUT, this needs no protocol extension at all - the
+// client's own Receiver runs locally here, so ReceiverOptions.DryRun is
+// simply consulted directly, the same as a local sync - but it's worth
+// proving over a real daemon connection too, not just assumed from the
+// PUT case working.
+func TestDaemon_RealTCP_DryRunGetMakesNoChanges(t *testing.T) {
+	modRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(modRoot, "readme.txt"), "should never be downloaded")
+
+	cfg := &Config{Modules: map[string]Module{
+		"public": {Name: "public", Path: modRoot, ReadOnly: true, List: true},
+	}}
+	addr, errLog := startTestDaemon(t, cfg)
+
+	client := dialTestDaemon(t, addr)
+	if _, err := DialGreeting(client, "public"); err != nil {
+		t.Fatalf("DialGreeting: %v", err)
+	}
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
+		t.Fatalf("DialAuth: %v", err)
+	}
+
+	dest := t.TempDir()
+	ropts := pipeline.ReceiverOptions{DryRun: true}
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+		t.Fatalf("DialModule: %v", err)
+	}
+
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		t.Fatalf("ReadDir(dest): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destination is not empty after a dry-run get: %v", entries)
+	}
+	if errLog.Len() != 0 {
+		t.Errorf("daemon error log = %q, want empty", errLog.String())
 	}
 }
