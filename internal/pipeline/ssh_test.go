@@ -79,7 +79,7 @@ func TestSSHLocalhost_SyncRoundTrip(t *testing.T) {
 
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil)
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
 	}()
 
 	select {

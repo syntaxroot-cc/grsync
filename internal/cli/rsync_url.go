@@ -31,8 +31,11 @@ const dialDaemonTimeout = 10 * time.Second
 // daemon.DialClient, which runs the real handshake/authentication and
 // then the same pipeline.Sender every other destination uses - this
 // function's only job is to get from a URL to a net.Conn and supply the
-// credentials, not to know anything about the transfer itself.
-func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule) error {
+// credentials, not to know anything about the transfer itself. hardLinks
+// is the only AttrOptions field DialClient's Sender-side (DirectionPut)
+// call actually consults, but it's threaded through as a full
+// sync.AttrOptions to match DialClient's own signature.
+func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool) error {
 	port := u.Port
 	if port == 0 {
 		port = daemon.DefaultPort
@@ -46,5 +49,5 @@ func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, w
 	defer func() { _ = nc.Close() }()
 
 	user := resolveUser(u.User)
-	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{})
+	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{HardLinks: hardLinks})
 }

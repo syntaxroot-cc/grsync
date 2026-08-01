@@ -70,13 +70,14 @@ func moduleRules(m Module) ([]sync.Rule, error) {
 	return sync.CompileRules(raw)
 }
 
-// moduleAttrOptions is what a daemon module preserves on an upload.
-// Fixed, rather than client-controlled, since the module (not the
-// client) owns what its own rsyncd.conf-configured directory considers
-// worth preserving - a client can't currently ask a module to preserve
-// more or less than this.
+// moduleAttrOptions is what a daemon module preserves - on an upload
+// (applied by the receiving Receiver) and, via its HardLinks field, on a
+// download too (consulted by the sending Sender). Fixed, rather than
+// client-controlled, since the module (not the client) owns what its own
+// rsyncd.conf-configured directory considers worth preserving - a client
+// can't currently ask a module to preserve more or less than this.
 func moduleAttrOptions() sync.AttrOptions {
-	return sync.AttrOptions{Perms: true, Times: true, Owner: true, Group: true, Links: true}
+	return sync.AttrOptions{Perms: true, Times: true, Owner: true, Group: true, Links: true, HardLinks: true}
 }
 
 // ServeModule runs one authenticated client's session against the
@@ -115,7 +116,7 @@ func ServeModule(c *conn, m Module) error {
 		if err != nil {
 			return fmt.Errorf("compiling module %q exclude rules: %w", m.Name, err)
 		}
-		if err := pipeline.Sender(c, m.Path, sync.WalkOptions{Recursive: true}, rules); err != nil {
+		if err := pipeline.Sender(c, m.Path, sync.WalkOptions{Recursive: true}, rules, moduleAttrOptions().HardLinks); err != nil {
 			return err
 		}
 		return waitForTransferDone(c)
@@ -133,9 +134,12 @@ func ServeModule(c *conn, m Module) error {
 // requested direction, waits for the server's ack (see ServeModule) and
 // fails without touching the pipeline at all if it's an @ERROR instead,
 // then runs the matching pipeline side against localPath. rules and
-// walkOpts only matter for DirectionPut (they govern what the client's
-// own Sender walk includes); attrOpts only matters for DirectionGet (what
-// the client's own Receiver preserves).
+// walkOpts govern what the client's own Sender walk includes on a
+// DirectionPut; attrOpts governs what the client's own Receiver preserves
+// on a DirectionGet, and its HardLinks field also governs whether a
+// DirectionPut's Sender detects hard links at all - the same field
+// serves both directions since it's one "does the client want hard links
+// preserved" decision either way.
 func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions) error {
 	if err := writeLine(c.w, string(direction)); err != nil {
 		return fmt.Errorf("sending direction: %w", err)
@@ -156,7 +160,7 @@ func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rul
 		}
 		return writeLine(c.w, transferDone)
 	case DirectionPut:
-		if err := pipeline.Sender(c, localPath, walkOpts, rules); err != nil {
+		if err := pipeline.Sender(c, localPath, walkOpts, rules, attrOpts.HardLinks); err != nil {
 			return err
 		}
 		return waitForTransferDone(c)

@@ -11,11 +11,15 @@ import (
 )
 
 // Receiver runs the receiving side of a sync over rw: receives the
-// sender's file list, then for each entry either creates it directly
-// (directories, symlinks - both have everything they need already inside
-// the FileEntry, no round trip required) or exchanges a signature/delta
-// with the sender (regular files) to reconstruct its bytes, applying
-// attributes per opts along the way.
+// sender's file list (with its hard-link grouping), then for each entry
+// either creates it directly (directories, symlinks - both have
+// everything they need already inside the FileEntry, no round trip
+// required), exchanges a signature/delta with the sender (a regular file
+// that is either unlinked or the first-seen member of a hard-link
+// group), or - for every other member of a hard-link group - is skipped
+// here entirely and instead recreated as a real hard link once its
+// group's first member has been fully written, in the dedicated pass
+// below. Attributes are applied per opts along the way.
 //
 // A destination file not mentioned in the sender's list is never touched
 // at all: Receiver only ever acts on paths that appear in the received
@@ -23,9 +27,20 @@ import (
 // reconcile against it, so nothing here can delete or corrupt an
 // unrelated file. (Full --delete semantics are explicitly out of scope.)
 func Receiver(rw io.ReadWriter, dest string, opts sync.AttrOptions) error {
-	entries, err := recvFileList(rw)
+	entries, groups, err := recvFileList(rw)
 	if err != nil {
 		return fmt.Errorf("receiving file list: %w", err)
+	}
+
+	// secondary marks every hard-link group member except the first:
+	// group[0] is written normally, like any other regular file, and
+	// every other member is linked to it in the dedicated pass below
+	// instead of being written out a second time.
+	secondary := make(map[string]bool)
+	for _, group := range groups {
+		for _, path := range group[1:] {
+			secondary[path] = true
+		}
 	}
 
 	// Directory attributes are deferred to a final pass below, applied
@@ -37,7 +52,10 @@ func Receiver(rw io.ReadWriter, dest string, opts sync.AttrOptions) error {
 	// at all. Walk's own sort guarantees a parent directory's entry
 	// always precedes its children's in entries, so collecting them here
 	// in list order and processing that collection in reverse gives
-	// children-before-parents for free, without a second sort.
+	// children-before-parents for free, without a second sort. The
+	// hard-link pass runs before this one for the same reason: os.Link
+	// creates a new directory entry too, and doing that after a
+	// directory's final mtime was already set would bump it right back.
 	var dirEntries []sync.FileEntry
 
 	for _, entry := range entries {
@@ -59,10 +77,19 @@ func Receiver(rw io.ReadWriter, dest string, opts sync.AttrOptions) error {
 				return fmt.Errorf("creating symlink %q: %w", entry.Path, err)
 			}
 			continue
+
+		case secondary[entry.Path]:
+			continue
 		}
 
 		if err := receiveRegularFile(rw, destPath, entry, opts); err != nil {
 			return err
+		}
+	}
+
+	for _, group := range groups {
+		if err := sync.ApplyHardLinks(dest, group); err != nil {
+			return fmt.Errorf("linking hard-link group starting at %q: %w", group[0], err)
 		}
 	}
 

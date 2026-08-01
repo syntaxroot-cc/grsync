@@ -33,15 +33,19 @@ func effectiveWalkOptions(opts *options) sync.WalkOptions {
 // effectiveAttrOptions computes sync.AttrOptions from opts: --archive
 // implies perms/times/owner/group/links, matching real rsync's -a
 // (-rlptgoD, minus the r which effectiveWalkOptions handles, and minus
-// devices/specials - see the README's note on why hard links and device
-// files are deferred rather than wired up here).
+// devices/specials - see the README's note on why device files are
+// deferred rather than wired up here). HardLinks is deliberately NOT
+// included in that implication: real rsync's own -a does not imply -H
+// either (-a is exactly -rlptgoD, no H), so --archive alone must not
+// turn hard-link detection on.
 func effectiveAttrOptions(opts *options) sync.AttrOptions {
 	return sync.AttrOptions{
-		Perms: opts.archive || opts.perms,
-		Times: opts.archive || opts.times,
-		Owner: opts.archive || opts.owner,
-		Group: opts.archive || opts.group,
-		Links: opts.archive || opts.links,
+		Perms:     opts.archive || opts.perms,
+		Times:     opts.archive || opts.times,
+		Owner:     opts.archive || opts.owner,
+		Group:     opts.archive || opts.group,
+		Links:     opts.archive || opts.links,
+		HardLinks: opts.hardLinks,
 	}
 }
 
@@ -122,11 +126,11 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 	for _, src := range sources {
 		switch {
 		case isRsyncDaemon:
-			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules); err != nil {
+			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		case isRemote:
-			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules); err != nil {
+			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		default:
@@ -153,7 +157,7 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
-	go func() { senderErrCh <- pipeline.Sender(sender, src, walkOpts, rules) }()
+	go func() { senderErrCh <- pipeline.Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
 
 	receiverErr := pipeline.Receiver(receiver, dest, attrOpts)
 	senderErr := <-senderErrCh
@@ -167,7 +171,7 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // syncToRemote spawns `grsync --server DEST` on the remote host via SSH
 // (or whatever --rsh overrides it to), performs the handshake, then runs
 // the sender side of the pipeline against that connection.
-func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule) error {
+func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool) error {
 	session, err := transport.Dial(rsh, remote.User, remote.Host, []string{"grsync", "--server", remote.Path})
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", remote.Host, err)
@@ -178,7 +182,7 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 		return fmt.Errorf("handshake with %s failed: %w", remote.Host, err)
 	}
 
-	sendErr := pipeline.Sender(session, src, walkOpts, rules)
+	sendErr := pipeline.Sender(session, src, walkOpts, rules, hardLinks)
 	closeErr := session.Close()
 
 	if sendErr != nil {

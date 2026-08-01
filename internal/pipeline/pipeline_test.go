@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,7 +26,7 @@ func runSenderReceiver(t *testing.T, src, dest string, walkOpts sync.WalkOptions
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
-	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules) }()
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
 
 	receiverErrCh := make(chan error, 1)
 	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts) }()
@@ -186,6 +187,254 @@ func TestSenderReceiver_DirectoryAttributesSurviveChildCreation(t *testing.T) {
 	}
 }
 
+// TestSenderReceiver_HardLinks is SC-18's end-to-end proof, with
+// AttrOptions.HardLinks explicitly requested (the -H/--hard-links
+// opt-in - see TestSenderReceiver_HardLinksNotPreservedWithoutOptIn for
+// the default-off case): two hard-linked source files must arrive at the
+// destination still hard-linked to each other (the same underlying file,
+// not two independent copies that merely happen to have identical
+// content), and an unrelated third file must NOT be linked to either of
+// them. Where this platform can't detect hard links at all (Windows -
+// sync.HardLinksSupported()), the same sync must still succeed and
+// produce byte-correct content - as independent copies, not an error -
+// exactly the graceful-degradation behavior sync.DetectHardLinks itself
+// already documents.
+//
+// os.SameFile is used for the linked/unlinked check rather than
+// platform-specific stat code in the test itself: it reports genuine
+// same-file identity on every platform Go supports, including Windows
+// (via the Win32 file index), even though grsync's own hard-link
+// *detection* can't see that identity there - so this test can assert
+// the real, portable ground truth regardless of what grsync itself was
+// able to observe.
+func TestSenderReceiver_HardLinks(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(srcRoot, "original.txt"), "shared content")
+	mustWriteFile(t, filepath.Join(srcRoot, "unrelated.txt"), "different content, must stay independent")
+	if err := os.Link(filepath.Join(srcRoot, "original.txt"), filepath.Join(srcRoot, "linked.txt")); err != nil {
+		t.Skipf("hard link creation unsupported in this environment: %v", err)
+	}
+
+	runSenderReceiver(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{Perms: true, Times: true, HardLinks: true})
+
+	assertSameContent(t, filepath.Join(srcRoot, "original.txt"), filepath.Join(destRoot, "original.txt"))
+	assertSameContent(t, filepath.Join(srcRoot, "linked.txt"), filepath.Join(destRoot, "linked.txt"))
+	assertSameContent(t, filepath.Join(srcRoot, "unrelated.txt"), filepath.Join(destRoot, "unrelated.txt"))
+
+	destOriginal := filepath.Join(destRoot, "original.txt")
+	destLinked := filepath.Join(destRoot, "linked.txt")
+	destUnrelated := filepath.Join(destRoot, "unrelated.txt")
+
+	originalInfo, err := os.Stat(destOriginal)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destOriginal, err)
+	}
+	linkedInfo, err := os.Stat(destLinked)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destLinked, err)
+	}
+	unrelatedInfo, err := os.Stat(destUnrelated)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destUnrelated, err)
+	}
+
+	if os.SameFile(originalInfo, unrelatedInfo) {
+		t.Fatalf("%q and %q are the same file, want independent - unrelated.txt must never be linked to the hard-link group", destOriginal, destUnrelated)
+	}
+
+	if !sync.HardLinksSupported() {
+		if os.SameFile(originalInfo, linkedInfo) {
+			t.Fatalf("%q and %q are the same file on a platform where HardLinksSupported() is false - "+
+				"expected independent copies (graceful degradation), not a link this platform can't have detected", destOriginal, destLinked)
+		}
+		return
+	}
+
+	if !os.SameFile(originalInfo, linkedInfo) {
+		t.Fatalf("%q and %q are independent files at the destination, want them hard-linked (same underlying file) like they are at the source", destOriginal, destLinked)
+	}
+
+	// Prove it directly, not just via os.SameFile: a write through one
+	// path must be visible through the other, the same proof
+	// internal/sync's own TestApplyHardLinks uses.
+	if err := os.WriteFile(destLinked, []byte("changed via the linked path"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", destLinked, err)
+	}
+	got, err := os.ReadFile(destOriginal)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", destOriginal, err)
+	}
+	if string(got) != "changed via the linked path" {
+		t.Errorf("%q content = %q after writing through %q, want the change to be visible (they should be the same file)", destOriginal, got, destLinked)
+	}
+}
+
+// TestSenderReceiver_HardLinksNotPreservedWithoutOptIn is
+// TestSenderReceiver_HardLinks's counterpart for the default case:
+// without AttrOptions.HardLinks set, hard-linked source files must sync
+// as independent copies - correct content, but not linked - even on a
+// platform that could have detected and preserved the relationship. This
+// is the direct proof that hard-link detection is genuinely opt-in
+// (matching real rsync's own -H/--hard-links, not implied by any other
+// flag), not just documented as opt-in while actually running
+// unconditionally.
+func TestSenderReceiver_HardLinksNotPreservedWithoutOptIn(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(srcRoot, "original.txt"), "shared content")
+	if err := os.Link(filepath.Join(srcRoot, "original.txt"), filepath.Join(srcRoot, "linked.txt")); err != nil {
+		t.Skipf("hard link creation unsupported in this environment: %v", err)
+	}
+
+	runSenderReceiver(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{Perms: true, Times: true}) // HardLinks left false
+
+	assertSameContent(t, filepath.Join(srcRoot, "original.txt"), filepath.Join(destRoot, "original.txt"))
+	assertSameContent(t, filepath.Join(srcRoot, "linked.txt"), filepath.Join(destRoot, "linked.txt"))
+
+	originalInfo, err := os.Stat(filepath.Join(destRoot, "original.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	linkedInfo, err := os.Stat(filepath.Join(destRoot, "linked.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if os.SameFile(originalInfo, linkedInfo) {
+		t.Errorf("destination files are hard-linked despite AttrOptions.HardLinks being false - " +
+			"hard-link detection must be opt-in, not run unconditionally")
+	}
+}
+
+// TestReceiver_AppliesHardLinksFromReceivedGroups exercises Receiver's
+// hard-link handling directly against a hand-built file list, the same
+// way TestReceiver_ConnectionDropsMidTransfer drives Receiver against a
+// raw peer goroutine rather than a real Sender. This matters on a
+// platform where sync.HardLinksSupported() is false (Windows): Receiver's
+// own linking logic - skip a group's secondary members in the main loop,
+// link them once their primary is written - has nothing to do with
+// whether *this* platform's Sender could have detected the grouping, so
+// it can and should be verified directly, standing in for whatever
+// Sender a real Linux/macOS peer would be running.
+//
+// The peer goroutine responds to a signature request for "original.txt"
+// only; if Receiver incorrectly asked for a signature for "linked.txt"
+// too (i.e. failed to skip it as a secondary member), nothing would ever
+// answer that second request and the test would time out rather than
+// silently pass.
+func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
+	destRoot := t.TempDir()
+
+	peerReadsFromReceiver, receiverWritesToPeer := io.Pipe()
+	receiverReadsFromPeer, peerWritesToReceiver := io.Pipe()
+	receiver := pipeReadWriter{Reader: receiverReadsFromPeer, Writer: receiverWritesToPeer}
+
+	// Named so the alphabetical sort order sync.DetectHardLinks itself
+	// would produce is obvious at a glance: "aaa-primary.txt" sorts
+	// first, so it's group[0] - the member Receiver writes normally -
+	// and "zzz-secondary.txt" is the one that must be skipped and linked
+	// instead.
+	const content = "shared content, sent once for the whole group"
+	entries := []sync.FileEntry{
+		{Path: "aaa-primary.txt", Mode: 0o644, Size: int64(len(content))},
+		{Path: "unrelated.txt", Mode: 0o644, Size: 5},
+		{Path: "zzz-secondary.txt", Mode: 0o644, Size: int64(len(content))},
+	}
+	groups := []sync.HardLinkGroup{{"aaa-primary.txt", "zzz-secondary.txt"}}
+
+	peerErrCh := make(chan error, 1)
+	go func() {
+		if err := sendFileList(peerWritesToReceiver, entries, groups); err != nil {
+			peerErrCh <- fmt.Errorf("sending file list: %w", err)
+			return
+		}
+
+		sigMsg, err := recvSignature(peerReadsFromReceiver)
+		if err != nil {
+			peerErrCh <- fmt.Errorf("receiving signature: %w", err)
+			return
+		}
+		if sigMsg.Path != "aaa-primary.txt" {
+			peerErrCh <- fmt.Errorf("signature requested for %q, want only \"aaa-primary.txt\" - "+
+				"\"zzz-secondary.txt\" (a hard-link group's secondary member) must never reach the signature/delta exchange", sigMsg.Path)
+			return
+		}
+		ops := sync.GenerateDelta(sigMsg.Sig, []byte(content))
+		if err := sendDelta(peerWritesToReceiver, "aaa-primary.txt", ops); err != nil {
+			peerErrCh <- fmt.Errorf("sending delta: %w", err)
+			return
+		}
+
+		sigMsg, err = recvSignature(peerReadsFromReceiver)
+		if err != nil {
+			peerErrCh <- fmt.Errorf("receiving signature: %w", err)
+			return
+		}
+		if sigMsg.Path != "unrelated.txt" {
+			peerErrCh <- fmt.Errorf("signature requested for %q, want \"unrelated.txt\"", sigMsg.Path)
+			return
+		}
+		ops = sync.GenerateDelta(sigMsg.Sig, []byte("xxxxx"))
+		if err := sendDelta(peerWritesToReceiver, "unrelated.txt", ops); err != nil {
+			peerErrCh <- fmt.Errorf("sending delta: %w", err)
+			return
+		}
+
+		peerErrCh <- nil
+	}()
+
+	receiverErrCh := make(chan error, 1)
+	go func() { receiverErrCh <- Receiver(receiver, destRoot, sync.AttrOptions{}) }()
+
+	select {
+	case err := <-receiverErrCh:
+		if err != nil {
+			t.Fatalf("Receiver returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Receiver did not complete within 10s - likely blocked waiting for a signature request for the secondary hard-link member that should have been skipped")
+	}
+	if err := <-peerErrCh; err != nil {
+		t.Fatalf("peer goroutine: %v", err)
+	}
+
+	destPrimary := filepath.Join(destRoot, "aaa-primary.txt")
+	destSecondary := filepath.Join(destRoot, "zzz-secondary.txt")
+	destUnrelated := filepath.Join(destRoot, "unrelated.txt")
+
+	primaryInfo, err := os.Stat(destPrimary)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destPrimary, err)
+	}
+	secondaryInfo, err := os.Stat(destSecondary)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destSecondary, err)
+	}
+	unrelatedInfo, err := os.Stat(destUnrelated)
+	if err != nil {
+		t.Fatalf("Stat %q: %v", destUnrelated, err)
+	}
+
+	if !os.SameFile(primaryInfo, secondaryInfo) {
+		t.Errorf("%q and %q are independent files, want them hard-linked", destPrimary, destSecondary)
+	}
+	if os.SameFile(primaryInfo, unrelatedInfo) {
+		t.Errorf("%q and %q are the same file, want independent", destPrimary, destUnrelated)
+	}
+
+	got, err := os.ReadFile(destSecondary)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", destSecondary, err)
+	}
+	if string(got) != content {
+		t.Errorf("%q content = %q, want %q", destSecondary, got, content)
+	}
+}
+
 // TestSender_ConnectionDropsMidTransfer confirms a dropped connection
 // produces a prompt, clear error - not a hang and not a silently
 // swallowed failure. The "receiver" here reads the file list (so Sender
@@ -210,7 +459,7 @@ func TestSender_ConnectionDropsMidTransfer(t *testing.T) {
 	}()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- Sender(sender, srcRoot, sync.WalkOptions{Recursive: true}, nil) }()
+	go func() { errCh <- Sender(sender, srcRoot, sync.WalkOptions{Recursive: true}, nil, false) }()
 
 	select {
 	case err := <-errCh:
@@ -234,7 +483,7 @@ func TestReceiver_ConnectionDropsMidTransfer(t *testing.T) {
 	receiver := pipeReadWriter{Reader: receiverReadsFromPeer, Writer: receiverWritesToPeer}
 
 	go func() {
-		_ = sendFileList(peerWritesToReceiver, []sync.FileEntry{{Path: "file.txt", Mode: 0o644}})
+		_ = sendFileList(peerWritesToReceiver, []sync.FileEntry{{Path: "file.txt", Mode: 0o644}}, nil)
 		// Read (and discard) the signature Receiver sends back for
 		// file.txt, then vanish - closing both pipe halves without ever
 		// sending a delta.

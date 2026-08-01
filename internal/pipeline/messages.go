@@ -126,24 +126,36 @@ func readTypedFrame(rw io.Reader, want transport.FrameType, what string) (transp
 	return f, nil
 }
 
-func sendFileList(w io.Writer, entries []sync.FileEntry) error {
-	payload, err := encodeGob(entries)
+// fileListMessage is FrameFileList's payload: the filtered file list plus
+// which entries are hard-linked to each other on the source, so that
+// grouping travels with the list itself rather than needing a separate
+// round trip - HardLinkGroups is empty exactly when there's nothing to
+// say about hard links, either because the source tree has none or
+// because the sending platform can't detect them (sync.HardLinksSupported()
+// is false).
+type fileListMessage struct {
+	Entries        []sync.FileEntry
+	HardLinkGroups []sync.HardLinkGroup
+}
+
+func sendFileList(w io.Writer, entries []sync.FileEntry, groups []sync.HardLinkGroup) error {
+	payload, err := encodeGob(fileListMessage{Entries: entries, HardLinkGroups: groups})
 	if err != nil {
 		return fmt.Errorf("encoding file list: %w", err)
 	}
 	return transport.WriteFrame(w, transport.Frame{Type: transport.FrameFileList, Payload: payload})
 }
 
-func recvFileList(r io.Reader) ([]sync.FileEntry, error) {
+func recvFileList(r io.Reader) ([]sync.FileEntry, []sync.HardLinkGroup, error) {
 	f, err := readTypedFrame(r, transport.FrameFileList, "file list")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var entries []sync.FileEntry
-	if err := decodeGob(f.Payload, &entries); err != nil {
-		return nil, fmt.Errorf("decoding file list: %w", err)
+	var msg fileListMessage
+	if err := decodeGob(f.Payload, &msg); err != nil {
+		return nil, nil, fmt.Errorf("decoding file list: %w", err)
 	}
-	return entries, nil
+	return msg.Entries, msg.HardLinkGroups, nil
 }
 
 func sendSignature(w io.Writer, path string, sig sync.Signature) error {

@@ -12,8 +12,11 @@ requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
 out of scope (compression, progress reporting, `--dry-run`, partial/
-append transfers, batch mode, full `--delete`, hard links, and device/
-special files) - this is real, working sync, not yet full feature parity.
+append transfers, batch mode, full `--delete`, and device/special files)
+- this is real, working sync, not yet full feature parity. Hard links
+*are* now preserved, opt-in via `-H`/`--hard-links` exactly like real
+rsync's own flag (see
+[File Attribute Preservation](#file-attribute-preservation) below).
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -69,6 +72,7 @@ argument is always the destination.
 | `--owner` | `-o` | preserve owner (implied by `--archive`; requires appropriate privileges) |
 | `--group` | `-g` | preserve group (implied by `--archive`; requires appropriate privileges) |
 | `--links` | `-l` | recreate symlinks as symlinks (implied by `--archive`) |
+| `--hard-links` | `-H` | preserve hard links between files in the source (**NOT** implied by `--archive`, matching real rsync's own `-a`) |
 | `--daemon` | | run as an rsync-protocol daemon, serving modules from `--config` (see [rsync Daemon Mode](#rsync-daemon-mode)) |
 | `--config PATH` | | path to the `rsyncd.conf` to serve (required with `--daemon`) |
 | `--port PORT` | | TCP port to listen on in `--daemon` mode (default `873`, matching rsync) |
@@ -175,6 +179,44 @@ capture.
   Call `sync.HardLinksSupported()` to tell "this platform can't detect
   hard links" apart from "this tree just has none," rather than guessing
   from an empty result.
+
+  **Wired into the actual sync pipeline, opt-in via `-H`/`--hard-links`**
+  - exactly matching real rsync's own flag, including that `--archive`
+  does *not* imply it (real rsync's `-a` is `-rlptgoD`, no `H`; see
+  `effectiveAttrOptions` in `internal/cli/sync.go`). Only when requested,
+  `pipeline.Sender` runs `sync.DetectHardLinks` over the filtered file
+  list (skipping the call entirely, not just discarding its result, when
+  `sync.HardLinksSupported()` is false - no point paying for a per-entry
+  `Lstat` pass that would always come back empty either way) and attaches
+  the grouping to the same `FrameFileList` message the entries themselves
+  travel in, rather than a separate round trip. `pipeline.Receiver`
+  writes each group's first member through the normal signature/delta
+  path and recreates every other member with `sync.ApplyHardLinks`
+  (`os.Link`) instead of re-transferring bytes that are identical by
+  definition - in a pass that runs after every regular file is written
+  but *before* the deferred directory-attributes pass, since `os.Link`
+  touches its parent directory's mtime the same way creating any other
+  file does. Detection only has to succeed on the *sending* side:
+  `os.Link` itself works on Windows too, so a Linux/macOS sender pushing
+  to a Windows destination still produces real hard links there, even
+  though a Windows source's own links can't be detected in the first
+  place.
+
+  Tested end to end with `TestSenderReceiver_HardLinks` in
+  `internal/pipeline/pipeline_test.go` (proving the destination files are
+  genuinely the same file, not independent copies with matching content
+  - and that this degrades to correct independent copies, not an error,
+  where `HardLinksSupported()` is false),
+  `TestSenderReceiver_HardLinksNotPreservedWithoutOptIn` (the direct
+  proof that omitting `-H` really does leave files unlinked, not just
+  documented as opt-in while actually running unconditionally),
+  `TestReceiver_AppliesHardLinksFromReceivedGroups` (proving `Receiver`
+  never asks for a signature for a group's secondary member, regardless
+  of what the current platform can detect), and - at the real CLI command
+  level, in `internal/cli/sync_test.go` -
+  `TestE2E_HardLinksPreservedWithFlag`/`TestE2E_ArchiveAloneDoesNotImplyHardLinks`,
+  the latter being the specific regression test for `--archive` never
+  silently turning this on.
 - **Device/special files** (`sync.ApplySpecialFile`): deliberately scoped
   down. Named pipes (FIFOs) are fully created via `Mkfifo`, since that
   needs no elevated privilege. Sockets and character/block devices are
@@ -301,13 +343,11 @@ ticket): compression, progress reporting, real `--dry-run` (still the
 flag-echoing placeholder, to avoid silently performing a real sync when a
 dry run was requested), partial/append transfers, batch mode, pulling
 from a remote source (only local-source syncs are supported - push, not
-pull), and - carried over from SC-8 - hard links and device/special
-files. `sync.DetectHardLinks`/`sync.ApplyHardLinks`/`sync.ApplySpecialFile`
-exist and are tested, but nothing in `pipeline.Receiver` calls them yet;
-wiring them in is a reasonable, low-risk follow-up (hard links
-particularly, since unlike device files it needs no elevated privilege)
-but was left out of this already-large integration ticket rather than
-expanding its scope further.
+pull), and device/special files. `sync.ApplySpecialFile` exists and is
+tested, but nothing in `pipeline.Receiver` calls it yet - unlike hard
+links (see [File Attribute Preservation](#file-attribute-preservation)
+above, now wired in), this needs elevated privilege to test meaningfully
+and was left out rather than expanding this integration further.
 
 ## rsync Daemon Mode
 

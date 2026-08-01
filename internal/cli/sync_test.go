@@ -40,6 +40,76 @@ func TestE2E_LocalToLocal(t *testing.T) {
 	assertTreesMatch(t, src, dst, symlinksSupported)
 }
 
+// TestE2E_HardLinksPreservedWithFlag drives the real CLI command with
+// -H/--hard-links and confirms two hard-linked source files arrive at
+// the destination still hard-linked to each other (os.SameFile), not
+// independent copies that merely have matching content.
+func TestE2E_HardLinksPreservedWithFlag(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(src, "original.txt"), "shared content")
+	if err := os.Link(filepath.Join(src, "original.txt"), filepath.Join(src, "linked.txt")); err != nil {
+		t.Skipf("hard link creation unsupported in this environment: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("sync.HardLinksSupported() is false on Windows - grsync's own detection can't observe the link created above, so this platform always produces independent copies regardless of -H; see TestSenderReceiver_HardLinks for the graceful-degradation proof")
+	}
+
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"-a", "-H", src, dst})
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	originalInfo, err := os.Stat(filepath.Join(dst, "original.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	linkedInfo, err := os.Stat(filepath.Join(dst, "linked.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if !os.SameFile(originalInfo, linkedInfo) {
+		t.Errorf("destination files are independent, want them hard-linked (-H was given)")
+	}
+}
+
+// TestE2E_ArchiveAloneDoesNotImplyHardLinks is the critical correctness
+// check behind -H being opt-in: --archive alone (no -H) must NOT
+// preserve hard links, exactly matching real rsync's own -a (-rlptgoD,
+// no H). Without this, "-H defaults to off" would be true in name only
+// if --archive silently turned it on anyway.
+func TestE2E_ArchiveAloneDoesNotImplyHardLinks(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(src, "original.txt"), "shared content")
+	if err := os.Link(filepath.Join(src, "original.txt"), filepath.Join(src, "linked.txt")); err != nil {
+		t.Skipf("hard link creation unsupported in this environment: %v", err)
+	}
+
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"-a", src, dst}) // -a, deliberately no -H
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	originalInfo, err := os.Stat(filepath.Join(dst, "original.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	linkedInfo, err := os.Stat(filepath.Join(dst, "linked.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if os.SameFile(originalInfo, linkedInfo) {
+		t.Errorf("destination files are hard-linked despite -H not being given - --archive must not imply -H, matching real rsync's own -a (-rlptgoD, no H)")
+	}
+}
+
 // assertTreesMatch walks both roots and compares every entry: path,
 // directory-ness, permission bits (platform-aware, see wantPermCLI),
 // modification time, and - for regular files - content, and for
