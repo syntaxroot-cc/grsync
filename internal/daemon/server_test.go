@@ -55,7 +55,7 @@ func TestDaemon_RealTCP_AnonymousDownload(t *testing.T) {
 	if _, err := DialGreeting(client, "public"); err != nil {
 		t.Fatalf("DialGreeting: %v", err)
 	}
-	if err := DialAuth(client, "", ""); err != nil {
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
 		t.Fatalf("DialAuth: %v", err)
 	}
 	dest := t.TempDir()
@@ -91,7 +91,7 @@ func TestDaemon_RealTCP_AuthenticatedUpload(t *testing.T) {
 	if _, err := DialGreeting(client, "incoming"); err != nil {
 		t.Fatalf("DialGreeting: %v", err)
 	}
-	if err := DialAuth(client, "alice", "hunter2"); err != nil {
+	if err := DialAuth(client, "alice", StaticPassword("hunter2")); err != nil {
 		t.Fatalf("DialAuth: %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestDaemon_RealTCP_WrongPasswordRejected(t *testing.T) {
 	if _, err := DialGreeting(client, "private"); err != nil {
 		t.Fatalf("DialGreeting: %v", err)
 	}
-	if err := DialAuth(client, "alice", "wrong"); err == nil {
+	if err := DialAuth(client, "alice", StaticPassword("wrong")); err == nil {
 		t.Fatalf("DialAuth with a wrong password returned nil error, want an error")
 	}
 }

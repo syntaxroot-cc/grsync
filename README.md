@@ -19,7 +19,11 @@ special files) - this is real, working sync, not yet full feature parity.
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
 listing, and real MD4 challenge-response authentication all match
 upstream rsync, verified against its actual source rather than assumed.
-See [rsync Daemon Mode](#rsync-daemon-mode) below for exactly what that
+**`rsync://host/module` is now a real destination argument to the main
+`grsync SRC... DEST` command itself**, not just something exercised from
+`internal/daemon`'s own tests - `grsync -a src rsync://host/module` works
+today, credentials and all. See
+[rsync Daemon Mode](#rsync-daemon-mode) below for exactly what that
 covers and where it hands off to grsync's own (non-rsync-wire-format)
 transfer protocol.
 
@@ -68,6 +72,7 @@ argument is always the destination.
 | `--daemon` | | run as an rsync-protocol daemon, serving modules from `--config` (see [rsync Daemon Mode](#rsync-daemon-mode)) |
 | `--config PATH` | | path to the `rsyncd.conf` to serve (required with `--daemon`) |
 | `--port PORT` | | TCP port to listen on in `--daemon` mode (default `873`, matching rsync) |
+| `--password-file FILE` | | read an `rsync://` daemon password from FILE instead of `RSYNC_PASSWORD` or an interactive prompt (see [rsync Daemon Mode](#rsync-daemon-mode)) |
 
 All five filter-related flags share one ordered rule list - their relative
 order on the command line is preserved, matching rsync's first-match-wins
@@ -352,12 +357,58 @@ recognized parameter with a malformed value, is a hard parse error.
 `daemon.ParseURL` parses `rsync://[user@]host[:port]/module[/path]`,
 including the bare `rsync://host` and `rsync://host/` forms real rsync
 uses to mean "list this daemon's modules" rather than selecting one, and
-IPv6 literals. This parser is implemented and tested, but **not yet wired
-into the main `grsync SRC... DEST` sync command** - today it's only used
-internally (and by `internal/daemon`'s own tests) to build a connection by
-hand. Making `rsync://...` a valid source/destination argument the same
-way an SSH `user@host:path` already is would be a natural, low-risk
-follow-up.
+IPv6 literals.
+
+**`rsync://host/module` is a real destination argument to the main
+`grsync SRC... DEST` command**: `grsync -a src rsync://host/module`
+dials the daemon over plain TCP, runs the real handshake/auth below, then
+uploads through the same `pipeline.Sender` every other destination uses.
+`internal/cli`'s `isRsyncURL` distinguishes this from a local path or an
+SSH `user@host:path` by its `rsync://` prefix, checked before either of
+those is - `transport.ParseRemotePath` itself now also refuses anything
+containing `"://"`, so an `rsync://` URL is never valid SSH syntax by
+construction (a real ambiguity found and fixed while wiring this up: it
+used to parse as host `"rsync"`, path `"//host/module"`).
+
+Only pushing to a module (`grsync SRC rsync://host/module`) is supported,
+matching the existing SSH-transport restriction rather than introducing a
+new asymmetry - pulling *from* an `rsync://` source is rejected with a
+clear error, the same as pulling from an SSH source already is. A
+destination URL also can't yet target a sub-path within a module
+(`rsync://host/module/subdir`) - the daemon protocol itself (see below)
+only supports syncing an entire module, and that's explicitly out of
+scope to change here; grsync rejects this case with a clear error rather
+than silently ignoring the sub-path.
+
+**Credentials**: verified against real rsync's actual documented
+behavior (`rsync.1`'s "RSYNC_PASSWORD" and "--password-file" sections)
+rather than invented. The username is the URL's own `user@` part, else
+`USER`, else `LOGNAME` (`USER` wins if both are set), else `"nobody"` -
+real rsync's exact resolution order. The password comes from
+`--password-file FILE` (or stdin, if `FILE` is `-`) if given, else the
+`RSYNC_PASSWORD` environment variable, else an interactive,
+non-echoing terminal prompt - also real rsync's exact precedence.
+**There is deliberately no `--password` flag**: real rsync has never had
+one either, precisely because a password given directly as a
+command-line argument is visible to any other user on the same machine
+via the process list (`ps`), and an environment variable can leak the
+same way on some systems - which is exactly why `--password-file` exists
+and why grsync (matching real rsync) refuses a world-readable
+`--password-file` (POSIX only; see `checkPasswordFilePermissions`, split
+`_unix.go`/`_windows.go` the same way `internal/sync`'s ownership and
+hard-link handling already is).
+
+None of this is resolved eagerly: `daemon.PasswordFunc` is only ever
+called if the daemon actually sends `AUTHREQD`, exactly matching real
+rsync's own `auth_client()`, which is only ever invoked in response to
+that same line. Connecting to a module that turns out not to require
+authentication never prompts, never reads `--password-file`, and never
+consults `RSYNC_PASSWORD` - `TestDialClient_PasswordFuncNotCalledForAnonymousModule`
+in `internal/daemon/client_test.go` proves this directly, not just by
+absence of a prompt in a passing test. A multi-source sync against the
+same daemon destination resolves (and, if it comes to it, prompts) at
+most once for the whole invocation, not once per source, even though
+each source still gets its own connection (see `DialClient` below).
 
 ### Handshake and authentication
 
@@ -422,6 +473,15 @@ follows is not.** Like the SSH transport (see
 grsync daemon interoperates with another grsync client, not with a real
 `rsync` binary, exactly the same boundary that already exists for SSH.
 
+Server and client sides are each a single `net.Conn`-in/`error`-out entry
+point: `daemon.ServeConn` (accepted connections, used by `Serve`'s accept
+loop) and `daemon.DialClient` (outbound connections, used by
+`internal/cli`'s `syncToRsyncDaemon`). `DialClient` exists specifically
+because `DialGreeting`/`DialAuth`/`DialModule` are built around this
+package's own unexported connection type - before `DialClient`, nothing
+outside `internal/daemon` could actually call them, a gap found while
+wiring the CLI up to this package rather than one planned in advance.
+
 **Other scope boundaries:**
 - **`max connections` is parsed but not enforced** - nothing currently
   caps concurrent connections to a module at that number.
@@ -433,19 +493,28 @@ grsync daemon interoperates with another grsync client, not with a real
   auth response) is capped at 8 KiB, so an unauthenticated client can't
   force unbounded memory growth by sending data with no newline.
 
-Tested with `TestDaemon_RealTCP_*` in `internal/daemon/server_test.go`
-over an actual loopback TCP connection - listen, dial, full handshake,
-auth, and transfer - not just in-memory pipes standing in for a
+Tested with `TestDaemon_RealTCP_*` and `TestDialClient_*` in
+`internal/daemon`, and end to end through the real CLI command with
+`TestE2E_LocalToRsyncDaemon_*` in `internal/cli/rsync_url_test.go` - all
+over an actual loopback TCP connection (listen, dial, full handshake,
+auth, and transfer), not just in-memory pipes standing in for a
 connection, since (unlike the SSH tests) nothing external is needed to
-exercise this end to end.
+exercise this end to end. `internal/cli`'s tests drive the real
+`NewRootCmd()` command, the same way `TestE2E_LocalToLocal` does for a
+local sync, against a real daemon started in-process - not
+`internal/pipeline` or `internal/daemon` called directly.
 
 ## Architecture
 
 - `cmd/grsync` - CLI entrypoint.
-- `internal/cli` - flag/argument parsing (built on cobra) and now the
-  real sync entry point (`sync.go`): local-to-local runs the pipeline
-  in-process over an `io.Pipe`, local-to-remote spawns and drives it over
-  an SSH `Session`.
+- `internal/cli` - flag/argument parsing (built on cobra) and the real
+  sync entry point (`sync.go`): local-to-local runs the pipeline
+  in-process over an `io.Pipe`, local-to-remote (SSH) spawns and drives it
+  over an SSH `Session`, and local-to-`rsync://` (`rsync_url.go`) dials
+  the daemon over TCP and drives it through `internal/daemon`'s
+  `DialClient`; `credentials.go` resolves the username/password for the
+  latter, matching real rsync's own precedence (see
+  [rsync Daemon Mode](#rsync-daemon-mode) above).
 - `internal/pipeline` - wires `internal/sync` and `internal/transport`
   together into an actual sync; see
   [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) above.
@@ -454,11 +523,12 @@ exercise this end to end.
 - `internal/transport` - remote endpoint parsing, RSH command
   construction, frame protocol, subprocess session management, and the
   `--server` handshake.
-- `internal/daemon` - the rsync daemon protocol: `rsyncd.conf` and
-  `rsync://` URL parsing, the `@RSYNCD` greeting/handshake and module
+- `internal/daemon` - the rsync daemon protocol, both sides: `rsyncd.conf`
+  and `rsync://` URL parsing, the `@RSYNCD` greeting/handshake and module
   listing, MD4 challenge-response authentication, and per-module access
-  control, handing off to `internal/pipeline` for the actual transfer.
-  See [rsync Daemon Mode](#rsync-daemon-mode) above.
+  control, handing off to `internal/pipeline` for the actual transfer via
+  `ServeConn` (server) and `DialClient` (client). See
+  [rsync Daemon Mode](#rsync-daemon-mode) above.
 
 Goal: full feature parity with upstream rsync, including protocol/format
 interoperability where specified (e.g. batch mode's file format).

@@ -44,25 +44,26 @@ type FilterRule struct {
 // in one struct (rather than loose variables) makes it straightforward to
 // pass a single value into internal/sync once that package exists.
 type options struct {
-	archive     bool
-	verbose     bool
-	compress    bool
-	recursive   bool
-	dirs        bool
-	dryRun      bool
-	delete      bool
-	progress    bool
-	perms       bool
-	times       bool
-	owner       bool
-	group       bool
-	links       bool
-	filterRules []FilterRule
-	rsh         string
-	server      bool
-	daemon      bool
-	config      string
-	port        int
+	archive      bool
+	verbose      bool
+	compress     bool
+	recursive    bool
+	dirs         bool
+	dryRun       bool
+	delete       bool
+	progress     bool
+	perms        bool
+	times        bool
+	owner        bool
+	group        bool
+	links        bool
+	filterRules  []FilterRule
+	rsh          string
+	server       bool
+	daemon       bool
+	config       string
+	port         int
+	passwordFile string
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -183,6 +184,12 @@ func NewRootCmd() *cobra.Command {
 	flags.BoolVar(&opts.daemon, "daemon", false, "run as an rsync-protocol daemon, serving modules defined in --config")
 	flags.StringVar(&opts.config, "config", "", "path to the rsyncd.conf file to serve (required with --daemon)")
 	flags.IntVar(&opts.port, "port", daemon.DefaultPort, "TCP port to listen on in --daemon mode")
+	flags.StringVar(&opts.passwordFile, "password-file", "",
+		"read the rsync:// daemon password from FILE (or stdin, if FILE is \"-\") instead of the "+
+			"RSYNC_PASSWORD environment variable or an interactive prompt; matches real rsync's own "+
+			"--password-file, including refusing a world-readable FILE. There is deliberately no "+
+			"--password flag: a password given directly as a command-line argument would be visible "+
+			"to other users on the same machine via the process list, exactly why real rsync has never had one either")
 
 	return cmd
 }

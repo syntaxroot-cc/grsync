@@ -21,6 +21,13 @@ type RemotePath struct {
 //
 // Disambiguation rule, in order:
 //
+//  0. A "://" anywhere in s (e.g. "rsync://host/module") is never this
+//     syntax at all - real [user@]host:path syntax never contains one,
+//     and without this check "rsync://host/module" would otherwise parse
+//     as host "rsync", path "//host/module", which is wrong in a way
+//     that's easy to miss (it "succeeds" instead of failing loudly).
+//     Checked alongside the Windows-drive-letter case below, before any
+//     of the numbered rules that follow ever run.
 //  1. A single ASCII letter immediately followed by ":" (e.g. "C:",
 //     "C:\Users\...") is always a Windows drive letter, never a remote
 //     host - real single-letter hostnames in this position are
@@ -39,7 +46,7 @@ type RemotePath struct {
 //     full of colons itself).
 //  4. Otherwise, the first ":" is the separator.
 func ParseRemotePath(s string) (RemotePath, bool) {
-	if s == "" || isWindowsDriveLetterPath(s) {
+	if s == "" || isWindowsDriveLetterPath(s) || strings.Contains(s, "://") {
 		return RemotePath{}, false
 	}
 
