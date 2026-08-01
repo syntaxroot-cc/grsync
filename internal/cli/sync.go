@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/syntaxroot-cc/grsync/internal/daemon"
 	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 	"github.com/syntaxroot-cc/grsync/internal/transport"
@@ -62,13 +63,18 @@ func toSyncRawRules(filterRules []FilterRule) []sync.RawRule {
 // runSync is the real sync entry point (as opposed to run, the
 // flag-echoing placeholder still used for --dry-run). For each source, it
 // syncs that source into destination - in-process for a local
-// destination, or over an SSH-spawned connection for a remote one.
+// destination, over an SSH-spawned connection for a remote user@host:path
+// one, or over a plain TCP connection to an rsync:// daemon module.
 //
-// Pulling FROM a remote source is not yet supported, only a local source
-// to a local or remote destination - this ticket's scope is explicitly
-// "local-to-local and local-to-remote," not pull mode.
+// Pulling FROM a remote source (SSH or an rsync:// daemon) is not yet
+// supported, only a local source to a local, SSH, or daemon destination -
+// this scope is explicitly "push," not pull mode, matching the existing
+// SSH-transport restriction rather than introducing a new asymmetry.
 func runSync(cmd *cobra.Command, sources []string, destination string, opts *options) error {
 	for _, src := range sources {
+		if isRsyncURL(src) {
+			return fmt.Errorf("pulling from an rsync daemon source (%q) is not yet supported", src)
+		}
 		if _, ok := transport.ParseRemotePath(src); ok {
 			return fmt.Errorf("pulling from a remote source (%q) is not yet supported", src)
 		}
@@ -81,17 +87,52 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		return fmt.Errorf("compiling filter rules: %w", err)
 	}
 
+	// isRsyncURL is checked, and rsyncURL parsed, before
+	// transport.ParseRemotePath ever looks at destination: an rsync://
+	// URL is never valid [user@]host:path syntax (ParseRemotePath itself
+	// now refuses anything containing "://"), but checking here first
+	// means that's true by construction, not just by the two parsers
+	// happening to agree.
+	var rsyncURL daemon.URL
+	isRsyncDaemon := isRsyncURL(destination)
+	if isRsyncDaemon {
+		rsyncURL, err = daemon.ParseURL(destination)
+		if err != nil {
+			return fmt.Errorf("parsing %q: %w", destination, err)
+		}
+		if rsyncURL.Module == "" {
+			return fmt.Errorf("%q has no module - an rsync:// sync destination must be rsync://host/module", destination)
+		}
+		if rsyncURL.Path != "" {
+			return fmt.Errorf("%q targets a sub-path within a module, which is not yet supported - "+
+				"the daemon protocol only supports syncing an entire module", destination)
+		}
+	}
 	remote, isRemote := transport.ParseRemotePath(destination)
 
+	// Resolved once, outside the per-source loop below, so a multi-source
+	// sync against the same daemon destination only ever prompts for (or
+	// reads) a password once - not once per source, even though each
+	// source gets its own connection, same as the SSH path already does.
+	var password daemon.PasswordFunc
+	if isRsyncDaemon {
+		password = resolvePassword(opts.passwordFile, cmd.InOrStdin())
+	}
+
 	for _, src := range sources {
-		if isRemote {
+		switch {
+		case isRsyncDaemon:
+			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules); err != nil {
+				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
+			}
+		case isRemote:
 			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
-			continue
-		}
-		if err := syncLocal(src, destination, walkOpts, rules, attrOpts); err != nil {
-			return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
+		default:
+			if err := syncLocal(src, destination, walkOpts, rules, attrOpts); err != nil {
+				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
+			}
 		}
 	}
 

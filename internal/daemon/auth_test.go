@@ -42,7 +42,7 @@ func TestAuth_NoAuthRequiredSendsOK(t *testing.T) {
 		errCh <- err
 	}()
 
-	if err := DialAuth(client, "", ""); err != nil {
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
 		t.Fatalf("DialAuth returned error: %v", err)
 	}
 	if err := <-errCh; err != nil {
@@ -63,7 +63,7 @@ func TestAuth_CorrectPasswordSucceeds(t *testing.T) {
 		errCh <- err
 	}()
 
-	if err := DialAuth(client, "alice", "hunter2"); err != nil {
+	if err := DialAuth(client, "alice", StaticPassword("hunter2")); err != nil {
 		t.Fatalf("DialAuth returned error: %v", err)
 	}
 	if err := <-errCh; err != nil {
@@ -85,7 +85,7 @@ func TestAuth_WrongPasswordFails(t *testing.T) {
 		errCh <- err
 	}()
 
-	dialErr := DialAuth(client, "alice", "wrong-password")
+	dialErr := DialAuth(client, "alice", StaticPassword("wrong-password"))
 	if dialErr == nil {
 		t.Fatalf("DialAuth with a wrong password returned nil error, want an error")
 	}
@@ -108,7 +108,7 @@ func TestAuth_UnauthorizedUserFails(t *testing.T) {
 		errCh <- err
 	}()
 
-	dialErr := DialAuth(client, "eve", "hunter2")
+	dialErr := DialAuth(client, "eve", StaticPassword("hunter2"))
 	if dialErr == nil {
 		t.Fatalf("DialAuth for an unauthorized user returned nil error, want an error")
 	}
@@ -133,7 +133,7 @@ func TestAuth_NoPlaintextPasswordOnWire(t *testing.T) {
 		errCh <- err
 	}()
 
-	if err := DialAuth(client, "alice", password); err != nil {
+	if err := DialAuth(client, "alice", StaticPassword(password)); err != nil {
 		t.Fatalf("DialAuth returned error: %v", err)
 	}
 	if err := <-errCh; err != nil {
@@ -158,7 +158,7 @@ func TestAuth_MissingSecretsFileFails(t *testing.T) {
 		errCh <- err
 	}()
 
-	dialErr := DialAuth(client, "alice", "hunter2")
+	dialErr := DialAuth(client, "alice", StaticPassword("hunter2"))
 	if dialErr == nil {
 		t.Fatalf("DialAuth with a missing secrets file returned nil error, want an error")
 	}

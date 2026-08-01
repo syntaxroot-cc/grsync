@@ -28,6 +28,25 @@ func (m Module) AuthRequired() bool {
 	return len(m.AuthUsers) > 0
 }
 
+// PasswordFunc resolves the password to use for daemon authentication.
+// DialAuth calls it at most once, and only if the server actually
+// challenges for a password (an "@RSYNCD: AUTHREQD" line) - matching real
+// rsync's own client behavior, where auth_client() is only ever invoked
+// in response to that same line. Connecting to a module that turns out
+// not to require authentication never calls this at all, so a caller
+// backing it with an interactive terminal prompt or a --password-file
+// read never triggers either one against an anonymous module - resolving
+// eagerly, before knowing whether the server will ask, would be a real
+// regression from real rsync's behavior here, not just a style choice.
+type PasswordFunc func() (string, error)
+
+// StaticPassword wraps an already-known password (e.g. a test fixture, or
+// a caller that has already decided eager resolution is fine) as a
+// PasswordFunc.
+func StaticPassword(password string) PasswordFunc {
+	return func() (string, error) { return password, nil }
+}
+
 // md4Hash returns the base64-encoded (standard alphabet, no padding - the
 // same encoding real rsync's own base64_encode(..., pad=0) produces) MD4
 // digest of secret followed by challenge. This matches real rsync's
@@ -168,8 +187,10 @@ func ServeAuth(c *conn, m Module) (user string, err error) {
 // itself is never sent, only this one-way hash of it, so ErrAuthFailed
 // and any wire capture of this exchange should never contain it. An empty
 // user is sent as "nobody", matching real rsync's own client behavior for
-// anonymous-looking auth attempts.
-func DialAuth(c *conn, user, password string) error {
+// anonymous-looking auth attempts. password is only ever called if the
+// server actually asks for one - see PasswordFunc's doc comment for why
+// that laziness matters, not just how it works.
+func DialAuth(c *conn, user string, password PasswordFunc) error {
 	for {
 		line, err := readLine(c.r)
 		if err != nil {
@@ -183,7 +204,11 @@ func DialAuth(c *conn, user, password string) error {
 			if sendUser == "" {
 				sendUser = "nobody"
 			}
-			response := md4Hash(password, challenge)
+			pass, err := password()
+			if err != nil {
+				return fmt.Errorf("resolving password: %w", err)
+			}
+			response := md4Hash(pass, challenge)
 			if err := writeLine(c.w, sendUser+" "+response); err != nil {
 				return fmt.Errorf("writing auth response: %w", err)
 			}

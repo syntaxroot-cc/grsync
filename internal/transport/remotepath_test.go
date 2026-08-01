@@ -26,6 +26,8 @@ func TestParseRemotePath(t *testing.T) {
 		{"empty string", "", RemotePath{}, false},
 		{"malformed ipv6 missing close bracket", "[::1:path", RemotePath{}, false},
 		{"malformed ipv6 no colon after bracket", "[::1]path", RemotePath{}, false},
+		{"rsync daemon URL is not SSH syntax", "rsync://example.com/module", RemotePath{}, false},
+		{"rsync daemon URL with user and port is not SSH syntax", "rsync://alice@example.com:8730/module", RemotePath{}, false},
 	}
 
 	for _, tt := range tests {
