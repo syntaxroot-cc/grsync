@@ -41,9 +41,9 @@ const dialDaemonTimeout = 10 * time.Second
 // all for this direction: the module's Receiver runs on the server, not
 // here, so DialModule sends it as an extra token on the wire (see
 // daemon.dryRunToken) rather than anything this function does directly.
-// Itemize/Verbose are deliberately not passed through - see runSync's
-// own one-time note about why daemon-PUT reporting output isn't
-// available, printed before this function is ever called.
+// Itemize/Verbose/Progress/Stats are all deliberately left unset - see
+// runSync's own one-time note about why none of daemon-PUT's reporting
+// output is available, printed before this function is ever called.
 func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool) error {
 	port := u.Port
 	if port == 0 {

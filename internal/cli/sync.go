@@ -50,13 +50,16 @@ func effectiveAttrOptions(opts *options) sync.AttrOptions {
 }
 
 // effectiveReceiverOptions computes pipeline.ReceiverOptions from opts:
-// --dry-run, --itemize-changes, and --verbose, all reported to output.
+// --dry-run, --itemize-changes, --verbose, --progress, and --stats, all
+// reported to output.
 func effectiveReceiverOptions(opts *options, output io.Writer) pipeline.ReceiverOptions {
 	return pipeline.ReceiverOptions{
-		DryRun:  opts.dryRun,
-		Itemize: opts.itemize,
-		Verbose: opts.verbose,
-		Output:  output,
+		DryRun:   opts.dryRun,
+		Itemize:  opts.itemize,
+		Verbose:  opts.verbose,
+		Progress: opts.progress,
+		Stats:    opts.stats,
+		Output:   output,
 	}
 }
 
@@ -138,17 +141,21 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 
 	ropts := effectiveReceiverOptions(opts, cmd.OutOrStdout())
 	if isRsyncDaemon && ropts.Reporting() {
-		// The daemon protocol has no channel for this: once the module
-		// handshake ends, the connection is pure binary wire protocol
-		// (see internal/daemon's own doc comment on where the real-vs-gob
-		// boundary sits) with nowhere to carry itemize/verbose text back
-		// to the client, unlike SSH's genuinely separate stderr stream.
-		// --dry-run's actual safety guarantee (no writes happen) still
-		// fully applies; only the reporting text is unavailable here.
-		// Noting this once, up front, rather than silently producing no
-		// output and leaving the user to wonder why.
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --itemize-changes/--verbose output is not available for an rsync:// "+
-			"daemon destination (the daemon protocol has no channel for it); --dry-run's no-write guarantee still applies")
+		// The daemon protocol has no channel for any of this: once the
+		// module handshake ends, the connection is pure binary wire
+		// protocol (see internal/daemon's own doc comment on where the
+		// real-vs-gob boundary sits) with nowhere to carry reporting text
+		// back to the client, unlike SSH's genuinely separate stderr
+		// stream. This was SC-11's disclosed limitation for
+		// itemize/verbose; --progress/--stats have the exact same
+		// limitation for the exact same reason, not a new gap - see the
+		// README's Progress and Stats section. --dry-run's actual
+		// no-write guarantee still fully applies regardless; only the
+		// reporting text is unavailable here. Noting this once, up
+		// front, rather than silently producing no output and leaving
+		// the user to wonder why.
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --itemize-changes/--verbose/--progress/--stats output is not available "+
+			"for an rsync:// daemon destination (the daemon protocol has no channel for it); --dry-run's no-write guarantee still applies")
 	}
 
 	for _, src := range sources {
@@ -204,14 +211,16 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // (or whatever --rsh overrides it to), performs the handshake, then runs
 // the sender side of the pipeline against that connection.
 //
-// ropts.DryRun/Itemize/Verbose are passed as extra flags on that remote
-// command line (e.g. "grsync --server --dry-run -i DEST"), not over any
-// new wire message: the remote --server process parses them the normal
-// way, via its own real CLI flag handling (see runServer), and the
-// receiving side's dry-run/itemize decision is made entirely on the
+// ropts.DryRun/Itemize/Verbose/Progress/Stats are passed as extra flags
+// on that remote command line (e.g. "grsync --server --dry-run -i
+// DEST"), not over any new wire message: the remote --server process
+// parses them the normal way, via its own real CLI flag handling (see
+// runServer), and the receiving side's decision is made entirely on the
 // remote side, exactly where pipeline.Receiver actually runs for this
 // transport - there is nothing for the local, sending side to decide
-// here at all.
+// here at all. This is the same mechanism SC-11 established for
+// DryRun/Itemize/Verbose; Progress/Stats just reuse it rather than
+// inventing a second one.
 func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions) error {
 	remoteArgs := []string{"grsync", "--server"}
 	if ropts.DryRun {
@@ -222,6 +231,12 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 	}
 	if ropts.Verbose {
 		remoteArgs = append(remoteArgs, "--verbose")
+	}
+	if ropts.Progress {
+		remoteArgs = append(remoteArgs, "--progress")
+	}
+	if ropts.Stats {
+		remoteArgs = append(remoteArgs, "--stats")
 	}
 	remoteArgs = append(remoteArgs, remote.Path)
 

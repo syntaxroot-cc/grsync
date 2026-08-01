@@ -11,14 +11,16 @@ really walks, filters, diffs, transfers, and reconstructs files, applying
 requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
-out of scope (compression, progress reporting, partial/append transfers,
-batch mode, full `--delete`, and device/special files) - this is real,
-working sync, not yet full feature parity. Hard links *are* now
-preserved, opt-in via `-H`/`--hard-links` exactly like real rsync's own
-flag (see [File Attribute Preservation](#file-attribute-preservation)
-below), and `--dry-run`/`-n` is a genuine trial run - full planning, zero
-filesystem changes - with real `--itemize-changes`/`-i` output matching
-rsync's own format (see [Dry-Run Mode](#dry-run-mode) below).
+out of scope (compression, partial/append transfers, batch mode, full
+`--delete`, and device/special files) - this is real, working sync, not
+yet full feature parity. Hard links *are* now preserved, opt-in via
+`-H`/`--hard-links` exactly like real rsync's own flag (see
+[File Attribute Preservation](#file-attribute-preservation) below), and
+`--dry-run`/`-n` is a genuine trial run - full planning, zero filesystem
+changes - with real `--itemize-changes`/`-i` output matching rsync's own
+format (see [Dry-Run Mode](#dry-run-mode) below). `--progress` and
+`--stats` are now implemented too, both matching real rsync's own output
+formats (see [Progress and Stats](#progress-and-stats) below).
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -498,6 +500,176 @@ prove nothing about the dry run's accuracy.
   prints a one-time note (to stderr) when `-i`/`-v` is combined with an
   `rsync://` destination, rather than silently producing no output and
   leaving the user to wonder why.
+
+## Progress and Stats
+
+`--progress` prints live per-file transfer progress; `--stats` prints an
+end-of-sync summary block. Both are opt-in, both are additive to
+`-i`/`-v`, and both match real rsync's own output formats - verified
+against `rsync.1`'s own documented examples and upstream's actual
+`main.c` (`output_summary`) rather than approximated.
+
+### `--progress`
+
+Real rsync's own progress line is fundamentally a *network* measurement:
+bytes as they cross the wire, for a protocol that streams a file's data
+incrementally. grsync's wire protocol doesn't - see
+[End-to-End Sync Pipeline](#end-to-end-sync-pipeline) - it's frame-at-a-time
+(a whole signature, then a whole delta, each gob-encoded), and
+`sync.ApplyDelta` reconstructs the entire file in memory before anything
+is written to disk. There is no partial, in-flight network state to
+report progress against. `--progress` here instead measures the local
+*disk-write* phase: `receiveRegularFile` writes files larger than 256KiB
+in chunks (`writeFileWithProgress`, `internal/pipeline/receiver.go`) and
+reports after each chunk, rather than in one `os.WriteFile` call. This is
+a deliberate, disclosed scope boundary, not an attempt to fake network
+streaming - files at or under 256KiB (most real transfers) report only
+once, at completion, since chunking a handful of bytes would add syscall
+overhead for a duration too short to ever be visibly "in progress."
+
+Output format matches real rsync's own (`rsync.1`'s own shown examples),
+one line per progress update:
+
+```
+782448  63%  195.61kB/s    0:00:02
+1,238,099 100%  154.76kB/s    0:00:08  (xfr#5, to-chk=169/396)
+```
+
+The first form is a mid-transfer update: raw byte count so far, percent
+of the file's total size, current transfer rate, and estimated time
+remaining (`H:MM:SS`, hours always shown even at zero, matching the man
+page's own `"0:00:04"`-style examples). The second is the line printed
+when a file finishes: comma-grouped total bytes, `100%`, the achieved
+rate, elapsed time for that file, and `(xfr#N, to-chk=M/T)` - this file
+was the Nth one actually transferred, with M files left to check out of
+T total entries in the sync.
+
+Reporting runs on its own goroutine, fed through a buffered channel
+(`progressReporter`, `internal/pipeline/progress.go`): `report()` is a
+non-blocking send (`select`/`default`) for *every* update including the
+final one, so a slow or entirely absent consumer on the other end of
+`Output` can never stall the actual file write - an update is dropped
+rather than the transfer blocking on it. `stop()` (deferred immediately
+after the reporter is constructed in `Receiver`, so it always runs even
+on an early-error return) closes the update channel and waits for the
+goroutine's own `run` loop to drain and exit, so no goroutine outlives a
+sync. Verified by dedicated concurrency tests
+(`TestProgressReporter_ReportDoesNotBlockOnSlowConsumer`,
+`TestProgressReporter_StopDoesNotLeakTheGoroutine`) rather than assumed
+safe.
+
+`--progress` never fires during `--dry-run`: it specifically measures
+bytes committed to disk, and dry-run skips that write entirely, so there
+is nothing to report (`TestReceiver_ProgressDoesNotFireDuringDryRun`).
+`--stats`, below, has no such restriction.
+
+### `--stats`
+
+Printed once, after the whole sync completes, matching real rsync's own
+field names and structure:
+
+```
+Number of files: 4 (reg: 3, dir: 1)
+Number of created files: 3 (reg: 2, dir: 1)
+Number of regular files transferred: 2
+Total file size: 1,416 bytes
+Total transferred file size: 16 bytes
+Literal data: 16 bytes
+Matched data: 1,400 bytes
+Total bytes sent: 612
+Total bytes received: 1,498
+
+sent 612 bytes  received 1,498 bytes  4,220.00 bytes/sec
+total size is 1,416  speedup is 0.67
+```
+
+- **Number of files / created files**: every entry in the sender's file
+  list, broken down by type (`reg`/`dir`/`link`); "created" counts only
+  those that did not already exist at the destination. The type
+  breakdown omits any type with a zero count (e.g. a sync with no
+  symlinks omits `link:` entirely), and the "created files" line itself
+  is omitted when nothing was newly created.
+- **Number of regular files transferred**: files whose content actually
+  changed, *or* were newly created - a brand-new empty file counts here
+  even though it has no bytes to compare, which needed a real fix (see
+  below); a pre-existing byte-identical file does not.
+- **Total file size / Total transferred file size**: sums of `entry.Size`
+  across all regular files, and across only the transferred ones.
+- **Literal data / Matched data**: bytes coming from the delta as new
+  data (`DataOp`) versus copied from the existing destination file
+  (`CopyOp`), summed with the same block-boundary math `sync.ApplyDelta`
+  itself uses (`deltaByteCounts`, `internal/pipeline/receiver.go`).
+- **Total bytes sent / received**: actual wire traffic for this
+  connection, measured by wrapping the `io.ReadWriter` passed to
+  `Receiver` in a byte-counting decorator (`countingReadWriter`,
+  `internal/pipeline/stats.go`) rather than threading a counter through
+  every individual send/recv call in `messages.go` - chosen specifically
+  so neither `Sender` nor its own tests needed any changes for this
+  ticket.
+- **speedup ratio**: `total_size / (bytes_sent + bytes_received)`,
+  verified against upstream rsync's own `main.c` (`output_summary`)
+  rather than guessed, and 0 (not NaN/Inf) when nothing was sent or
+  received at all. `(DRY RUN)` is appended to the speedup line under
+  `--dry-run`, reusing the same suffix real rsync itself prints.
+- **Not present**: no "Number of deleted files" line - grsync has no
+  `--delete` (see [Status](#status)) - and no file-list build-time
+  fields, since grsync doesn't separately time that phase the way
+  upstream rsync's own stats block does.
+
+Unlike `--progress`, `--stats` is fully compatible with `--dry-run`:
+every field it reports is derived from planning data (the signature/delta
+exchange, which dry-run still performs in full - see
+[Dry-Run Mode](#dry-run-mode)) or from wire bytes actually exchanged,
+neither of which dry-run skips - only the final disk write is, and stats
+doesn't depend on that (`TestReceiver_StatsWorksInDryRun`).
+
+### A real bug this ticket's self-review caught
+
+A brand-new *empty* file has `oldData == nil` (nothing existed before)
+and `newData == nil` too - `sync.ApplyDelta`'s accumulator is never
+appended to when there are zero delta ops, which is exactly what happens
+for a zero-byte file. `bytes.Equal(nil, nil)` is `true`, so a naive
+"did the content change" check alone would call a genuinely new empty
+file unchanged, undercounting both "files transferred" and the progress
+reporter's own `xfr#` counter. Fixed with a separate `transferred :=
+!existed || contentChanged` check used specifically for stats/xfer
+accounting (`receiveRegularFile`, `internal/pipeline/receiver.go`);
+`contentChanged` alone is still what itemize output uses, since
+`itemizeFile` already handles the `!existed` case as its own first,
+higher-priority branch. Locked in by
+`TestReceiver_StatsCountsNewEmptyFileAsTransferred`.
+
+### Across transports
+
+- **Local**: threaded straight through `ReceiverOptions`, same as
+  itemize/verbose.
+- **SSH**: `--progress`/`--stats` are appended to the remote
+  `grsync --server` command line exactly like `--dry-run`/
+  `--itemize-changes`/`--verbose` already are (see
+  [Dry-Run Mode](#dry-run-mode)'s own "Across transports" section) - no
+  new wire protocol needed, and output reaches the local terminal through
+  the same live stderr passthrough already established there.
+  `TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer` proves this
+  over a real SSH connection to `127.0.0.1` (skipped gracefully without a
+  local `sshd`).
+- **`rsync://` daemon, download (`DirectionGet`)**: works exactly like a
+  local sync - the client's own `Receiver` runs locally, with a real
+  channel (this process's own stdout/wherever `Output` points) to print
+  to. Verified over a real TCP connection by `TestDaemon_RealTCP_StatsWorkForGet`.
+- **`rsync://` daemon, upload (`DirectionPut`)**: **the same disclosed gap
+  `--itemize-changes`/`--verbose` already have, not a new one.** Once the
+  module handshake ends, the daemon connection is pure binary wire
+  protocol with no channel for arbitrary text (see
+  [Dry-Run Mode](#dry-run-mode)'s own explanation of why) - the *server's*
+  `Receiver`, which is the side actually applying the upload, has no way
+  to get progress or stats text back to the uploading client. `grsync`'s
+  existing one-time stderr note for this case already covers
+  `--progress`/`--stats` alongside `-i`/`-v`
+  (`internal/cli/sync.go`'s daemon-PUT warning). Confirmed harmless by
+  `TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks`: the
+  client's own `ReceiverOptions{Progress: true, Stats: true}` is silently
+  inert for this direction (`Sender` never even looks at
+  `ReceiverOptions`), and the upload itself still completes correctly.
 
 ## rsync Daemon Mode
 

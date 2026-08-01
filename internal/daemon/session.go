@@ -139,13 +139,16 @@ func ServeModule(c *conn, m Module) error {
 		}
 		return waitForTransferDone(c)
 	case DirectionPut:
-		// No Itemize/Verbose/Output here: the daemon protocol has no
-		// channel back to the client for reporting text once the
+		// No Itemize/Verbose/Progress/Stats here: the daemon protocol has
+		// no channel back to the client for reporting text once the
 		// handshake ends (unlike SSH's separate stderr stream) - see the
-		// README's Dry-Run Mode section for the full explanation of this
-		// disclosed gap. DryRun's actual no-write guarantee, in contrast,
-		// needs no channel at all beyond the dryRunToken above: it's
-		// purely a local decision this call makes about its own writes.
+		// README's Progress and Stats section for the full explanation of
+		// this disclosed gap, which SC-11 already established for
+		// itemize/verbose and SC-10 confirms applies identically to
+		// progress/stats, not a new limitation. DryRun's actual no-write
+		// guarantee, in contrast, needs no channel at all beyond the
+		// dryRunToken above: it's purely a local decision this call makes
+		// about its own writes.
 		ropts := pipeline.ReceiverOptions{DryRun: dryRun}
 		if err := pipeline.Receiver(c, m.Path, moduleAttrOptions(), ropts); err != nil {
 			return err
