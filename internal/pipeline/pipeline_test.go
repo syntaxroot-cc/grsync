@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +117,41 @@ func TestSenderReceiver_DestinationOnlyFileIsLeftAlone(t *testing.T) {
 	}
 	if string(got) != "only ever existed at the destination" {
 		t.Errorf("dest-only.txt content changed: got %q", got)
+	}
+}
+
+// TestSenderReceiver_VerboseAloneShowsNamesOnly is SC-10's Step 4
+// confirmation, not a reimplementation: SC-11 already wired -v to print
+// real rsync's own "%n%L" (bare path, no itemize code) when Verbose is
+// set without Itemize, but no test ever exercised that combination
+// directly - worth checking explicitly, especially since this exact area
+// (reportChange's gating) turned out to have a real bug introduced while
+// broadening ReceiverOptions.Reporting() for --progress/--stats (see
+// itemize.go's reportChange, which now correctly gates on Itemize/Verbose
+// specifically, not the broader Reporting()).
+func TestSenderReceiver_VerboseAloneShowsNamesOnly(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(srcRoot, "new.txt"), "brand new content")
+	mustMkdirAll(t, filepath.Join(srcRoot, "sub"))
+	mustWriteFile(t, filepath.Join(srcRoot, "sub", "nested.txt"), "nested content")
+
+	var out bytes.Buffer
+	runSenderReceiverWithOptions(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{},
+		ReceiverOptions{Verbose: true, Output: &out})
+
+	output := out.String()
+	if !strings.Contains(output, "new.txt") {
+		t.Errorf("output = %q, want it to mention new.txt", output)
+	}
+	if !strings.Contains(output, "sub/nested.txt") {
+		t.Errorf("output = %q, want it to mention sub/nested.txt", output)
+	}
+	// The defining difference from -i: no itemize code prefix at all.
+	if strings.Contains(output, "+++++++++") {
+		t.Errorf("output = %q, want bare paths only (no itemize codes) since Itemize was not requested", output)
 	}
 }
 

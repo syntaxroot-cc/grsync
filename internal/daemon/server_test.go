@@ -249,3 +249,100 @@ func TestDaemon_RealTCP_DryRunGetMakesNoChanges(t *testing.T) {
 		t.Errorf("daemon error log = %q, want empty", errLog.String())
 	}
 }
+
+// TestDaemon_RealTCP_StatsWorkForGet confirms Stats works fully for a
+// module download, over a real TCP connection: DirectionGet's Receiver
+// runs on the client, exactly like a local sync, so ReceiverOptions
+// reaches it directly with no protocol involvement at all - unlike
+// DirectionPut, there is no daemon-specific limitation here to disclose.
+func TestDaemon_RealTCP_StatsWorkForGet(t *testing.T) {
+	modRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(modRoot, "readme.txt"), "some real content to report stats about")
+
+	cfg := &Config{Modules: map[string]Module{
+		"public": {Name: "public", Path: modRoot, ReadOnly: true, List: true},
+	}}
+	addr, _ := startTestDaemon(t, cfg)
+
+	client := dialTestDaemon(t, addr)
+	if _, err := DialGreeting(client, "public"); err != nil {
+		t.Fatalf("DialGreeting: %v", err)
+	}
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
+		t.Fatalf("DialAuth: %v", err)
+	}
+
+	dest := t.TempDir()
+	var out bytes.Buffer
+	ropts := pipeline.ReceiverOptions{Stats: true, Output: &out}
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+		t.Fatalf("DialModule: %v", err)
+	}
+
+	output := out.String()
+	for _, want := range []string{"Number of files:", "Total file size:", "speedup is"} {
+		if !bytes.Contains([]byte(output), []byte(want)) {
+			t.Errorf("stats output = %q, want it to contain %q", output, want)
+		}
+	}
+}
+
+// TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks confirms
+// the disclosed daemon-PUT limitation fails safely rather than breaking
+// anything: even if a caller sets Progress/Stats on the *client's*
+// ReceiverOptions for a DirectionPut, the transfer still completes
+// correctly, because those fields never cross the wire at all - only
+// DryRun does, via dryRunToken (see ServeModule/DialModule's own doc
+// comments) - so the server-side Receiver that would actually need them
+// never even sees them. This is what "consistent, not a new gap" means
+// concretely: the same fields SC-11 already established as inert for
+// daemon-PUT stay inert for Progress/Stats too, without erroring.
+func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
+	modRoot := t.TempDir()
+	cfg := &Config{Modules: map[string]Module{
+		"incoming": {Name: "incoming", Path: modRoot, ReadOnly: false},
+	}}
+	addr, errLog := startTestDaemon(t, cfg)
+
+	client := dialTestDaemon(t, addr)
+	if _, err := DialGreeting(client, "incoming"); err != nil {
+		t.Fatalf("DialGreeting: %v", err)
+	}
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
+		t.Fatalf("DialAuth: %v", err)
+	}
+
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "upload.txt"), "pushed despite requesting progress/stats")
+	rules, err := sync.CompileRules(nil)
+	if err != nil {
+		t.Fatalf("compiling empty rule set: %v", err)
+	}
+
+	// Progress/Stats set here deliberately, to prove they're harmlessly
+	// ignored for this direction rather than causing an error.
+	var clientSideOutput bytes.Buffer
+	ropts := pipeline.ReceiverOptions{Progress: true, Stats: true, Output: &clientSideOutput}
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+		t.Fatalf("DialModule: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(modRoot, "upload.txt"))
+	if err != nil {
+		t.Fatalf("reading uploaded file from module: %v", err)
+	}
+	if string(got) != "pushed despite requesting progress/stats" {
+		t.Errorf("uploaded content = %q, want %q", got, "pushed despite requesting progress/stats")
+	}
+	// Nothing was ever printed on the client side either: DialModule's
+	// DirectionPut branch runs pipeline.Sender, which never consults
+	// ReceiverOptions at all (see pipeline.Sender's own doc comment) -
+	// there is no client-side reporting output for an upload regardless
+	// of transport.
+	if clientSideOutput.Len() != 0 {
+		t.Errorf("client-side output = %q, want empty (Sender never reports progress/stats)", clientSideOutput.String())
+	}
+	if errLog.Len() != 0 {
+		t.Errorf("daemon error log = %q, want empty", errLog.String())
+	}
+}

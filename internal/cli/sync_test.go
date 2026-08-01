@@ -163,6 +163,67 @@ func TestE2E_DryRunAndRealRunItemizeMatch(t *testing.T) {
 	}
 }
 
+// TestE2E_StatsOutput drives the real CLI command with --stats and
+// confirms the printed summary contains real rsync's own field names
+// and a plausible speedup line - the same real-format proof as
+// internal/pipeline's own stats tests, checked here through the actual
+// command a user types.
+func TestE2E_StatsOutput(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "f.txt"), "some file content")
+
+	cmd := NewRootCmd()
+	var out strings.Builder
+	cmd.SetArgs([]string{"-a", "--stats", src, dst})
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	output := out.String()
+	for _, want := range []string{
+		"Number of files:", "Number of regular files transferred:",
+		"Total file size:", "Literal data:", "Matched data:",
+		"Total bytes sent:", "Total bytes received:", "speedup is",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output = %q, want it to contain %q", output, want)
+		}
+	}
+}
+
+// TestE2E_ProgressOutput drives the real CLI command with --progress
+// against a file large enough to chunk and confirms the destination
+// still ends up byte-correct - progress reporting must never corrupt or
+// truncate the actual transfer, only report on it.
+func TestE2E_ProgressOutput(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	content := strings.Repeat("y", 600*1024) // several chunks at the 256KiB chunk size
+	mustWriteFile(t, filepath.Join(src, "big.bin"), content)
+
+	cmd := NewRootCmd()
+	var out strings.Builder
+	cmd.SetArgs([]string{"-a", "--progress", src, dst})
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "100%") {
+		t.Errorf("output = %q, want a 100%% completion line", out.String())
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "big.bin"))
+	if err != nil {
+		t.Fatalf("reading synced file: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("synced content differs from source (len got=%d, want=%d)", len(got), len(content))
+	}
+}
+
 // TestE2E_HardLinksPreservedWithFlag drives the real CLI command with
 // -H/--hard-links and confirms two hard-linked source files arrive at
 // the destination still hard-linked to each other (os.SameFile), not

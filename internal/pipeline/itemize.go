@@ -29,10 +29,17 @@ type ReceiverOptions struct {
 	// (plus " -> target" for a changed symlink) per changed entry to
 	// Output - real rsync's own default "%n%L" format for -v without -i.
 	Verbose bool
-	// Output is where Itemize/Verbose lines are written, one per line.
-	// A nil Output is treated as io.Discard, so a caller that wants no
-	// reporting at all doesn't need to construct a discard writer
-	// itself.
+	// Progress, when true, writes a live-updating line per regular file
+	// as its data is written to disk (see progress.go's own doc comment
+	// for exactly what this measures and why, given grsync's non-
+	// streaming wire protocol), to Output.
+	Progress bool
+	// Stats, when true, writes a real-rsync-format summary block (see
+	// stats.go's formatStats) to Output once the whole sync completes.
+	Stats bool
+	// Output is where Itemize/Verbose/Progress/Stats output is written.
+	// A nil Output is treated as io.Discard, so a caller that wants none
+	// of this doesn't need to construct a discard writer itself.
 	Output io.Writer
 }
 
@@ -43,12 +50,15 @@ func (o ReceiverOptions) output() io.Writer {
 	return o.Output
 }
 
-// Reporting reports whether o requests any change reporting at all
-// (Itemize or Verbose) - exported since callers outside this package
-// (internal/cli, deciding whether to print its own one-time daemon-PUT
-// reporting-gap note) need it too, not just Receiver itself.
+// Reporting reports whether o requests any output at all - Itemize,
+// Verbose, Progress, or Stats - exported since callers outside this
+// package (internal/cli, deciding whether to print its own one-time
+// daemon-PUT no-reporting-channel note) need it too, not just Receiver
+// itself. All four share the same disclosed daemon-PUT limitation (see
+// the README's Progress and Stats section), so one check covers all of
+// them consistently rather than needing a separate one per flag.
 func (o ReceiverOptions) Reporting() bool {
-	return o.Itemize || o.Verbose
+	return o.Itemize || o.Verbose || o.Progress || o.Stats
 }
 
 // itemizeAttrs holds the 9 attribute-letter positions of real rsync's
@@ -230,11 +240,15 @@ func formatVerboseLine(path, linkTarget string) string {
 }
 
 // reportChange writes one itemize/verbose line for entry to ropts.Output,
-// if ropts requests any reporting at all and report says this entry is
-// actually worth mentioning - matching real rsync's own default (single
-// -i) behavior of never mentioning a completely unchanged item.
+// if ropts requests itemize or verbose reporting specifically (not
+// ropts.Reporting(), which also covers Progress/Stats - those have
+// nothing to do with per-entry itemize/verbose lines, and gating on the
+// broader check would incorrectly print verbose-style lines for a caller
+// that asked only for --progress or --stats) and report says this entry
+// is actually worth mentioning - matching real rsync's own default
+// (single -i) behavior of never mentioning a completely unchanged item.
 func reportChange(ropts ReceiverOptions, code string, report bool, entry sync.FileEntry) {
-	if !ropts.Reporting() || !report {
+	if (!ropts.Itemize && !ropts.Verbose) || !report {
 		return
 	}
 

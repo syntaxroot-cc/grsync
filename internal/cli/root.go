@@ -56,6 +56,7 @@ type options struct {
 	links        bool
 	hardLinks    bool
 	itemize      bool
+	stats        bool
 	filterRules  []FilterRule
 	rsh          string
 	server       bool
@@ -104,8 +105,8 @@ func NewRootCmd() *cobra.Command {
 		Use:   "grsync <source>... <destination>",
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
-			"Local-to-local and local-to-remote (SSH) syncs are supported, including --dry-run " +
-			"and --itemize-changes; compression, progress reporting, and full --delete are not yet.",
+			"Local-to-local and local-to-remote (SSH) syncs are supported, including --dry-run, " +
+			"--itemize-changes, --progress, and --stats; compression and full --delete are not yet.",
 		// --server takes exactly one positional arg (the destination path)
 		// rather than the normal <source>...<destination> shape: it is how
 		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
@@ -148,7 +149,12 @@ func NewRootCmd() *cobra.Command {
 		"output a change-summary line per updated item, real rsync's own 11-character %i format "+
 			"(YXcstpoguax - see the README's Dry-Run Mode section); most useful with --dry-run")
 	flags.BoolVar(&opts.delete, "delete", false, "delete extraneous files from destination")
-	flags.BoolVar(&opts.progress, "progress", false, "show progress during transfer")
+	flags.BoolVar(&opts.progress, "progress", false,
+		"show a live per-file progress line as data is written to disk, real rsync's own "+
+			"\"bytes  percent  rate  eta\" format (see the README's Progress and Stats section)")
+	flags.BoolVar(&opts.stats, "stats", false,
+		"print a summary of the transfer (files, bytes sent/received, speedup ratio) at the end, "+
+			"real rsync's own --stats format (see the README's Progress and Stats section)")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleExclude, rules: &opts.filterRules},
 		"exclude", "exclude files matching PATTERN (repeatable, order preserved relative to --include/--filter)")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleInclude, rules: &opts.filterRules},

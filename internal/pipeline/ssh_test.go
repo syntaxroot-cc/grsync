@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,4 +151,55 @@ func TestSSHLocalhost_DryRunMakesNoChanges(t *testing.T) {
 	if len(entries) != 0 {
 		t.Errorf("dest is not empty after a --dry-run --server sync over real SSH: %v", entries)
 	}
+}
+
+// TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer is the real,
+// over-the-wire proof that --progress/--stats on the remote --server
+// command line (exactly what internal/cli's syncToRemote adds for a real
+// invocation - see its own doc comment) don't corrupt or interfere with
+// the actual transfer. It does not attempt to capture and verify the
+// remote process's own stderr text (session.go's live passthrough of
+// it) - that would need OS-level stderr redirection in this test
+// process, disproportionate complexity for what SC-11's own SSH tests
+// already established isn't otherwise verified end to end (they check
+// write-safety and transfer correctness, not stderr content); the
+// destination matching the source byte-for-byte is what actually proves
+// progress reporting's chunked write path didn't corrupt anything.
+func TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer(t *testing.T) {
+	requireLocalSSHServer(t)
+	grsyncPath := buildGrsyncBinary(t)
+
+	src := t.TempDir()
+	dest := t.TempDir()
+	content := strings.Repeat("z", progressWriteChunkSize*2+500)
+	mustWriteFile(t, filepath.Join(src, "big.bin"), content)
+
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--progress", "--stats", dest})
+	if err != nil {
+		t.Fatalf("Dial returned error: %v", err)
+	}
+
+	if err := transport.Handshake(session); err != nil {
+		t.Fatalf("Handshake returned error: %v", err)
+	}
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Sender did not complete within 20s")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Errorf("Session.Close returned error: %v", err)
+	}
+
+	assertSameContent(t, filepath.Join(src, "big.bin"), filepath.Join(dest, "big.bin"))
 }
