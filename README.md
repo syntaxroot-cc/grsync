@@ -11,12 +11,14 @@ really walks, filters, diffs, transfers, and reconstructs files, applying
 requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
-out of scope (compression, progress reporting, `--dry-run`, partial/
-append transfers, batch mode, full `--delete`, and device/special files)
-- this is real, working sync, not yet full feature parity. Hard links
-*are* now preserved, opt-in via `-H`/`--hard-links` exactly like real
-rsync's own flag (see
-[File Attribute Preservation](#file-attribute-preservation) below).
+out of scope (compression, progress reporting, partial/append transfers,
+batch mode, full `--delete`, and device/special files) - this is real,
+working sync, not yet full feature parity. Hard links *are* now
+preserved, opt-in via `-H`/`--hard-links` exactly like real rsync's own
+flag (see [File Attribute Preservation](#file-attribute-preservation)
+below), and `--dry-run`/`-n` is a genuine trial run - full planning, zero
+filesystem changes - with real `--itemize-changes`/`-i` output matching
+rsync's own format (see [Dry-Run Mode](#dry-run-mode) below).
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -54,11 +56,12 @@ argument is always the destination.
 | Flag | Shorthand | Description |
 |---|---|---|
 | `--archive` | `-a` | archive mode |
-| `--verbose` | `-v` | increase verbosity |
+| `--verbose` | `-v` | print each updated item's path (superseded by `--itemize-changes` when both are given, see [Dry-Run Mode](#dry-run-mode)) |
 | `--compress` | `-z` | compress data during transfer |
 | `--recursive` | `-r` | recurse into directories |
 | `--dirs` | `-d` | list directories without recursing into them (implied by `-r`) |
-| `--dry-run` | `-n` | show what would be transferred |
+| `--dry-run` | `-n` | perform a trial run: full planning (file list, filters, deltas), zero filesystem changes (see [Dry-Run Mode](#dry-run-mode)) |
+| `--itemize-changes` | `-i` | print a change-summary line per updated item, real rsync's own 11-character `%i` format (see [Dry-Run Mode](#dry-run-mode)) |
 | `--delete` | | delete extraneous files from destination |
 | `--progress` | | show progress during transfer |
 | `--exclude PATTERN` | | exclude matching files (repeatable) |
@@ -339,15 +342,162 @@ mentioned. (Full `--delete` semantics remain a separate, later ticket.)
 
 **Explicitly out of scope for this pipeline** (some pre-existing gaps,
 restated here so they're not mistaken for oversights specific to this
-ticket): compression, progress reporting, real `--dry-run` (still the
-flag-echoing placeholder, to avoid silently performing a real sync when a
-dry run was requested), partial/append transfers, batch mode, pulling
-from a remote source (only local-source syncs are supported - push, not
-pull), and device/special files. `sync.ApplySpecialFile` exists and is
-tested, but nothing in `pipeline.Receiver` calls it yet - unlike hard
-links (see [File Attribute Preservation](#file-attribute-preservation)
-above, now wired in), this needs elevated privilege to test meaningfully
-and was left out rather than expanding this integration further.
+ticket): compression, progress reporting, partial/append transfers,
+batch mode, pulling from a remote source (only local-source syncs are
+supported - push, not pull), and device/special files.
+`sync.ApplySpecialFile` exists and is tested, but nothing in
+`pipeline.Receiver` calls it yet - unlike hard links (see
+[File Attribute Preservation](#file-attribute-preservation) above, now
+wired in), this needs elevated privilege to test meaningfully and was
+left out rather than expanding this integration further.
+
+## Dry-Run Mode
+
+`--dry-run`/`-n` is a genuine trial run, not the flag-echoing placeholder
+it used to be: `pipeline.Receiver` performs every planning step exactly
+as a real sync would - the full signature/delta exchange, hard-link
+grouping, comparing each entry against the destination's current
+state - and simply skips the eight calls that would actually touch the
+filesystem. Every other write path (`Sender`, and everything upstream of
+`Receiver`) is completely unaffected by dry-run; only the receiving
+side's own final commit step is skipped, exactly where the "no changes"
+guarantee actually needs to be enforced.
+
+### The eight audited write calls
+
+`Receiver`'s own doc comment names them explicitly, and each one is
+individually gated behind `if !ropts.DryRun`, not a single outer branch
+that happens to skip the whole function (which would also have skipped
+the planning work the ticket requires to stay real):
+
+- Two `os.MkdirAll` calls and an `os.WriteFile` in `receiveRegularFile`.
+- An `os.MkdirAll` and `sync.ApplyAttributes` in `receiveSymlink` -
+  `ApplyAttributes` is the one that actually calls `os.Symlink` for a
+  symlink entry (see [File Attribute Preservation](#file-attribute-preservation)),
+  not just `chmod`/`chtimes`, which is exactly why skipping it alone
+  (not a separate `os.Symlink` call) is what makes a symlink entry a
+  genuine no-op in dry-run.
+- `sync.ApplyAttributes` for a directory, in the deferred
+  attribute-application pass.
+- `sync.ApplyHardLinks`, in the hard-link pass.
+
+`TestReceiver_DryRunMakesNoFilesystemChanges` in
+`internal/pipeline/pipeline_test.go` is the test built specifically to
+catch a regression here: it syncs a tree exercising every one of those
+eight paths (a top-level file, a nested directory with a file inside it,
+a symlink, and - best-effort - two hard-linked files) against a
+completely empty destination and asserts the destination is *still*
+completely empty afterward, not just that no error was returned.
+
+### What still runs, and why
+
+The full signature/delta exchange happens over the wire in dry-run mode
+exactly as it would for a real sync - **this is a deliberate divergence
+from real rsync's own documented dry-run behavior**, worth stating
+explicitly rather than glossing over. Real rsync's docs say a dry run
+"does not send the actual data for file transfers," but that's only true
+because real rsync's *default* mode has a cheap size+mtime "quick check"
+that skips the signature/delta algorithm entirely for files it can
+already tell are unchanged - grsync has no such shortcut (a pre-existing,
+deliberate architectural choice from the original delta-transfer and
+pipeline-integration work: full delta always runs, full stop). Matching
+real rsync's dry-run network behavior *by letter* would mean building a
+new quick-check mechanism that doesn't otherwise exist in this codebase,
+just to serve this one mode - worse than disclosing the honest
+divergence. The content comparison itself is genuinely free either way:
+`sync.ApplyDelta` is pure in-memory work, so computing it costs nothing
+whether or not the result is about to be written, and it's the only way
+grsync can correctly answer "did this file's content actually change"
+for itemize purposes without a `--checksum`-style flag.
+
+### `--itemize-changes`/`-i`: real rsync's actual format, not an approximation
+
+Verified against `rsync.1`'s own `--itemize-changes` section rather than
+invented: the format is `YXcstpoguax`, 11 characters - `Y` (update type:
+`>` transferred, `c` local change/creation, `h` hard link, `.` not
+updated), `X` (file type: `f`/`d`/`L`), then 9 attribute letters
+(`c` checksum/value-differs, `s` size, `t` time, `p` perms, `o` owner,
+`g` group, `u`/`n`/`b` atime/crtime, `a` ACL, `x` xattr) - `.` for
+unchanged, `+` for newly-created. A completely unchanged item is not
+printed at all with a single `-i`, matching real rsync's own default
+(a second `-i`/`-vv` would show them too; grsync doesn't implement that
+second tier). Output lines match real rsync's own default
+(`--out-format='%i %n%L'`): the code, the path, and `" -> target"` for a
+symlink.
+
+Scoped to what grsync actually tracks, each disclosed explicitly rather
+than silently approximated:
+
+- **`u`/`a`/`x` (atime/crtime, ACL, xattr) are always `.`** - grsync has
+  no `--atimes`/`--acl`/`--xattr` flags, matching real rsync's own
+  behavior when those options aren't given.
+- **Attribute-`c` (checksum) never fires for a regular file** - real
+  rsync gates it behind `--checksum`, which grsync doesn't have; only
+  `s`/`t`/`p`/`o`/`g` are ever used to describe what changed about a
+  file's content or attributes, matching this ticket's own explicit
+  scope.
+- **`h` (hard-link secondary member) is implemented even though the
+  ticket's own explicit list didn't name it** - SC-18 already computed
+  exactly this grouping information, and reporting a hard-linked file as
+  an ordinary new file (`>f+++++++++`) would be a real, easily-avoidable
+  inaccuracy.
+
+`--verbose`/`-v` alone (without `-i`) prints just the path (plus
+`" -> target"` for a symlink) per changed item - real rsync's own
+`"%n%L"` default for `-v` without `-i`; `-i` takes precedence when both
+are given.
+
+Verified against real rsync's own documented guarantee ("The output of
+`--itemize-changes` is supposed to be exactly the same on a dry run and
+a subsequent real run") by `TestReceiver_DryRunItemizeMatchesRealRunItemize`
+and its CLI-level counterpart `TestE2E_DryRunAndRealRunItemizeMatch`:
+both compare a dry run's itemize output against a real run's, on a
+*separate*, equally fresh destination - not a second real run against
+the same one, which would legitimately report nothing left to do and
+prove nothing about the dry run's accuracy.
+
+### Across transports
+
+- **Local**: `pipeline.Receiver` runs in-process; `ReceiverOptions`
+  (dry-run, itemize, verbose, and where to write it) is passed straight
+  through.
+- **SSH**: the remote `grsync --server` process is invoked with
+  `--dry-run`/`--itemize-changes`/`--verbose` as ordinary flags on its
+  own command line (see `syncToRemote` in `internal/cli/sync.go`) - no
+  new wire protocol needed, since `--server` mode already parses its own
+  real CLI flags. Itemize/verbose *output* needed one small addition:
+  `transport.Session` now passes the remote subprocess's stderr through
+  to this process's own stderr live, not just buffering it for a
+  post-mortem error message - stdout is the framed wire protocol itself
+  (see [End-to-End Sync Pipeline](#end-to-end-sync-pipeline)), so
+  `runServer` writes its reporting there, never to stdout, and that
+  passthrough is what lets it actually reach the local terminal.
+  `TestSSHLocalhost_DryRunMakesNoChanges` proves the no-write guarantee
+  over a real SSH connection to `127.0.0.1` (skipped gracefully if no
+  local `sshd` is reachable, the same as this project's other real-SSH
+  tests).
+- **`rsync://` daemon**: dry-run's no-write guarantee is fully supported
+  in both directions, verified over a real TCP connection by
+  `TestDaemon_RealTCP_DryRunPutMakesNoChanges` and
+  `TestDaemon_RealTCP_DryRunGetMakesNoChanges`. A download
+  (`DirectionGet`) needs nothing special - the client's own `Receiver`
+  runs locally, exactly like a local sync. An upload (`DirectionPut`)
+  needed a small, genuine protocol extension: the client sends
+  `"put --dry-run"` instead of `"put"` on the direction line
+  (`daemon.dryRunToken`) so the *server's* `Receiver` - the side that
+  actually decides whether to write, for this direction - knows to skip
+  its writes.
+
+  **Itemize/verbose output is not available for an `rsync://` upload**,
+  a real, disclosed gap rather than something silently half-working: once
+  the module handshake ends, the daemon connection is pure binary wire
+  protocol with no channel for arbitrary text, unlike SSH's genuinely
+  separate stderr stream - adding one would be real, separate protocol
+  work, not a small extension of this ticket. `--dry-run`'s actual
+  no-write guarantee needs no such channel and is unaffected; `grsync`
+  prints a one-time note (to stderr) when `-i`/`-v` is combined with an
+  `rsync://` destination, rather than silently producing no output and
+  leaving the user to wonder why.
 
 ## rsync Daemon Mode
 

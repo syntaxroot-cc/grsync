@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
@@ -80,6 +81,17 @@ func moduleAttrOptions() sync.AttrOptions {
 	return sync.AttrOptions{Perms: true, Times: true, Owner: true, Group: true, Links: true, HardLinks: true}
 }
 
+// dryRunToken is appended as a second, space-separated field on the
+// direction line - "put --dry-run" instead of just "put" - the one
+// piece of protocol extension a client-requested dry-run needs for a
+// DirectionPut: the connection's Receiver runs on this (server) side, so
+// there is no other way for the client to communicate "plan this, but
+// don't actually write it" without adding a wire signal for it. A
+// DirectionGet needs nothing equivalent - that side's Receiver runs
+// locally on the client, entirely its own decision to make (see
+// DialModule).
+const dryRunToken = "--dry-run"
+
 // ServeModule runs one authenticated client's session against the
 // already-selected module m: reads the client's requested Direction,
 // enforces read-only, acknowledges with "@RSYNCD: OK" or refuses with an
@@ -95,7 +107,13 @@ func ServeModule(c *conn, m Module) error {
 	if err != nil {
 		return fmt.Errorf("reading direction: %w", err)
 	}
-	direction := Direction(line)
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		_ = writeLine(c.w, fmt.Sprintf("@ERROR: invalid direction %q", line))
+		return fmt.Errorf("invalid direction %q", line)
+	}
+	direction := Direction(fields[0])
+	dryRun := direction == DirectionPut && len(fields) > 1 && fields[1] == dryRunToken
 
 	if direction == DirectionPut && m.ReadOnly {
 		_ = writeLine(c.w, "@ERROR: module is read only")
@@ -121,7 +139,15 @@ func ServeModule(c *conn, m Module) error {
 		}
 		return waitForTransferDone(c)
 	case DirectionPut:
-		if err := pipeline.Receiver(c, m.Path, moduleAttrOptions()); err != nil {
+		// No Itemize/Verbose/Output here: the daemon protocol has no
+		// channel back to the client for reporting text once the
+		// handshake ends (unlike SSH's separate stderr stream) - see the
+		// README's Dry-Run Mode section for the full explanation of this
+		// disclosed gap. DryRun's actual no-write guarantee, in contrast,
+		// needs no channel at all beyond the dryRunToken above: it's
+		// purely a local decision this call makes about its own writes.
+		ropts := pipeline.ReceiverOptions{DryRun: dryRun}
+		if err := pipeline.Receiver(c, m.Path, moduleAttrOptions(), ropts); err != nil {
 			return err
 		}
 		return writeLine(c.w, transferDone)
@@ -140,8 +166,24 @@ func ServeModule(c *conn, m Module) error {
 // DirectionPut's Sender detects hard links at all - the same field
 // serves both directions since it's one "does the client want hard links
 // preserved" decision either way.
-func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions) error {
-	if err := writeLine(c.w, string(direction)); err != nil {
+//
+// ropts matters differently depending on direction: for DirectionGet,
+// the client's own Receiver runs locally, so ropts (DryRun, Itemize,
+// Verbose, Output) all apply directly, exactly like a local sync. For
+// DirectionPut, the client runs Sender, which has no dry-run concept at
+// all (see pipeline.Sender's own doc comment) - only ropts.DryRun is
+// used here, sent as an extra token on the direction line (dryRunToken)
+// so the *server's* Receiver, which is the side that actually decides
+// whether to write, knows to skip its writes. Itemize/Verbose are
+// silently unusable for a DirectionPut, since the daemon protocol has no
+// channel to carry that reporting text back from the server - see
+// ServeModule's own comment on the same limitation.
+func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions) error {
+	directionLine := string(direction)
+	if direction == DirectionPut && ropts.DryRun {
+		directionLine += " " + dryRunToken
+	}
+	if err := writeLine(c.w, directionLine); err != nil {
 		return fmt.Errorf("sending direction: %w", err)
 	}
 
@@ -155,7 +197,7 @@ func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rul
 
 	switch direction {
 	case DirectionGet:
-		if err := pipeline.Receiver(c, localPath, attrOpts); err != nil {
+		if err := pipeline.Receiver(c, localPath, attrOpts, ropts); err != nil {
 			return err
 		}
 		return writeLine(c.w, transferDone)

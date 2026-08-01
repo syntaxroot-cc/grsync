@@ -6,9 +6,6 @@
 package cli
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/spf13/cobra"
 
 	"github.com/syntaxroot-cc/grsync/internal/daemon"
@@ -58,6 +55,7 @@ type options struct {
 	group        bool
 	links        bool
 	hardLinks    bool
+	itemize      bool
 	filterRules  []FilterRule
 	rsh          string
 	server       bool
@@ -106,8 +104,8 @@ func NewRootCmd() *cobra.Command {
 		Use:   "grsync <source>... <destination>",
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
-			"Local-to-local and local-to-remote (SSH) syncs are supported; " +
-			"--dry-run, compression, progress reporting, and full --delete are not yet.",
+			"Local-to-local and local-to-remote (SSH) syncs are supported, including --dry-run " +
+			"and --itemize-changes; compression, progress reporting, and full --delete are not yet.",
 		// --server takes exactly one positional arg (the destination path)
 		// rather than the normal <source>...<destination> shape: it is how
 		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
@@ -133,26 +131,22 @@ func NewRootCmd() *cobra.Command {
 				return runServer(cmd, args[0], opts)
 			}
 			sources, destination := args[:len(args)-1], args[len(args)-1]
-			if opts.dryRun {
-				// A real dry-run (list what would change, transfer
-				// nothing) is explicitly out of scope for now - falling
-				// through to a real sync here would silently do the
-				// opposite of what --dry-run promises, which is worse
-				// than not supporting it yet. Until real dry-run support
-				// lands, this stays on the flag-echoing placeholder.
-				return run(cmd, sources, destination, opts)
-			}
 			return runSync(cmd, sources, destination, opts)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.BoolVarP(&opts.archive, "archive", "a", false, "archive mode (equivalent to common rsync defaults)")
-	flags.BoolVarP(&opts.verbose, "verbose", "v", false, "increase output verbosity")
+	flags.BoolVarP(&opts.verbose, "verbose", "v", false,
+		"mention each updated item's path (superseded by --itemize-changes when both are given, "+
+			"matching real rsync's own -v/-i relationship)")
 	flags.BoolVarP(&opts.compress, "compress", "z", false, "compress file data during transfer")
 	flags.BoolVarP(&opts.recursive, "recursive", "r", false, "recurse into directories")
 	flags.BoolVarP(&opts.dirs, "dirs", "d", false, "include directories themselves without recursing into their contents (implied by --recursive)")
-	flags.BoolVarP(&opts.dryRun, "dry-run", "n", false, "show what would be transferred without transferring")
+	flags.BoolVarP(&opts.dryRun, "dry-run", "n", false, "perform a trial run: full planning (file list, filters, deltas) with no filesystem changes")
+	flags.BoolVarP(&opts.itemize, "itemize-changes", "i", false,
+		"output a change-summary line per updated item, real rsync's own 11-character %i format "+
+			"(YXcstpoguax - see the README's Dry-Run Mode section); most useful with --dry-run")
 	flags.BoolVar(&opts.delete, "delete", false, "delete extraneous files from destination")
 	flags.BoolVar(&opts.progress, "progress", false, "show progress during transfer")
 	flags.Var(&filterRuleFlag{ruleType: FilterRuleExclude, rules: &opts.filterRules},
@@ -195,50 +189,6 @@ func NewRootCmd() *cobra.Command {
 			"to other users on the same machine via the process list, exactly why real rsync has never had one either")
 
 	return cmd
-}
-
-// run is the placeholder command body. It only echoes back what was parsed
-// so the flag wiring can be verified end to end; the actual sync/transport
-// work lands in later tickets.
-func run(cmd *cobra.Command, sources []string, destination string, opts *options) error {
-	var rules strings.Builder
-	if len(opts.filterRules) == 0 {
-		rules.WriteString("[]")
-	} else {
-		for i, r := range opts.filterRules {
-			if i > 0 {
-				rules.WriteString(", ")
-			}
-			fmt.Fprintf(&rules, "%s:%s", r.Type, r.Pattern)
-		}
-	}
-
-	summary := fmt.Sprintf(
-		"sources:     %v\n"+
-			"destination: %s\n"+
-			"archive:     %t\n"+
-			"verbose:     %t\n"+
-			"compress:    %t\n"+
-			"recursive:   %t\n"+
-			"dirs:        %t\n"+
-			"dry-run:     %t\n"+
-			"delete:      %t\n"+
-			"progress:    %t\n"+
-			"perms:       %t\n"+
-			"times:       %t\n"+
-			"owner:       %t\n"+
-			"group:       %t\n"+
-			"links:       %t\n"+
-			"rsh:         %q\n"+
-			"filters:     %s\n",
-		sources, destination,
-		opts.archive, opts.verbose, opts.compress, opts.recursive, opts.dirs, opts.dryRun,
-		opts.delete, opts.progress, opts.perms, opts.times, opts.owner, opts.group, opts.links,
-		opts.rsh, rules.String(),
-	)
-
-	_, err := fmt.Fprint(cmd.OutOrStdout(), summary)
-	return err
 }
 
 // Execute runs the root command using os.Args, as called from main().

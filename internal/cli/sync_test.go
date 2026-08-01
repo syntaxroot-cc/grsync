@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/syntaxroot-cc/grsync/internal/sync"
@@ -38,6 +39,128 @@ func TestE2E_LocalToLocal(t *testing.T) {
 	}
 
 	assertTreesMatch(t, src, dst, symlinksSupported)
+}
+
+// TestE2E_DryRunMakesNoFilesystemChanges drives the real CLI command
+// with --dry-run/-n against a rich source tree and confirms the
+// destination is completely empty afterward - the same guarantee
+// internal/pipeline's own TestReceiver_DryRunMakesNoFilesystemChanges
+// proves at the pipeline level, checked again here through the actual
+// command a user types, flags and all.
+func TestE2E_DryRunMakesNoFilesystemChanges(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(src, "top.txt"), "top level content")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
+	if err := os.Symlink("nested.txt", filepath.Join(src, "sub", "link.txt")); err != nil {
+		t.Logf("symlink creation unsupported in this environment, tree will not include one: %v", err)
+	}
+
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"-a", "-H", "--dry-run", src, dst})
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatalf("ReadDir(dst): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destination is not empty after --dry-run: %v", entries)
+	}
+}
+
+// TestE2E_DryRunItemizeOutput drives the real CLI command with
+// --dry-run and --itemize-changes together and confirms the printed
+// output actually contains real rsync's own %i format codes - a new
+// file's ">f+++++++++" and a new directory's "cd+++++++++" - not just
+// that the command exits without error.
+func TestE2E_DryRunItemizeOutput(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(src, "new.txt"), "brand new content")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
+
+	cmd := NewRootCmd()
+	var out strings.Builder
+	cmd.SetArgs([]string{"-a", "--dry-run", "-i", src, dst})
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, ">f+++++++++ new.txt") {
+		t.Errorf("output = %q, want it to contain %q", output, ">f+++++++++ new.txt")
+	}
+	if !strings.Contains(output, "cd+++++++++ sub") {
+		t.Errorf("output = %q, want it to contain %q", output, "cd+++++++++ sub")
+	}
+	if !strings.Contains(output, ">f+++++++++ sub/nested.txt") {
+		t.Errorf("output = %q, want it to contain %q", output, ">f+++++++++ sub/nested.txt")
+	}
+
+	// --dry-run's own guarantee, checked here too: itemize output
+	// claiming a transfer happened must not have been accompanied by an
+	// actual one.
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatalf("ReadDir(dst): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destination is not empty despite --dry-run: %v", entries)
+	}
+}
+
+// TestE2E_DryRunAndRealRunItemizeMatch is
+// TestReceiver_DryRunItemizeMatchesRealRunItemize's CLI-level
+// counterpart: real rsync's own documented guarantee ("The output of
+// --itemize-changes is supposed to be exactly the same on a dry run and
+// a subsequent real run") checked through the actual command, against
+// two separate fresh destinations.
+func TestE2E_DryRunAndRealRunItemizeMatch(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "file.txt"), "some content")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
+
+	dryRunDst := t.TempDir()
+	var dryRunOut strings.Builder
+	dryRunCmd := NewRootCmd()
+	dryRunCmd.SetArgs([]string{"-a", "--dry-run", "-i", src, dryRunDst})
+	dryRunCmd.SetOut(&dryRunOut)
+	if err := dryRunCmd.Execute(); err != nil {
+		t.Fatalf("dry-run Execute returned error: %v", err)
+	}
+
+	realDst := t.TempDir()
+	var realOut strings.Builder
+	realCmd := NewRootCmd()
+	realCmd.SetArgs([]string{"-a", "-i", src, realDst})
+	realCmd.SetOut(&realOut)
+	if err := realCmd.Execute(); err != nil {
+		t.Fatalf("real-run Execute returned error: %v", err)
+	}
+
+	// The trailing summary line ("would sync ... to DRYDST" vs "synced
+	// ... to REALDST") legitimately differs - only the itemize lines
+	// above it need to match, so both outputs are trimmed to just those.
+	dryRunLines := strings.Split(strings.TrimSpace(dryRunOut.String()), "\n")
+	realLines := strings.Split(strings.TrimSpace(realOut.String()), "\n")
+	if len(dryRunLines) < 2 || len(realLines) < 2 {
+		t.Fatalf("expected at least one itemize line plus a summary line; dry-run = %q, real = %q", dryRunOut.String(), realOut.String())
+	}
+	dryRunItemize := strings.Join(dryRunLines[:len(dryRunLines)-1], "\n")
+	realItemize := strings.Join(realLines[:len(realLines)-1], "\n")
+	if dryRunItemize != realItemize {
+		t.Errorf("dry-run itemize output does not match a real run's:\ndry-run:\n%s\nreal:\n%s", dryRunItemize, realItemize)
+	}
 }
 
 // TestE2E_HardLinksPreservedWithFlag drives the real CLI command with
