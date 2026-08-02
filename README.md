@@ -53,7 +53,13 @@ covers and where it hands off to grsync's own (non-rsync-wire-format)
 transfer protocol. `--ipv4`/`-4`, `--ipv6`/`-6`, and `--address` now
 genuinely control which address family and local address every transport
 uses, matching real rsync's own documented scope for each (see
-[IPv4/IPv6 Support](#ipv4ipv6-support) below).
+[IPv4/IPv6 Support](#ipv4ipv6-support) below). The test suite now also
+includes real-rsync comparison integration tests, fuzz targets, and
+throughput benchmarks, with `-race` and `govulncheck` wired into CI (see
+[Testing](#testing) below) - including a genuine, previously-undisclosed
+finding from building those comparison tests: grsync has no
+trailing-slash sensitivity on source paths, unlike real rsync's `src` vs
+`src/` distinction.
 
 ## Build
 
@@ -1496,6 +1502,101 @@ non-ssh `--rsh` override. IPv6-dependent tests call `requireIPv6Loopback`
 first and skip gracefully (not fail) in an environment without a working
 IPv6 loopback, the same established pattern `requireLocalSSHServer`
 already uses for the SSH tests.
+
+## Testing
+
+Beyond each section's own `### Testing` subsection above (which covers that
+feature's specific tests), the project as a whole has four further layers:
+real-rsync comparison integration tests, fuzz targets, throughput
+benchmarks, and CI hardening (`-race`, `govulncheck`).
+
+### Real-rsync comparison tests
+
+`internal/cli/rsync_compare_test.go` runs grsync and a real `rsync` binary
+independently against the same source tree and diffs the resulting
+destination trees for equivalence. **This checks behavioral equivalence,
+not wire-protocol interoperability** - the same distinction already
+disclosed for batch mode, compression, and daemon mode above: grsync's
+own sync protocol is gob-based, not a reimplementation of rsync's actual
+wire format, so the two tools are never talking to each other here, only
+being pointed at the same input and compared on output. If no `rsync`
+binary is found on `PATH`, these tests skip (not fail), the same
+established pattern the SSH tests already use for `requireLocalSSHServer`.
+
+Three scenarios are covered: a basic recursive sync, a filtered sync
+(`--exclude`), and attribute preservation (permissions and mtime, with a
+tolerance for filesystem timestamp-precision differences between temp
+directories - a real, deliberate design choice to avoid false failures
+from test-environment noise rather than a genuine correctness gap). Both
+tools are invoked with plain `-r`/`-rpt`, never `-a`, specifically to
+avoid owner/group comparisons that would be flaky or require root in CI.
+
+Building these tests surfaced a genuine, previously-undisclosed scope
+boundary: **grsync has no trailing-slash sensitivity on source paths.**
+Real rsync famously treats `src` (copy the directory itself into `dest`)
+and `src/` (copy `src`'s contents into `dest`) differently; grsync's
+`Walk` (`internal/sync/walk.go`) always excludes the root path from its
+own output, i.e. it unconditionally behaves as if a trailing slash were
+given, regardless of whether the CLI argument actually has one. The
+comparison tests account for this by invoking real rsync with an explicit
+trailing slash to match; anyone relying on grsync as an rsync CLI
+substitute should be aware `src` and `src/` behave identically here,
+unlike real rsync.
+
+### Fuzzing
+
+Six `testing.F` fuzz targets, each checking one explicit invariant rather
+than fuzzing without a clear property in mind:
+
+- `FuzzWeakChecksumRoll` (`internal/sync`) - the rolling checksum's
+  incrementally-updated value always matches recomputing from scratch on
+  the same window, for any data and window size. If this ever broke, the
+  delta algorithm would silently miss or misidentify block matches.
+- `FuzzRoundTripDelta` (`internal/sync`) - `ApplyDelta(old, GenerateDelta(sig, new), sig)`
+  always reproduces `new` exactly, for arbitrary (old, new) byte pairs.
+- `FuzzCompileAndMatch` (`internal/sync`) - the filter pattern compiler
+  and matcher never panic on any pattern/path string, however malformed.
+- `FuzzReadGreeting` and `FuzzReadLine` (`internal/daemon`) - the daemon's
+  greeting-line and shared line-reading code never panic on untrusted
+  network input, and `readLine` never returns a line longer than
+  `maxLineLength` regardless of how much unterminated data a peer sends
+  (the anti-DoS memory bound the code documents).
+- `FuzzReadFrame` (`internal/transport`) - frame decoding never panics and
+  never attempts an oversized allocation on a corrupted or hostile
+  stream, the same protection that
+  `TestE2E_ReadBatchOfMalformedFileFailsClearly` (see
+  [Batch Mode](#batch-mode) above) already found catching one hand-picked
+  garbage file cleanly; this target explores far beyond that single case.
+
+`go test ./...` alone only replays each target's seed corpus as ordinary
+subtests - it does not actually fuzz. CI runs each target through a real,
+bounded `-fuzz -fuzztime 15s` burst in its own dedicated job step.
+
+### Benchmarks
+
+`internal/sync/delta_bench_test.go` benchmarks `GenerateDelta` (block
+matching, the most performance-sensitive code in the project, run once
+per file on every sync) and `GenerateSignature` across three file sizes
+(10KB, 100KB, 1MB) and, for `GenerateDelta`, four change percentages (0%,
+10%, 50%, 100%) - unmatched content falls back to an expensive
+byte-by-byte incremental scan, so a file's similarity to its old version
+matters as much as its size for real throughput.
+
+### CI
+
+`.github/workflows/ci.yaml` runs `go build`/`go vet`, `golangci-lint`,
+`govulncheck`, the fuzz targets above, and `go test` on both Linux and
+Windows runners. `-race` runs on the Linux leg only: it requires cgo and
+a C toolchain, reliably available on `ubuntu-latest` but not something
+this project can verify for `windows-latest` without a real runner to
+test against, and the races it would actually catch (SC-10's
+progress-reporter goroutine, SC-6's per-connection daemon handling)
+aren't platform-specific in nature, so one reliable platform is enough.
+The Linux leg also installs a real `rsync` binary so the comparison tests
+above get a genuine execution somewhere in CI, not just a proof they can
+skip; the Windows leg has no equivalent easy install and instead
+exercises the graceful-skip path, matching a real Windows dev machine
+without rsync.
 
 ## Architecture
 

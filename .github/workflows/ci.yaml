@@ -39,3 +39,100 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Real-rsync comparison tests (internal/cli/rsync_compare_test.go)
+      # skip gracefully without a real rsync binary on PATH - the same
+      # established pattern this project's SSH tests already use for an
+      # environment-dependent capability - but leaving that skip as the
+      # *only* thing CI ever exercises would mean those tests never
+      # actually run for real anywhere. Installing rsync here, on the
+      # Linux leg only, guarantees they get a genuine execution on at
+      # least one platform; windows-latest has no equivalent easy
+      # install, so it continues to exercise (and prove) the graceful
+      # skip path instead, exactly as a Windows dev machine without
+      # rsync already does locally.
+      - name: install rsync (Linux only, for real-rsync comparison tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      # -race requires cgo (it links a C-based runtime), which is
+      # reliably available out of the box on ubuntu-latest but not
+      # something this project can verify is equally well-supported on
+      # windows-latest's own default toolchain without access to a real
+      # GitHub Actions runner to test against - so -race runs where it's
+      # known-good (Linux), and windows-latest still gets a full,
+      # real, native (not cross-compiled) test run without it. The
+      # actual value -race provides - catching a genuine data race in
+      # this project's own logic (SC-10's progress-reporter goroutine,
+      # SC-6's per-connection daemon handling) - isn't platform-specific
+      # in what it would find, so one platform running it is enough to
+      # get that benefit.
+      - name: go test -race (Linux)
+        if: runner.os == 'Linux'
+        run: go test -race -timeout 10m ./...
+
+      - name: go test (Windows)
+        if: runner.os != 'Linux'
+        run: go test -timeout 10m ./...
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # `go test ./...` alone only ever replays each Fuzz function's seed
+      # corpus as ordinary subtests - it does not actually fuzz anything
+      # (verified locally: a 10s -fuzz run finds thousands of new
+      # "interesting" corpus entries per target that a seed-only run
+      # never would). Each target gets its own explicit step, for a
+      # real, bounded fuzzing burst - not just existing, unexercised, in
+      # the source tree - and so a failure clearly names which target
+      # found it rather than a single opaque combined step.
+      - name: FuzzWeakChecksumRoll
+        run: go test ./internal/sync/... -run '^$' -fuzz '^FuzzWeakChecksumRoll$' -fuzztime 15s
+
+      - name: FuzzRoundTripDelta
+        run: go test ./internal/sync/... -run '^$' -fuzz '^FuzzRoundTripDelta$' -fuzztime 15s
+
+      - name: FuzzCompileAndMatch
+        run: go test ./internal/sync/... -run '^$' -fuzz '^FuzzCompileAndMatch$' -fuzztime 15s
+
+      - name: FuzzReadGreeting
+        run: go test ./internal/daemon/... -run '^$' -fuzz '^FuzzReadGreeting$' -fuzztime 15s
+
+      - name: FuzzReadLine
+        run: go test ./internal/daemon/... -run '^$' -fuzz '^FuzzReadLine$' -fuzztime 15s
+
+      - name: FuzzReadFrame
+        run: go test ./internal/transport/... -run '^$' -fuzz '^FuzzReadFrame$' -fuzztime 15s
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: golang/govulncheck-action@v1
