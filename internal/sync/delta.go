@@ -141,16 +141,24 @@ func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 // to plug into - so an io.Writer parameter would just be unused
 // flexibility at this stage. That can change if/when a streaming
 // transport is introduced later.
+// blockSize is validated lazily, only once a CopyOp actually needs it to
+// translate a BlockIndex into a byte range - not unconditionally up
+// front - so a delta with no CopyOps at all (every real caller today
+// still has BlockSize > 0 via GenerateSignature's own DefaultBlockSize,
+// but SC-12's append-mode construction can legitimately produce a
+// Signature with BlockSize == 0 when the receiver's existing file is
+// empty, since there is then no prefix block to describe at all) never
+// gets rejected for a value that would never actually be used.
 func ApplyDelta(oldData []byte, ops []DeltaOp, sig Signature) ([]byte, error) {
 	blockSize := sig.BlockSize
-	if blockSize <= 0 {
-		return nil, fmt.Errorf("invalid signature block size %d", blockSize)
-	}
 
 	var out []byte
 	for i, op := range ops {
 		switch o := op.(type) {
 		case CopyOp:
+			if blockSize <= 0 {
+				return nil, fmt.Errorf("op %d: invalid signature block size %d", i, blockSize)
+			}
 			start := o.BlockIndex * blockSize
 			if o.BlockIndex < 0 || start >= len(oldData) {
 				return nil, fmt.Errorf("op %d: CopyOp block index %d is out of range for a %d-byte old file", i, o.BlockIndex, len(oldData))

@@ -133,10 +133,40 @@ func fromWireDeltaOps(wire []wireDeltaOp, compressed bool, literal []byte) ([]sy
 // against a class of bug (an off-by-one, a dropped frame) that
 // position-only encoding could never detect and would silently
 // misapply one file's delta to another.
+//
+// Append (SC-12's own contribution) tells Sender how to respond to this
+// signature - see appendAction's own doc comment for the three
+// possibilities. It defaults to appendNone (gob's zero value), so every
+// signatureMessage sent before --append/--append-verify existed decodes
+// exactly as it always did.
 type signatureMessage struct {
-	Path string
-	Sig  sync.Signature
+	Path   string
+	Sig    sync.Signature
+	Append appendAction
 }
+
+// appendAction is carried on a signatureMessage to tell Sender how to
+// respond to it - see receiver.go's own doc comment on where each value
+// gets chosen, and sender.go's own doc comment on how each is handled.
+type appendAction byte
+
+const (
+	// appendNone is the normal, pre-SC-12 flow: Sender runs
+	// sync.GenerateDelta against Sig exactly as it always has.
+	appendNone appendAction = iota
+	// appendTail means "the receiver's existing Sig.BlockSize bytes are
+	// blindly trusted, unverified - send only the literal tail past
+	// that offset" (--append). Sig.BlockSize carries that trusted
+	// offset (not a real block size at all here); Sig.Blocks is unused.
+	// See receiver.go for exactly when this is chosen and sender.go for
+	// how it's handled.
+	appendTail
+	// appendSkip means "the destination is already at least as long as
+	// the source - don't read or compare anything at all, just
+	// acknowledge with an empty delta" (the --append/--append-verify
+	// "not shorter, skip entirely" eligibility rule).
+	appendSkip
+)
 
 // deltaMessage is FrameDelta's payload: one regular file's delta ops,
 // tagged with its Path for the same reason as signatureMessage.
@@ -225,8 +255,8 @@ func recvFileList(r io.Reader) ([]sync.FileEntry, []sync.HardLinkGroup, error) {
 	return msg.Entries, msg.HardLinkGroups, nil
 }
 
-func sendSignature(w io.Writer, path string, sig sync.Signature) error {
-	payload, err := encodeGob(signatureMessage{Path: path, Sig: sig})
+func sendSignature(w io.Writer, path string, sig sync.Signature, action appendAction) error {
+	payload, err := encodeGob(signatureMessage{Path: path, Sig: sig, Append: action})
 	if err != nil {
 		return fmt.Errorf("encoding signature for %q: %w", path, err)
 	}

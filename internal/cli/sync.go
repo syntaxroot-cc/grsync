@@ -54,12 +54,16 @@ func effectiveAttrOptions(opts *options) sync.AttrOptions {
 // reported to output.
 func effectiveReceiverOptions(opts *options, output io.Writer) pipeline.ReceiverOptions {
 	return pipeline.ReceiverOptions{
-		DryRun:   opts.dryRun,
-		Itemize:  opts.itemize,
-		Verbose:  opts.verbose,
-		Progress: opts.progress,
-		Stats:    opts.stats,
-		Output:   output,
+		DryRun:       opts.dryRun,
+		Itemize:      opts.itemize,
+		Verbose:      opts.verbose,
+		Progress:     opts.progress,
+		Stats:        opts.stats,
+		Output:       output,
+		Partial:      opts.partial,
+		PartialDir:   opts.partialDir,
+		Append:       opts.appendMode,
+		AppendVerify: opts.appendVerify,
 	}
 }
 
@@ -163,6 +167,15 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		return err
 	}
 
+	// --append/--append-verify are two different behaviors for the same
+	// underlying idea (see the README's Partial and Append Transfers
+	// section for the real, verified-against-source distinction) - like
+	// --ipv4/--ipv6 above, rejecting the combination outright is clearer
+	// than silently preferring one.
+	if opts.appendMode && opts.appendVerify {
+		return fmt.Errorf("--append and --append-verify are mutually exclusive")
+	}
+
 	// isRsyncURL is checked, and rsyncURL parsed, before
 	// transport.ParseRemotePath ever looks at destination: an rsync://
 	// URL is never valid [user@]host:path syntax (ParseRemotePath itself
@@ -212,6 +225,21 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		// the user to wonder why.
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --itemize-changes/--verbose/--progress/--stats output is not available "+
 			"for an rsync:// daemon destination (the daemon protocol has no channel for it); --dry-run's no-write guarantee still applies")
+	}
+	if isRsyncDaemon && (ropts.KeepPartial() || ropts.AppendMode()) {
+		// A different flavor of the same underlying limitation: for an
+		// rsync:// daemon upload, the module's Receiver runs on the
+		// server (see daemon.ServeModule's own DirectionPut comment), not
+		// here, and syncToRsyncDaemon only ever forwards DryRun to it (via
+		// daemon.dryRunToken) - not the rest of ReceiverOptions. Extending
+		// that wire protocol to also carry Partial/PartialDir/Append/
+		// AppendVerify is real, separate protocol work outside SC-12's own
+		// scope (it depends on SC-17's daemon-CLI wiring, not the other
+		// way around), so this direction silently ignores all four rather
+		// than honoring them - noting that plainly, once, rather than
+		// letting the user assume they took effect.
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --partial/--partial-dir/--append/--append-verify are not available "+
+			"for an rsync:// daemon destination (the module's receiver runs on the server, which has no way to learn these were requested)")
 	}
 
 	for _, src := range sources {
@@ -275,8 +303,11 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // remote side, exactly where pipeline.Receiver actually runs for this
 // transport - there is nothing for the local, sending side to decide
 // here at all. This is the same mechanism SC-11 established for
-// DryRun/Itemize/Verbose; Progress/Stats just reuse it rather than
-// inventing a second one.
+// DryRun/Itemize/Verbose; Progress/Stats, and now Partial/PartialDir/
+// Append/AppendVerify, just reuse it rather than inventing a second
+// one - the remote --server process's own Receiver call decides
+// everything about temp files/resumption/append locally, from its own
+// argv, exactly like it already decides DryRun.
 //
 // copts needs none of that: --compress/-z is a Sender-side decision (see
 // pipeline.CompressOptions' own doc comment), and Sender runs right here,
@@ -312,6 +343,23 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 	}
 	if ropts.Stats {
 		remoteArgs = append(remoteArgs, "--stats")
+	}
+	if ropts.PartialDir != "" {
+		// --partial-dir implies --partial (see ReceiverOptions.KeepPartial's
+		// own doc comment), so there's no need to also forward a bare
+		// --partial alongside it - one less argv token, and it avoids ever
+		// sending a value that could look like two separate flags if it
+		// happened to be forwarded as "--partial-dir" "value" instead of
+		// this single "--partial-dir=value" token.
+		remoteArgs = append(remoteArgs, "--partial-dir="+ropts.PartialDir)
+	} else if ropts.Partial {
+		remoteArgs = append(remoteArgs, "--partial")
+	}
+	if ropts.Append {
+		remoteArgs = append(remoteArgs, "--append")
+	}
+	if ropts.AppendVerify {
+		remoteArgs = append(remoteArgs, "--append-verify")
 	}
 	remoteArgs = append(remoteArgs, remote.Path)
 

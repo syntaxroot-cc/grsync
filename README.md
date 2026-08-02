@@ -11,10 +11,10 @@ really walks, filters, diffs, transfers, and reconstructs files, applying
 requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
-out of scope (partial/append transfers, batch mode, full `--delete`, and
-device/special files) - this is real, working sync, not yet full feature
-parity. Hard links *are* now preserved, opt-in via `-H`/`--hard-links`
-exactly like real rsync's own flag (see
+out of scope (batch mode, full `--delete`, and device/special files) -
+this is real, working sync, not yet full feature parity. Hard links
+*are* now preserved, opt-in via `-H`/`--hard-links` exactly like real
+rsync's own flag (see
 [File Attribute Preservation](#file-attribute-preservation) below), and
 `--dry-run`/`-n` is a genuine trial run - full planning, zero filesystem
 changes - with real `--itemize-changes`/`-i` output matching rsync's own
@@ -24,6 +24,10 @@ formats (see [Progress and Stats](#progress-and-stats) below).
 `--compress`/`-z` now genuinely compresses a file's literal delta data
 with zlib, including real rsync's own `--compress-level` and
 `--skip-compress` (see [Compression](#compression) below).
+`--partial`/`--partial-dir` and `--append`/`--append-verify` are now
+implemented too, with a real, disclosed scope boundary around what
+"partial" means in grsync's own architecture (see
+[Partial and Append Transfers](#partial-and-append-transfers) below).
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -826,6 +830,200 @@ outright, recreating the link directly instead (see
 `--compress` is moot for them by construction, with nothing to compress
 in the first place. `TestSenderReceiver_CompressWorksWithHardLinks`
 confirms that skip still holds correctly with compression enabled.
+
+## Partial and Append Transfers
+
+`--partial`/`--partial-dir` keep (and can resume from) a file whose
+transfer didn't finish; `--append`/`--append-verify` extend a
+destination file that's shorter than the source without re-sending the
+part that's already there. All four are implemented against real
+rsync's own documented behavior (`rsync.1`) and, where the docs were
+ambiguous, its actual source (`generator.c`, `sender.c`) - verified
+rather than assumed.
+
+### A real prerequisite this ticket needed, not just added
+
+Before this ticket, `Receiver` wrote a regular file's new content
+straight to its final destination path (`os.WriteFile`, or a chunked
+`os.OpenFile` loop for `--progress`). That meant a process killed
+mid-write left a genuinely truncated file sitting at the real
+destination, with no flag able to prevent or recover from it - `--partial`
+literally cannot mean anything sensible without a separate temp file to
+keep or discard in the first place. Every regular file is now written to
+a fresh temp file next to its destination (`.name.RANDOM.grsync-tmp`,
+created via `os.CreateTemp` for safe unique naming, `0644` by default to
+match `os.WriteFile`'s own prior behavior) and only renamed into place
+once it's completely written - unconditionally, not just when `--partial`
+is given. `--partial`/`--partial-dir` control only what happens to that
+temp file if the transfer aborts before the rename.
+
+### What "partial" means in grsync's architecture (a real, disclosed scope boundary)
+
+grsync's wire protocol has no streaming I/O: one regular file's delta
+arrives as a single, atomic gob-encoded frame, fully decoded into memory
+before a single byte of it is written to disk (the same finding SC-10
+already made for `--progress`). There is no such thing as "half of this
+file's delta arrived" - a dropped connection mid-frame just means that
+file's transfer never started at all, while everything already written
+for *earlier* files in the same sync stays exactly as complete as it
+already was.
+
+**`--partial` in grsync is therefore file-granularity, not real rsync's
+true byte-level mid-file resumption.** It describes which *whole files*
+survive an interrupted multi-file sync, not a partially-written single
+file left in a recoverable half-complete state on the wire. Concretely:
+if file 3 of 5 is the one in flight when a connection drops, files 1-2
+are already complete and untouched by `--partial` either way; file 3 is
+either fully absent (if the drop happened while its delta was still in
+transit - the common case) or has its temp file kept/discarded per
+`--partial`/`--partial-dir` (if the drop happened during the local write
+itself); files 4-5 are never attempted at all.
+`TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial`
+is the direct proof of this, run with and without `--partial` to confirm
+the flag genuinely doesn't change that particular outcome.
+
+### `--partial`
+
+Without it, a temp file left behind by an aborted transfer is deleted -
+the destination is left exactly as it was before the sync started (or
+absent, for a new file). With it, the temp file is instead renamed onto
+the real destination path, matching real rsync's own default "keep it
+where the real file goes" behavior - a subsequent run's normal
+signature/delta exchange against that destination file then picks up
+whatever prefix happens to still be correct, for free, with no
+additional resume-lookup mechanism needed.
+
+### `--partial-dir DIR`
+
+Implies `--partial` (matching real rsync's own documented "also implying
+that [`--partial`] be enabled"). Instead of overwriting the real
+destination with the partial result, the temp file is moved into DIR,
+leaving the real destination completely untouched. A relative DIR is
+created inside *each file's own destination directory* (real rsync's own
+documented placement, so a `--partial-dir=.rsync-partial` can be reused
+across an entire tree without files colliding); an absolute DIR is a
+single shared directory, so grsync mirrors each file's full relative
+path underneath it instead of just its basename - real rsync's own docs
+don't spell out this exact scheme for the absolute case, but mirroring
+the relative path is the only one that can't collide between two files
+sharing a basename in different subdirectories.
+
+**Real content-level resumption, not just retention**: on a later run,
+if a file has a leftover partial-dir file, it's used as the delta
+comparison basis *instead of* the (possibly nonexistent) real
+destination file - `sync.GenerateDelta` then naturally produces `CopyOp`s
+for whatever prefix still matches and literal data only for the
+genuinely new tail, exactly like a resumed transfer should.
+`TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry` measures this
+directly: a resumed transfer with a genuine partial-dir prefix writes
+meaningfully fewer bytes to the wire than an identical transfer starting
+from nothing. The partial-dir file is removed once it's successfully
+folded into a completed transfer, matching real rsync's own documented
+"delete it after it has served its purpose."
+
+**Self-review: could a partial file leak outside `--partial-dir`?**
+No - verified both by re-reading `abandonOrKeep` (`internal/pipeline/partial.go`)
+and by dedicated tests
+(`TestAbandonOrKeep_PartialDirNeverOverwritesExistingDestContent`,
+`TestAbandonOrKeep_NeverLeavesATempFileNextToDestPath`): whenever
+`--partial-dir` is set, an aborted temp file's only two possible
+destinations are the partial-dir path itself or deletion - the real
+destination path is never touched by that code path at all.
+
+### `--append` vs `--append-verify`: the real, verified distinction
+
+Both share the same two eligibility rules, verified against real
+rsync's own source (`generator.c`) rather than assumed: a destination
+file that doesn't exist yet is transferred completely normally (append
+semantics only ever apply to an *existing*, shorter file - "new files
+are transferred," per `rsync.1`); a destination that's already at least
+as long as the source is skipped **entirely and unconditionally** - not
+compared, not touched at all, even if its content genuinely differs.
+
+For a genuinely shorter destination, the two diverge exactly where real
+rsync's own source diverges (`generate_and_send_sums`: plain `--append`
+returns after writing only a header, sending zero real block checksums
+at all; `--append-verify` falls through to the completely normal
+per-block signature loop):
+
+- **`--append`** blindly trusts the existing prefix - grsync's receiver
+  never reads or hashes it at all, just its length. The sender is told
+  (via a wire-level `Append` marker on the signature message) to send
+  only the literal tail past that offset, represented as a single
+  `CopyOp` ("take the receiver's word for these bytes, unverified")
+  followed by a `DataOp` for the new data - reusing `sync.ApplyDelta`
+  completely unchanged, since `CopyOp`'s own contract only ever claims to
+  copy a block, never that it was checksum-verified.
+- **`--append-verify`** runs the exact same `sync.GenerateSignature`/
+  `GenerateDelta`/`ApplyDelta` pipeline as an entirely normal sync -
+  needing no new algorithm at all. The eligibility rules above are the
+  only thing it actually adds on top of a vanilla transfer.
+
+**Self-review: does `--append` risk silent corruption?** Yes - and this
+is real rsync's own documented risk (`rsync.1`: "**can be dangerous** if
+you aren't 100% sure... existing content... is also known to be the
+same"), reproduced faithfully here, not worsened and not silently fixed.
+`TestReceiver_AppendDoesNotVerifyCorruptedPrefix` locks this in
+explicitly: a destination with a wrong existing prefix ends up with that
+wrong prefix preserved verbatim, plus the correct new tail appended after
+it - exactly real rsync's own documented behavior.
+`TestReceiver_AppendVerifyDetectsCorruptedPrefix` proves the same
+scenario is fully corrected under `--append-verify`. **Use `--append`
+only when you are certain the existing destination content is already
+correct** (e.g. a log file only this sync ever writes to) - exactly real
+rsync's own guidance.
+
+A source file that shrinks below what the receiver already trusts
+between the receiver's own check and the sender's actual read (real
+rsync's own "diminished file" race, normally handled with a warning and
+a per-file skip) is treated as a hard error here instead: grsync's
+`Receiver` has no general "skip this one file, keep going" mechanism
+anywhere else in the codebase, and building one solely for this narrow
+race was judged a bigger change than this ticket's own scope - a
+disclosed simplification, not a silent gap.
+
+`--append` and `--append-verify` are mutually exclusive (a clear CLI
+error, matching the same "reject the ambiguous combination outright"
+philosophy `--ipv4`/`--ipv6` already established).
+
+### Interaction with dry-run and hard links
+
+Both flags fully respect `--dry-run`: the append-aware signature/delta
+exchange (and, for `--partial-dir`, the partial-file basis lookup) still
+runs for accurate itemize planning, but the temp-file/rename/cleanup
+code all lives inside the same `if !DryRun` guard every other write in
+`Receiver` does, so nothing is ever created, modified, or deleted on
+disk. `TestReceiver_AppendWorksWithDryRun` and
+`TestReceiver_PartialDirCreatesNoFilesAndDeletesNothingDuringDryRun`
+both confirm this directly, the latter specifically checking that a
+leftover partial-dir file survives a dry run completely untouched
+(neither consumed nor deleted).
+
+A hard-link group's secondary members never reach the signature/delta
+exchange at all (see [Compression](#compression)'s own identical note) -
+so `--partial`/`--append` are structurally moot for them, not specially
+excluded by any append- or partial-specific code.
+`TestReceiver_AppendExcludesHardLinkSecondaryMembers` confirms that
+structural fact still holds with `--append` enabled.
+
+### Across transports
+
+- **Local and SSH**: fully supported. For SSH, `--partial`/
+  `--partial-dir`/`--append`/`--append-verify` are forwarded to the
+  remote `--server` process as ordinary argv flags - the same mechanism
+  SC-11 established for `--dry-run`/`--itemize-changes` - parsed there
+  through the server's own normal flag handling, no wire-protocol change
+  needed. Verified over a real SSH connection by
+  `TestSSHLocalhost_AppendAndPartialDoNotBreakTheTransfer`.
+- **`rsync://` daemon**: **not available**, a real, disclosed gap rather
+  than a silent one. An upload's module `Receiver` runs on the daemon
+  server (see [rsync Daemon Mode](#rsync-daemon-mode)), and
+  `syncToRsyncDaemon` only ever forwards `DryRun` to it via a dedicated
+  wire token - extending that protocol to also carry these four flags is
+  real, separate work outside this ticket's own scope. `grsync` prints a
+  one-time note when any of them is combined with an `rsync://`
+  destination, the same pattern already established for
+  itemize/verbose/progress/stats.
 
 ## rsync Daemon Mode
 

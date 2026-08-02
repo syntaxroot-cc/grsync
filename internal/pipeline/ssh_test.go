@@ -299,3 +299,54 @@ func TestSSHLocalhost_IPv4ForwardedToSSHDoesNotBreakTheTransfer(t *testing.T) {
 
 	assertSameContent(t, filepath.Join(src, "top.txt"), filepath.Join(dest, "top.txt"))
 }
+
+// TestSSHLocalhost_AppendAndPartialDoNotBreakTheTransfer is SC-12's
+// real, over-the-wire proof for the SSH transport: --append/--partial
+// are forwarded to the remote --server process as ordinary argv flags
+// (see cli.syncToRemote's own doc comment - the same mechanism SC-11
+// established for --dry-run/--itemize-changes), parsed there through
+// the server's own normal flag handling, with no wire-protocol change
+// needed at all. This drives that real path end to end against a real
+// local sshd: the destination file is a genuine prefix of the source, so
+// a real --append tail-only transfer actually happens, not just a
+// harmless no-op.
+func TestSSHLocalhost_AppendAndPartialDoNotBreakTheTransfer(t *testing.T) {
+	requireLocalSSHServer(t)
+	grsyncPath := buildGrsyncBinary(t)
+
+	src := t.TempDir()
+	dest := t.TempDir()
+	prefix := "already on the remote side "
+	full := prefix + "and now the new tail, sent over real ssh"
+	mustWriteFile(t, filepath.Join(src, "growing.log"), full)
+	mustWriteFile(t, filepath.Join(dest, "growing.log"), prefix)
+
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--append", "--partial", dest}, false, false)
+	if err != nil {
+		t.Fatalf("Dial returned error: %v", err)
+	}
+
+	if err := transport.Handshake(session); err != nil {
+		t.Fatalf("Handshake returned error: %v", err)
+	}
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Sender did not complete within 20s")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Errorf("Session.Close returned error: %v", err)
+	}
+
+	assertSameContent(t, filepath.Join(src, "growing.log"), filepath.Join(dest, "growing.log"))
+}
