@@ -51,14 +51,30 @@ const dialDaemonTimeout = 10 * time.Second
 // like dryRunToken is needed for it at all, since the server's Receiver
 // only ever reacts to what each deltaMessage's own Compressed marker
 // says.
-func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool, copts pipeline.CompressOptions) error {
+//
+// network ("tcp"/"tcp4"/"tcp6", from --ipv4/--ipv6) and localAddr (from
+// --address, already resolved once by resolveLocalAddr - nil means no
+// preference) are SC-14's own contribution, fully honored here for the
+// same reason copts is: this dial happens on the client, right here, so
+// there's nothing for the daemon side to be told about either of them.
+func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool, copts pipeline.CompressOptions, network string, localAddr *net.TCPAddr) error {
 	port := u.Port
 	if port == 0 {
 		port = daemon.DefaultPort
 	}
 	addr := net.JoinHostPort(u.Host, strconv.Itoa(port))
 
-	nc, err := net.DialTimeout("tcp", addr, dialDaemonTimeout)
+	// localAddr must only be assigned into dialer.LocalAddr when genuinely
+	// non-nil: a nil *net.TCPAddr assigned directly into that net.Addr
+	// interface field would produce a non-nil interface wrapping a nil
+	// pointer (the classic Go typed-nil gotcha), which net.Dialer would
+	// then try to actually use as a local address instead of correctly
+	// treating it as "no preference."
+	dialer := &net.Dialer{Timeout: dialDaemonTimeout}
+	if localAddr != nil {
+		dialer.LocalAddr = localAddr
+	}
+	nc, err := dialer.Dial(network, addr)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", addr, err)
 	}

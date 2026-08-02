@@ -66,6 +66,9 @@ type options struct {
 	config        string
 	port          int
 	passwordFile  string
+	ipv4          bool
+	ipv6          bool
+	address       string
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -128,7 +131,7 @@ func NewRootCmd() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.daemon {
-				return runDaemon(cmd, opts.config, opts.port)
+				return runDaemon(cmd, opts)
 			}
 			if opts.server {
 				return runServer(cmd, args[0], opts)
@@ -206,6 +209,17 @@ func NewRootCmd() *cobra.Command {
 			"--password-file, including refusing a world-readable FILE. There is deliberately no "+
 			"--password flag: a password given directly as a command-line argument would be visible "+
 			"to other users on the same machine via the process list, exactly why real rsync has never had one either")
+	flags.BoolVarP(&opts.ipv4, "ipv4", "4", false,
+		"prefer IPv4 for the --daemon listener and for dialing an rsync:// daemon; forwarded as ssh's own "+
+			"-4 flag when ssh is genuinely the remote shell in use (see the README's IPv4/IPv6 Support section "+
+			"for exactly when that forwarding does and doesn't happen)")
+	flags.BoolVarP(&opts.ipv6, "ipv6", "6", false,
+		"prefer IPv6 - see --ipv4's own help text; --ipv4 and --ipv6 are mutually exclusive")
+	flags.StringVar(&opts.address, "address", "",
+		"bind to a specific local IP address or hostname: the listen address in --daemon mode, or the "+
+			"local/source address of the outbound connection when dialing an rsync:// daemon; matches real "+
+			"rsync's own --address scope exactly - has no effect on the SSH transport or a local sync "+
+			"(see the README's IPv4/IPv6 Support section)")
 
 	return cmd
 }

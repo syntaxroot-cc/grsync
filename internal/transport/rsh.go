@@ -2,6 +2,40 @@ package transport
 
 import "strings"
 
+// sshAddressFamilyFlag returns "-4" or "-6" to insert into the
+// remote-shell argv when ipv4/ipv6 was requested AND program is
+// genuinely ssh - real rsync's own exact behavior, verified against
+// upstream source (main.c's do_cmd(): "if (default_af_hint == AF_INET
+// && strcmp(t, "ssh") == 0) args[argc++] = "-4";", where t is the
+// resolved remote-shell command's basename). Real rsync's own -4/-6 is
+// never forwarded for any other remote shell - its own man page says so
+// explicitly: "For other remote shells you'll need to specify '--rsh
+// SHELL -4' directly" - so this returns "" (nothing to insert) for
+// anything but ssh, rather than guessing at another program's own
+// address-family flag syntax.
+//
+// program is compared by basename, not the full path, matching real
+// rsync's own strrchr(cmd, '/')-based check - and additionally strips a
+// trailing ".exe", which upstream's Unix-only C code never needs to but
+// grsync does, running natively on Windows too.
+func sshAddressFamilyFlag(program string, ipv4, ipv6 bool) string {
+	if !ipv4 && !ipv6 {
+		return ""
+	}
+	base := program
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(base, ".exe")
+	if base != "ssh" {
+		return ""
+	}
+	if ipv4 {
+		return "-4"
+	}
+	return "-6"
+}
+
 // DefaultRSH is the remote-shell command used when no --rsh/-e override is
 // given, matching real rsync's own default.
 const DefaultRSH = "ssh"
@@ -20,7 +54,13 @@ const DefaultRSH = "ssh"
 // -e "ssh -p 2222 -i key.pem") or the user's own ~/.ssh/config, exactly as
 // with real rsync. Inventing grsync-only flags for these would be a
 // *worse* match for SC-1's parity goal, not a better one.
-func BuildRSHCommand(rsh, user, host string, remoteArgs []string) []string {
+//
+// ipv4/ipv6 (--ipv4/--ipv6, SC-14) are the one deliberate exception to
+// that "customize everything via -e" philosophy, because real rsync
+// itself makes it one: see sshAddressFamilyFlag's own doc comment for
+// exactly when -4/-6 does and doesn't get inserted here, verified
+// against upstream's own source rather than assumed.
+func BuildRSHCommand(rsh, user, host string, remoteArgs []string, ipv4, ipv6 bool) []string {
 	fields := splitRSHCommand(rsh)
 	if len(fields) == 0 {
 		fields = []string{DefaultRSH}
@@ -31,8 +71,11 @@ func BuildRSHCommand(rsh, user, host string, remoteArgs []string) []string {
 		target = user + "@" + host
 	}
 
-	cmd := make([]string, 0, len(fields)+1+len(remoteArgs))
+	cmd := make([]string, 0, len(fields)+2+len(remoteArgs))
 	cmd = append(cmd, fields...)
+	if af := sshAddressFamilyFlag(fields[0], ipv4, ipv6); af != "" {
+		cmd = append(cmd, af)
+	}
 	cmd = append(cmd, target)
 	cmd = append(cmd, remoteArgs...)
 	return cmd
