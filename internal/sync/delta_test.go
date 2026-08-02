@@ -32,15 +32,6 @@ func TestApplyDelta_OutOfRangeBlockIndexErrors(t *testing.T) {
 	}
 }
 
-// TestApplyDelta_InvalidBlockSizeErrorsOnlyWhenACopyOpNeedsIt is SC-12's
-// own relaxation of ApplyDelta's block-size validation, made concrete: a
-// zero/negative BlockSize is only ever actually consulted when
-// translating a CopyOp's BlockIndex into a byte range, so it must only
-// be rejected when ops genuinely contains a CopyOp - not unconditionally
-// up front, which would reject SC-12's own append-mode construction for
-// a brand-new (zero-length existing) destination file, where a
-// Signature with BlockSize == 0 and no CopyOp at all is entirely valid
-// (there is no prefix block to describe).
 func TestApplyDelta_InvalidBlockSizeErrorsOnlyWhenACopyOpNeedsIt(t *testing.T) {
 	if _, err := ApplyDelta([]byte("data"), []DeltaOp{CopyOp{BlockIndex: 0}}, Signature{BlockSize: 0}); err == nil {
 		t.Errorf("ApplyDelta with a zero block size and a CopyOp returned nil error, want an error")
@@ -63,21 +54,10 @@ func TestApplyDelta_InvalidBlockSizeErrorsOnlyWhenACopyOpNeedsIt(t *testing.T) {
 	}
 }
 
-// TestGenerateDelta_WeakChecksumCollisionDisambiguatedByStrongChecksum
-// exercises the actual weak-checksum-collision path, rather than assuming
-// the strong-checksum disambiguation code is correct because it looks
-// right. block1, block2, and block3 below are three deliberately
-// constructed, genuinely different 3-byte sequences that all produce the
-// identical weak checksum (a=60, b=100 - hand-verified against
-// newWeakChecksum's exact weighting convention, no modular wraparound
-// needed): with weight (n-i) for byte i in a window of n=3, all three
-// satisfy sum=60 and 3x+2y+z=100 simultaneously by construction.
-//
-// If GenerateDelta ever regressed to trusting a weak-checksum match
-// without confirming it via strong checksum, this test would silently
-// start producing corrupted output (a CopyOp pointing at the wrong
-// block) - exactly the class of bug a weak checksum alone can't catch,
-// which is the entire reason a strong checksum exists.
+// block1, block2, and block3 are three different 3-byte sequences
+// constructed to all produce the identical weak checksum (a=60, b=100),
+// so this test exercises the strong-checksum disambiguation path rather
+// than just trusting it looks correct.
 func TestGenerateDelta_WeakChecksumCollisionDisambiguatedByStrongChecksum(t *testing.T) {
 	block1 := []byte{10, 20, 30}
 	block2 := []byte{15, 10, 35}
@@ -128,7 +108,7 @@ func TestGenerateDelta_WeakChecksumCollisionDisambiguatedByStrongChecksum(t *tes
 		}
 		d, ok := ops[0].(DataOp)
 		if !ok || string(d.Bytes) != string(block3) {
-			t.Errorf("op = %+v, want DataOp{Bytes: %v} - a weak-only match must not produce a CopyOp", ops[0], block3)
+			t.Errorf("op = %+v, want DataOp{Bytes: %v}", ops[0], block3)
 		}
 	})
 }
@@ -146,7 +126,6 @@ func TestGenerateDelta_IdenticalFileIsAllCopies(t *testing.T) {
 	if copies != 4 {
 		t.Errorf("got %d CopyOps, want 4 (one per block): %+v", copies, ops)
 	}
-	// Order matters too: block 0 first, then 1, 2, 3.
 	for i, op := range ops {
 		cp, ok := op.(CopyOp)
 		if !ok || cp.BlockIndex != i {
@@ -170,8 +149,6 @@ func TestGenerateDelta_CompletelyDifferentFileIsAllData(t *testing.T) {
 		t.Fatalf("got 0 DataOps, want at least 1")
 	}
 
-	// Reassembling every DataOp's bytes must reproduce newData exactly,
-	// since nothing was copied.
 	var got []byte
 	for _, op := range ops {
 		got = append(got, op.(DataOp).Bytes...)
@@ -198,9 +175,6 @@ func TestGenerateDelta_SingleByteChangeInMiddle(t *testing.T) {
 		t.Fatalf("got 0 DataOps despite a changed byte, want at least 1")
 	}
 
-	// The whole point of the algorithm: a one-byte change should cost a
-	// small, bounded amount of literal data, not force the whole file (or
-	// even the whole surrounding block) to be retransmitted as data.
 	var totalDataBytes int
 	for _, op := range ops {
 		if d, ok := op.(DataOp); ok {
@@ -211,9 +185,6 @@ func TestGenerateDelta_SingleByteChangeInMiddle(t *testing.T) {
 		t.Errorf("total literal bytes = %d, want a small bounded amount for a single changed byte", totalDataBytes)
 	}
 
-	// Reconstructing from ops must still reproduce newData exactly - the
-	// strongest check that "mostly CopyOps, one small DataOp" is actually
-	// correct, not just small.
 	reconstructed, err := ApplyDelta(old, ops, sig)
 	if err != nil {
 		t.Fatalf("ApplyDelta returned error: %v", err)

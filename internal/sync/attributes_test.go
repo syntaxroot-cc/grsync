@@ -8,16 +8,11 @@ import (
 	"time"
 )
 
-// wantPerm returns the permission bits Stat should actually report after
-// applyPerms(path, mode) on the current platform. On POSIX this is just
-// mode.Perm() - full fidelity. On Windows, os.Chmod can only toggle the
-// read-only attribute: any owner-write bit (0200) present makes the file
-// fully writable (reported as 0666), and its absence makes it read-only
-// (reported as 0444) - there's no way to represent finer-grained POSIX
-// permissions through the Win32 attribute model Go's os.Chmod uses there.
-// This is a real, verified platform difference (confirmed by running the
-// naive POSIX-only assertion here and watching it fail with 666 instead
-// of the requested 600), not a gap in applyPerms itself.
+// wantPerm returns the permission bits Stat should report after
+// applyPerms(path, mode) on the current platform. On Windows, os.Chmod can
+// only toggle the read-only attribute: any owner-write bit makes the file
+// fully writable (0666), and its absence makes it read-only (0444) - there's
+// no way to represent finer-grained POSIX permissions there.
 func wantPerm(mode os.FileMode) os.FileMode {
 	if runtime.GOOS != "windows" {
 		return mode.Perm()
@@ -55,11 +50,6 @@ func TestApplyPerms_IgnoresTypeBits(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// A FileEntry.Mode for a regular file with 0755 perms, as Lstat would
-	// actually report it (no high type bits set for a plain file - but
-	// this proves applyPerms takes a plain fs.FileMode and behaves
-	// correctly on a value that's already realistic, not just a bare
-	// octal literal).
 	if err := applyPerms(path, os.FileMode(0o755)); err != nil {
 		t.Fatalf("applyPerms returned error: %v", err)
 	}
@@ -74,17 +64,13 @@ func TestApplyPerms_IgnoresTypeBits(t *testing.T) {
 }
 
 func TestApplyPerms_ReadOnlyOnWindowsWhenNoWriteBit(t *testing.T) {
-	// Directly exercises the read-only side of Windows' reduced-fidelity
-	// Chmod, rather than only ever testing modes that happen to include
-	// a write bit.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file.txt")
 	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	t.Cleanup(func() {
-		// Best-effort: restore write permission so t.TempDir()'s own
-		// cleanup can actually remove this file afterward.
+		// Restore write permission so t.TempDir()'s cleanup can remove this file.
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Logf("cleanup: failed to restore writable permissions on %s: %v", path, err)
 		}
@@ -110,11 +96,8 @@ func TestApplyTimes(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Truncated to whole seconds: some filesystems (notably FAT variants,
-	// and historically some others) don't store sub-second mtime
-	// precision, so a nanosecond-precision want value could produce a
-	// flaky round-trip mismatch that has nothing to do with applyTimes
-	// itself being wrong.
+	// Whole seconds: some filesystems (e.g. FAT) don't store sub-second
+	// mtime precision, which would make a nanosecond-precision want flaky.
 	want := time.Date(2020, time.March, 15, 10, 30, 0, 0, time.UTC)
 
 	if err := applyTimes(path, want); err != nil {
@@ -161,11 +144,6 @@ func TestApplyTimes_Idempotent(t *testing.T) {
 }
 
 func TestApplyOwnership_SkippedWhenUnavailable(t *testing.T) {
-	// This is a pure logic check, not dependent on syscall behavior or
-	// privilege at all: applyOwnership must return before ever calling
-	// Lchown when OwnershipAvailable is false, which is provable purely
-	// from the returned (applied, skipped, err) tuple - no real file
-	// ownership needs to change for this assertion to be meaningful.
 	entry := FileEntry{UID: 0, GID: 0, OwnershipAvailable: false}
 
 	applied, skipped, err := applyOwnership("/does/not/need/to/exist", entry, true, true)
@@ -203,10 +181,8 @@ func TestApplyOwnership_AppliedWhenAvailable(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Chown to our own current uid/gid: even an unprivileged process can
-	// always do this (you can always "change" ownership to yourself),
-	// unlike chowning to an arbitrary other user, which needs root - so
-	// this exercises the real syscall without requiring elevation.
+	// Chown to our own uid/gid: unlike an arbitrary other user, this needs
+	// no elevated privilege, so it still exercises the real syscall.
 	entry := FileEntry{
 		UID:                uint32(os.Getuid()),
 		GID:                uint32(os.Getgid()),
@@ -225,10 +201,8 @@ func TestApplyOwnership_AppliedWhenAvailable(t *testing.T) {
 	}
 }
 
-// trySymlink creates a throwaway symlink to check whether this
-// environment supports it at all (matching the same check TestWalk_Symlink
-// in walk_test.go uses), skipping the calling test rather than failing it
-// when unsupported - e.g. Windows without Developer Mode or elevation.
+// trySymlink skips the calling test if this environment can't create
+// symlinks (e.g. Windows without Developer Mode or elevation).
 func trySymlink(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -245,7 +219,7 @@ func TestApplySymlink(t *testing.T) {
 	entry := FileEntry{
 		Path:       "link",
 		Mode:       os.ModeSymlink | 0o777,
-		LinkTarget: "some-target-file", // no path separator - see applySymlink's doc comment on why LinkTarget isn't slash-normalized
+		LinkTarget: "some-target-file",
 	}
 
 	if err := applySymlink(destPath, entry); err != nil {
@@ -386,9 +360,6 @@ func TestApplyAttributes_SymlinkSkipsPermsAndTimes(t *testing.T) {
 		LinkTarget: "some-target-file",
 	}
 
-	// Perms and Times are requested here, same as Links - proving they're
-	// deliberately skipped for a symlink entry rather than accidentally
-	// omitted from the test's opts.
 	result, err := ApplyAttributes(entry, destPath, AttrOptions{Perms: true, Times: true, Links: true})
 	if err != nil {
 		t.Fatalf("ApplyAttributes returned error: %v", err)

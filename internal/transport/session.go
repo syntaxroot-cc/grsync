@@ -10,9 +10,8 @@ import (
 )
 
 // Session wraps a running remote-shell subprocess (e.g. ssh), exposing
-// its stdin/stdout as a single Read/Write pair so the framed protocol
-// (frame.go) can be layered directly on top without the caller needing
-// to know this is a subprocess at all.
+// its stdin/stdout as a single Read/Write pair so the framed protocol can
+// be layered directly on top.
 type Session struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -20,26 +19,13 @@ type Session struct {
 	stderr *bytes.Buffer
 }
 
-// Dial spawns the remote-shell command built by BuildRSHCommand (ssh, or
-// whatever --rsh/-e overrides it to) and returns a Session wrapping its
-// stdin/stdout. The subprocess's stderr is both captured (so it can be
-// surfaced as part of a meaningful error from Close if the process exits
-// non-zero) and passed straight through to this process's own stderr
-// live, as it arrives - not just replayed after the fact. That passthrough
-// is what lets a remote --server process's own itemize/verbose output
-// (see internal/cli's runServer, which writes exactly there, never to
-// stdout - stdout here is the framed wire protocol itself) actually
-// reach the local user's terminal during a real-time transfer, the same
-// way real rsync's own remote messages do.
+// Dial spawns the remote-shell command built by BuildRSHCommand and
+// returns a Session wrapping its stdin/stdout. The subprocess's stderr is
+// captured (to enrich Close's error on a non-zero exit) and also passed
+// through live to this process's own stderr.
 //
-// Host-key verification is never touched here: this deliberately never
-// adds flags like "-o StrictHostKeyChecking=no" or a null
-// UserKnownHostsFile. Whatever the invoked command (ssh by default) does
-// by default - checking known_hosts, prompting or failing on an unknown
-// or changed host key - is exactly what happens, unmodified. There is no
-// stubbed-out or weakened host-key behavior to document here because none
-// of that logic is reimplemented at all; it's entirely the system ssh
-// client's own, unchanged behavior.
+// Host-key verification is left entirely to the invoked command (ssh by
+// default); no StrictHostKeyChecking or known_hosts flags are added here.
 func Dial(rsh, user, host string, remoteArgs []string, ipv4, ipv6 bool) (*Session, error) {
 	argv := BuildRSHCommand(rsh, user, host, remoteArgs, ipv4, ipv6)
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -50,14 +36,8 @@ func Dial(rsh, user, host string, remoteArgs []string, ipv4, ipv6 bool) (*Sessio
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		// StdinPipe already succeeded above, and Start is never reached
-		// on this path - so nothing will ever close that pipe's file
-		// descriptor automatically (that's normally Cmd.Wait's job, and
-		// Wait only does it once Start has actually run). Verified
-		// against golang/go#58369, which documents this exact gap: Start
-		// itself failing *does* clean up already-created pipes, but never
-		// reaching Start at all does not. Close stdin explicitly here
-		// rather than leak it.
+		// Start is never reached on this path, so stdin's pipe won't be
+		// closed automatically by cmd.Wait; close it explicitly.
 		_ = stdin.Close()
 		return nil, fmt.Errorf("creating stdout pipe: %w", err)
 	}
@@ -66,9 +46,7 @@ func Dial(rsh, user, host string, remoteArgs []string, ipv4, ipv6 bool) (*Sessio
 	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Start(); err != nil {
-		// Unlike the StdoutPipe case above, Start failing here *does*
-		// close both already-created pipes as part of its own documented
-		// cleanup (golang/go#58369) - nothing further to release.
+		// Start failing here already closes both pipes; nothing to clean up.
 		return nil, fmt.Errorf("starting %q: %w", argv[0], err)
 	}
 
@@ -82,18 +60,9 @@ func (s *Session) Read(p []byte) (int, error) { return s.stdout.Read(p) }
 func (s *Session) Write(p []byte) (int, error) { return s.stdin.Write(p) }
 
 // Close closes the subprocess's stdin (signaling EOF to the remote side)
-// and waits for it to exit.
-//
-// stdout is deliberately not closed here: cmd.Wait's own documentation
-// states it closes any pipe created via StdoutPipe automatically once the
-// command exits, and that closing it earlier is incorrect if reads from
-// it haven't all completed yet - so an explicit s.stdout.Close() here
-// would either be redundant or actively wrong, depending on timing.
-//
-// If the process exited with an error, that error is enriched with
-// whatever the subprocess wrote to stderr: a bare "exit status 255" is
-// nearly useless without the diagnostic message ssh itself printed
-// explaining why (unknown host, auth failure, connection refused, ...).
+// and waits for it to exit; stdout is left for cmd.Wait to close itself.
+// If the process exited with an error, stderr output is appended for a
+// more useful message than a bare exit code.
 func (s *Session) Close() error {
 	stdinErr := s.stdin.Close()
 	waitErr := s.cmd.Wait()

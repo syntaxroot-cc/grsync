@@ -8,16 +8,9 @@ import (
 	"time"
 )
 
-// countingReadWriter wraps rw, counting every byte read and written -
-// used to populate Stats.BytesSent/BytesReceived from the actual bytes
-// crossing this connection (frame headers included, not just gob
-// payloads), the same quantity real rsync's own "Total bytes sent"/
-// "Total bytes received" measure, just over grsync's own gob wire
-// protocol instead of rsync's real one (see messages.go's encoding
-// note). Wrapping the connection itself, rather than threading a length
-// return value through every send/recv helper in messages.go, means
-// Sender and its own tests need no changes at all for this - only
-// Receiver ever needs to know these counts.
+// countingReadWriter wraps rw, counting every byte read and written, to
+// populate Stats.BytesSent/BytesReceived from what actually crosses this
+// connection (frame headers included, not just gob payloads).
 type countingReadWriter struct {
 	rw      io.ReadWriter
 	read    int64
@@ -38,13 +31,8 @@ func (c *countingReadWriter) Write(p []byte) (int, error) {
 
 // Stats accumulates statistics over one Receiver call, mirroring real
 // rsync's own --stats fields where grsync can compute them accurately.
-// Fields real rsync reports that grsync deliberately omits - Number of
-// deleted files (no --delete), File list size/generation-time/transfer-
-// time (not measured anywhere in this architecture), and ACL/xattr/
-// device/special counts (not tracked, the same scope boundary SC-11's
-// itemize format already established) - are left out entirely rather
-// than reported as a misleading zero; see the README's Progress and
-// Stats section for the full list.
+// Fields grsync can't measure (deleted files, ACL/xattr/device counts,
+// etc.) are omitted entirely rather than reported as a misleading zero.
 type Stats struct {
 	RegularFiles int
 	Directories  int
@@ -55,22 +43,17 @@ type Stats struct {
 	CreatedSymlinks     int
 
 	// RegularFilesTransferred is how many regular files actually had
-	// different content and were rewritten - the same contentChanged
-	// bit itemizeFile already computes for its Y code, reused here
-	// rather than recomputed.
+	// different content and were rewritten.
 	RegularFilesTransferred int
 
 	// TotalFileSize is the sum of Size across every regular-file entry
-	// considered (matching real rsync's own "does not count directories
-	// or special files, but does include symlinks" - except grsync
-	// scopes this to regular files only, since symlink "size" isn't a
-	// meaningful transferred-bytes quantity in this pipeline).
+	// considered; unlike real rsync, this excludes symlinks, since
+	// symlink "size" isn't a meaningful transferred-bytes quantity here.
 	TotalFileSize            int64
 	TotalTransferredFileSize int64
 
-	// LiteralData and MatchedData are computed by inspecting the
-	// DataOp/CopyOp list each regular file's delta already produces -
-	// no new information needs to cross the wire for this.
+	// LiteralData and MatchedData come from each regular file's delta
+	// DataOp/CopyOp list.
 	LiteralData int64
 	MatchedData int64
 
@@ -90,13 +73,8 @@ func (s Stats) NumCreatedFiles() int {
 	return s.CreatedRegularFiles + s.CreatedDirectories + s.CreatedSymlinks
 }
 
-// SpeedupRatio is real rsync's own formula, verified against its actual
-// source (main.c's output_summary, not just the man page's looser
-// prose): total file size divided by the sum of bytes sent and
-// received. Real rsync's own comment calls this "really just a
-// feel-good bigger-is-better number," not a rigorous metric -
-// reproduced here exactly as-is, caveat included, rather than a
-// differently-reasoned formula that happens to also produce a ratio.
+// SpeedupRatio is real rsync's own formula: total file size divided by
+// the sum of bytes sent and received.
 func (s Stats) SpeedupRatio() float64 {
 	total := s.BytesSent + s.BytesReceived
 	if total == 0 {
@@ -106,10 +84,7 @@ func (s Stats) SpeedupRatio() float64 {
 }
 
 // BytesPerSecond is total bytes transferred divided by elapsed wall-clock
-// time, matching real rsync's own bytes_per_sec_human_dnum(). Zero
-// elapsed time (a sync fast enough that no measurable time passed, or a
-// synthetic test driving Receiver directly without going through the
-// real clock) reports 0 rather than dividing by zero.
+// time. Zero elapsed time reports 0 rather than dividing by zero.
 func (s Stats) BytesPerSecond() float64 {
 	if s.Elapsed <= 0 {
 		return 0
@@ -118,10 +93,8 @@ func (s Stats) BytesPerSecond() float64 {
 }
 
 // commaInt formats n with comma thousands separators, matching real
-// rsync's own comma_num()/human_num() output for --stats byte counts.
-// (--progress's own live line, in contrast, shows raw ungrouped digits -
-// see formatProgressLine - matching the different function real rsync
-// itself uses there.)
+// rsync's --stats byte counts (--progress's live line shows raw ungrouped
+// digits instead - see formatProgressLine).
 func commaInt(n int64) string {
 	s := strconv.FormatInt(n, 10)
 	neg := strings.HasPrefix(s, "-")
@@ -142,8 +115,7 @@ func commaInt(n int64) string {
 }
 
 // commaFloat2 formats f with comma thousands separators and exactly 2
-// decimal places, matching real rsync's own comma_dnum(f, 2) - used for
-// the speedup ratio and the bytes/sec rate in --stats output.
+// decimal places, matching real rsync's comma_dnum(f, 2).
 func commaFloat2(f float64) string {
 	neg := f < 0
 	if neg {
@@ -162,11 +134,8 @@ func commaFloat2(f float64) string {
 	return fmt.Sprintf("%s%s.%02d", sign, commaInt(whole), frac)
 }
 
-// typeBreakdown is real rsync's own "(reg: R, dir: D, link: L)" suffix,
-// omitting any type whose count is zero entirely - matching the man
-// page's own documented rule ("If any value is 0, it is completely
-// omitted from the list"), which also naturally hides grsync's lack of
-// device/special support rather than needing a separate carve-out for it.
+// typeBreakdown is real rsync's "(reg: R, dir: D, link: L)" suffix,
+// omitting any type whose count is zero.
 func typeBreakdown(reg, dir, link int) string {
 	var parts []string
 	if reg > 0 {
@@ -184,13 +153,10 @@ func typeBreakdown(reg, dir, link int) string {
 	return " (" + strings.Join(parts, ", ") + ")"
 }
 
-// formatStats renders s in real rsync's own --stats structure (verified
-// against main.c's output_summary): a detailed field-by-field block,
-// then the shorter sent/received/rate and total-size/speedup summary
-// every --stats run ends with regardless of verbosity. dryRun appends
-// real rsync's own "(DRY RUN)" suffix to the speedup line when set,
-// reusing a real, already-verified rsync convention rather than
-// inventing a different way to flag the same thing.
+// formatStats renders s in real rsync's --stats structure: a detailed
+// field-by-field block, then the sent/received/rate and
+// total-size/speedup summary. dryRun appends real rsync's own
+// "(DRY RUN)" suffix to the speedup line.
 func formatStats(s Stats, dryRun bool) string {
 	var b strings.Builder
 

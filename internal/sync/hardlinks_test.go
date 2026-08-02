@@ -35,9 +35,6 @@ func TestDetectHardLinks(t *testing.T) {
 	}
 
 	if runtime.GOOS == "windows" {
-		// lookupHardLinkKey always reports unavailable on Windows (see
-		// hardlinks_windows.go) - even though a real hard link was just
-		// created above, detection can't observe it, by design.
 		if len(groups) != 0 {
 			t.Errorf("got %d groups on Windows, want 0 (hard-link identity is unavailable there)", len(groups))
 		}
@@ -87,9 +84,6 @@ func TestApplyHardLinks(t *testing.T) {
 		t.Skipf("hard link creation unsupported in this environment: %v", err)
 	}
 
-	// Prove they're genuinely the same underlying file, not just two
-	// copies with equal content: writing through one path must be visible
-	// through the other.
 	linkedPath := filepath.Join(destRoot, "linked.txt")
 	if err := os.WriteFile(linkedPath, []byte("changed via the linked path"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)

@@ -12,23 +12,6 @@ import (
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 )
 
-// TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial
-// is SC-12's own core "interrupted transfer" proof, matching the
-// existing TestReceiver_ConnectionDropsMidTransfer/
-// TestReceiver_AppliesHardLinksFromReceivedGroups pattern of driving
-// Receiver against a hand-built peer goroutine for exact control over
-// when the connection dies. It drives home Step 3's own architectural
-// finding: grsync's "partial" is file-granularity, not true mid-file
-// resumption, so completed files survive a drop *regardless* of
-// --partial, and the in-flight file at the moment of the drop is simply
-// never attempted at all (absent, not corrupted, not partially written) -
-// because its signature/delta exchange never got far enough to produce
-// any bytes to write in the first place. This test runs the identical
-// scenario with and without ReceiverOptions.Partial to prove that flag
-// genuinely makes no difference to this particular failure mode - the
-// flag's real, distinguishing effect (see partial_test.go's own
-// abandonOrKeep tests) only matters for a failure *during* the local
-// write phase, not a dropped connection between files.
 func TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial(t *testing.T) {
 	for _, ropts := range []ReceiverOptions{{}, {Partial: true}, {PartialDir: ".rsync-partial"}} {
 		t.Run(fmt.Sprintf("%+v", ropts), func(t *testing.T) {
@@ -68,11 +51,8 @@ func TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial
 					}
 				}
 
-				// Receive the signature request for c.txt (proving Receiver
-				// got that far), then vanish without ever responding -
-				// simulating a connection that drops mid-transfer, the same
-				// way TestReceiver_ConnectionDropsMidTransfer does for a
-				// single file.
+				// Receive the signature request for c.txt, then vanish
+				// without ever responding.
 				if _, err := recvSignature(peerReadsFromReceiver); err != nil {
 					peerErrCh <- fmt.Errorf("receiving signature for c.txt: %w", err)
 					return
@@ -98,10 +78,8 @@ func TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial
 				}
 			}
 
-			// c.txt's transfer never got far enough to produce any bytes to
-			// write at all - it must be completely absent, not a
-			// zero-length or truncated file, and not present in a partial
-			// location either, regardless of ropts.
+			// c.txt must be completely absent, not zero-length or truncated,
+			// regardless of ropts.
 			if _, statErr := os.Stat(filepath.Join(destRoot, "c.txt")); !os.IsNotExist(statErr) {
 				t.Errorf("c.txt exists after the connection dropped before its own transfer began, want it completely absent")
 			}
@@ -126,25 +104,14 @@ func TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial
 	}
 }
 
-// TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry is "the pipeline
-// can be told to resume," made concrete and measured, not just asserted:
-// a leftover partial-dir file representing a genuine (correct) prefix of
-// the real source content is picked up as the delta comparison basis on
-// the next run - sync.GenerateDelta naturally turns that into CopyOps for
-// the matching prefix and DataOps only for the new tail (see
-// loadPartialBasis's own doc comment) - producing a real, measurable
-// reduction in wire bytes compared to a from-scratch run with no
-// resume basis available, and leaving the destination byte-for-byte
-// correct either way. The partial-dir file is also removed once it's
-// served its purpose, matching real rsync's own documented behavior.
 func TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry(t *testing.T) {
 	fullContent := strings.Repeat("resumable content chunk, well over one block size ", 60)
 	partialDir := ".rsync-partial"
 
 	resumedSrc, resumedDest := t.TempDir(), t.TempDir()
 	mustWriteFile(t, filepath.Join(resumedSrc, "big.txt"), fullContent)
-	// A genuine prefix of the real content, as if an earlier run had
-	// gotten this far before being interrupted.
+	// A genuine prefix, as if an earlier run had gotten this far before
+	// being interrupted.
 	prefix := fullContent[:len(fullContent)*3/4]
 	partialPath := filepath.Join(resumedDest, partialDir, "big.txt")
 	mustMkdirAll(t, filepath.Dir(partialPath))
@@ -159,8 +126,7 @@ func TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry(t *testing.T) {
 		t.Errorf("partial-dir file %q still exists after a successful resumed transfer, want it removed", partialPath)
 	}
 
-	// Baseline: the identical transfer with no partial-dir file to resume
-	// from at all (a completely fresh destination).
+	// Baseline: a completely fresh destination, no resume basis.
 	freshSrc, freshDest := t.TempDir(), t.TempDir()
 	mustWriteFile(t, filepath.Join(freshSrc, "big.txt"), fullContent)
 	freshBytes := runSenderReceiverWithCompressOptions(t, freshSrc, freshDest,
@@ -171,13 +137,6 @@ func TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry(t *testing.T) {
 	}
 }
 
-// TestReceiver_PartialDirBasisIgnoresRealDestinationContent confirms
-// loadPartialBasis genuinely takes priority over the real destination
-// file when both exist: the real destination here is deliberately wrong
-// (would produce an incorrect comparison basis on its own), while the
-// partial-dir file holds the correct prefix - the final result must
-// still be correct, proving the partial-dir file is what actually got
-// used, not silently ignored in favor of the real (wrong) destination.
 func TestReceiver_PartialDirBasisIgnoresRealDestinationContent(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 	fullContent := strings.Repeat("A", 1400) + "the new tail"
@@ -197,16 +156,6 @@ func TestReceiver_PartialDirBasisIgnoresRealDestinationContent(t *testing.T) {
 	assertSameContent(t, filepath.Join(srcRoot, "file.txt"), filepath.Join(destRoot, "file.txt"))
 }
 
-// TestReceiver_PartialDirCreatesNoFilesAndDeletesNothingDuringDryRun is
-// this ticket's own explicit dependency requirement (SC-11 interaction):
-// with --dry-run set, --partial-dir must neither write a temp file, nor
-// commit anything to destPath, nor delete the leftover partial-dir file
-// it would otherwise have consumed and cleaned up on a real run -
-// loadPartialBasis is read-only by construction (see its own doc
-// comment), and the temp-file/rename/cleanup code all lives inside
-// receiveRegularFile's `if !ctx.ropts.DryRun` guard, so a dry run should
-// never reach any of it; this test is the proof, not just the
-// structural argument.
 func TestReceiver_PartialDirCreatesNoFilesAndDeletesNothingDuringDryRun(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 	fullContent := strings.Repeat("resumable content ", 100)

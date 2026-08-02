@@ -94,11 +94,6 @@ func TestCompressDecompressLiteral_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestCompressLiteral_FallsBackWhenNotSmaller is the self-review's tiny-
-// payload concern made concrete: a handful of bytes can never come out
-// smaller after zlib's own ~8-byte header/trailer overhead, so
-// compressLiteral must report ok == false rather than silently returning
-// something larger than the input.
 func TestCompressLiteral_FallsBackWhenNotSmaller(t *testing.T) {
 	tiny := []byte{1, 2, 3}
 	if _, ok := compressLiteral(tiny, DefaultCompressLevel); ok {

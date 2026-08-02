@@ -83,12 +83,9 @@ func TestDialClient_UploadOverRealTCP(t *testing.T) {
 	}
 }
 
-// TestDialClient_PasswordFuncNotCalledForAnonymousModule is the laziness
-// guarantee made concrete: PasswordFunc must never be invoked when the
-// server never challenges for a password, exactly matching real rsync's
-// own auth_client(), which is only ever called in response to an
-// AUTHREQD line. A PasswordFunc backed by an interactive terminal prompt
-// or a --password-file read must not fire against an anonymous module.
+// TestDialClient_PasswordFuncNotCalledForAnonymousModule confirms
+// PasswordFunc is never invoked when the server doesn't challenge for a
+// password (an anonymous module).
 func TestDialClient_PasswordFuncNotCalledForAnonymousModule(t *testing.T) {
 	modRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(modRoot, "open.txt"), "no auth needed")

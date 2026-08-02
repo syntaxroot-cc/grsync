@@ -8,11 +8,9 @@ import (
 	"strings"
 )
 
-// RuleKind identifies which flag produced a raw filter rule, before any
-// pattern parsing or file expansion happens. It mirrors the shape of
-// internal/cli's FilterRule (Type + Pattern) but is defined independently:
-// internal/sync must never import internal/cli, since cli is expected to
-// depend on sync (not the other way around) once they're wired together.
+// RuleKind identifies which flag produced a raw filter rule, before pattern
+// parsing or file expansion happens. Defined independently from internal/cli's
+// FilterRule since internal/sync must never import internal/cli.
 type RuleKind string
 
 const (
@@ -20,15 +18,10 @@ const (
 	RuleInclude RuleKind = "include"
 	// RuleExclude is a direct --exclude pattern.
 	RuleExclude RuleKind = "exclude"
-	// RuleFilter is a raw --filter rule line, e.g. "+ *.txt", "- .git/",
-	// or "merge FILE" - see parseFilterLine for the subset of rsync's
-	// filter-rule syntax this supports.
+	// RuleFilter is a raw --filter rule line, e.g. "+ *.txt", "- .git/", or "merge FILE".
 	RuleFilter RuleKind = "filter"
-	// RuleExcludeFrom has a Pattern that is a file path, not a filter
-	// pattern itself. CompileRules reads that file and inserts one
-	// exclude rule per line at this exact position in the list,
-	// preserving overall command-line order rather than appending
-	// everything to the end.
+	// RuleExcludeFrom is a --exclude-from file path; CompileRules expands
+	// it in place at that position, preserving command-line order.
 	RuleExcludeFrom RuleKind = "exclude-from"
 	// RuleIncludeFrom is RuleExcludeFrom's --include-from counterpart.
 	RuleIncludeFrom RuleKind = "include-from"
@@ -51,21 +44,17 @@ const (
 	Exclude
 )
 
-// Rule is a single compiled, ready-to-match filter rule. Pattern has
-// already had its leading "/" (Anchored) marker stripped by CompileRules;
-// it never contains that marker itself.
+// Rule is a single compiled, ready-to-match filter rule. Pattern has already
+// had its leading "/" and trailing "/" markers stripped by CompileRules.
 //
-// Anchored matches real rsync's actual rule: a pattern anchors to the
-// transfer root if it has a leading "/", contains any other "/", or
-// contains "**" - only a pattern with none of those (a bare filename, e.g.
-// "*.log") matches at any depth, against the final path component only.
+// A pattern anchors to the transfer root if it has a leading "/", contains
+// any other "/", or contains "**"; only a bare filename like "*.log" matches
+// at any depth, against the final path component only (matching rsync).
 type Rule struct {
 	Action   Action
 	Pattern  string
 	Anchored bool
-	// DirOnly means this rule only ever matches directories - set from a
-	// trailing "/" on the original pattern, stripped by CompileRules just
-	// like the anchor marker.
+	// DirOnly means the rule only matches directories (from a trailing "/" on the original pattern).
 	DirOnly bool
 }
 
@@ -82,8 +71,7 @@ func (r Rule) matches(entryPath string, isDir bool) bool {
 		return matchSegments(patternSegs, pathSegs)
 	}
 
-	// Unanchored: the pattern may match starting at any depth, as if
-	// "**/" were implicitly prepended to it.
+	// Unanchored: try matching starting at any depth, as if "**/" were prepended.
 	for start := 0; start <= len(pathSegs); start++ {
 		if matchSegments(patternSegs, pathSegs[start:]) {
 			return true
@@ -92,13 +80,9 @@ func (r Rule) matches(entryPath string, isDir bool) bool {
 	return false
 }
 
-// matchSegments matches a "/"-split pattern against a "/"-split path,
-// segment by segment. Every segment except "**" is matched with
-// path.Match, which already gives us "*" (any run of characters within the
-// segment) and "?" (exactly one character) for free, without needing a
-// hand-rolled matcher of our own. "**" is handled explicitly: it may
-// consume zero or more path segments, so both possibilities (consume none
-// and keep matching, or consume one and recurse) are tried.
+// matchSegments matches a "/"-split pattern against a "/"-split path.
+// Every segment except "**" is matched with path.Match. "**" may consume
+// zero or more path segments, so both possibilities are tried.
 func matchSegments(patternSegs, pathSegs []string) bool {
 	if len(patternSegs) == 0 {
 		return len(pathSegs) == 0
@@ -124,18 +108,14 @@ func matchSegments(patternSegs, pathSegs []string) bool {
 	return matchSegments(patternSegs[1:], pathSegs[1:])
 }
 
-// compilePattern parses a single raw pattern's anchor ("/" prefix) and
-// dir-only ("/" suffix) markers into a ready-to-match Rule with the given
-// action. Shared by direct --include/--exclude rules, each line read from
-// an --exclude-from/--include-from file, and --filter rule lines.
+// compilePattern parses a pattern's anchor ("/" prefix) and dir-only ("/"
+// suffix) markers into a ready-to-match Rule. Shared by direct
+// --include/--exclude rules, --exclude-from/--include-from file lines, and
+// --filter rule lines.
 //
-// A pattern containing any empty "/"-separated segment - a bare "/" or ""
-// overall, or an internal "//" typo like "a//b" - is rejected rather than
-// silently compiled: no real FileEntry.Path segment is ever empty (Walk()
-// never produces one), so a Rule requiring an empty segment could never
-// match anything. Compiling it anyway would leave the user with a filter
-// rule that silently does nothing forever, which is worse than a clear
-// error at compile time.
+// A pattern with an empty "/"-segment (bare "/", "", or an "a//b" typo) is
+// rejected rather than compiled: it could never match a real FileEntry.Path,
+// so it would silently become a no-op rule instead of a clear error.
 func compilePattern(action Action, pattern string) (Rule, error) {
 	leadingSlash := strings.HasPrefix(pattern, "/")
 	if leadingSlash {
@@ -151,19 +131,15 @@ func compilePattern(action Action, pattern string) (Rule, error) {
 		}
 	}
 
-	// A leading "/" always anchors. So does any *other* "/" still present
-	// in the pattern, or a "**" anywhere in it - matching real rsync's
-	// rule, not just the "leading slash only" simplification this started
-	// as. Only a genuinely slash-free, "**"-free pattern (a bare filename)
-	// matches at any depth.
+	// Anchors on leading "/", any other "/", or "**" anywhere - matching rsync's rule.
 	anchored := leadingSlash || strings.Contains(pattern, "/") || strings.Contains(pattern, "**")
 
 	return Rule{Action: action, Pattern: pattern, Anchored: anchored, DirOnly: dirOnly}, nil
 }
 
 // readPatternFile reads one pattern per line from path, for
-// --exclude-from/--include-from. Blank lines and lines starting with "#"
-// or ";" are skipped, matching rsync's own filter-file comment convention.
+// --exclude-from/--include-from. Blank lines and lines starting with "#" or
+// ";" are skipped, matching rsync's filter-file comment convention.
 func readPatternFile(path string) (patterns []string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -190,21 +166,17 @@ func readPatternFile(path string) (patterns []string, err error) {
 }
 
 // parsedFilterLine is the result of parsing one line of --filter RULE
-// syntax - whether it came directly from a --filter flag or from a line
-// inside a merge file.
+// syntax, whether from a --filter flag or a line inside a merge file.
 type parsedFilterLine struct {
 	isMerge   bool
 	mergeFile string
 	rule      Rule // valid only when !isMerge
 }
 
-// parseFilterLine implements a deliberately small subset of rsync's
-// --filter rule syntax: "+ PATTERN" / "- PATTERN" (and their word-form
-// equivalents "include PATTERN" / "exclude PATTERN"), plus "merge FILE".
-// Real rsync's filter language is much larger (modifiers like "-C",
-// "dir-merge" with per-directory semantics, "!", exclude-if-present rules,
-// and more) - none of that is implemented here; anything outside this
-// subset is a hard parse error rather than a silent no-op.
+// parseFilterLine implements a subset of rsync's --filter syntax:
+// "+ PATTERN" / "- PATTERN" (and "include"/"exclude" word forms), plus
+// "merge FILE". Anything outside this subset is a hard parse error, not a
+// silent no-op.
 func parseFilterLine(line string) (parsedFilterLine, error) {
 	switch {
 	case strings.HasPrefix(line, "+ "):
@@ -228,14 +200,9 @@ func parseFilterLine(line string) (parsedFilterLine, error) {
 	}
 }
 
-// expandMergeFile reads path and parses each non-comment, non-blank line
-// with parseFilterLine - the same syntax --filter itself accepts. Nested
-// merge (a merge file whose own lines include another "merge OTHER"
-// directive) is deliberately unsupported: rather than silently recursing
-// (risking an infinite loop on a self-referential merge file) or silently
-// dropping the nested directive, it's a hard error. This covers the
-// "basic merge case"; full nested/dir-merge support is a larger feature
-// left for later if it turns out to be needed.
+// expandMergeFile reads path and parses each line with parseFilterLine.
+// Nested merge directives are a hard error rather than silently recursing
+// (risking a loop on a self-referential file) or silently dropping them.
 func expandMergeFile(path string) ([]Rule, error) {
 	lines, err := readPatternFile(path)
 	if err != nil {
@@ -256,13 +223,9 @@ func expandMergeFile(path string) ([]Rule, error) {
 	return rules, nil
 }
 
-// CompileRules converts raw rules - --include/--exclude patterns,
-// --filter rule lines (including "merge FILE"), and --exclude-from/
-// --include-from file references - into a single ordered, ready-to-match
-// Rule list. From-file and merged rules are expanded in place at the
-// position their flag occurred, so e.g. a --exclude-from sandwiched
-// between two direct --exclude flags on the command line stays sandwiched
-// between their compiled Rules, not appended after them.
+// CompileRules converts raw rules into a single ordered, ready-to-match Rule
+// list. From-file and merged rules are expanded in place at the position
+// their flag occurred, preserving command-line order.
 func CompileRules(raw []RawRule) ([]Rule, error) {
 	var rules []Rule
 	for _, r := range raw {
@@ -316,16 +279,8 @@ func CompileRules(raw []RawRule) ([]Rule, error) {
 	return rules, nil
 }
 
-// Included evaluates rules against a single FileEntry using rsync's
-// first-match-wins semantics: rules are tried in order, and the action of
-// the first one that matches decides the outcome. If no rule matches, the
-// entry is included by default - matching rsync's own default behavior of
-// transferring anything not explicitly excluded.
-//
-// entry.Path is never empty and never represents the transfer root itself:
-// Walk() (internal/sync/walk.go) deliberately excludes the root from its
-// own output, so there's no "path exactly equal to the root" case for this
-// function to special-case.
+// Included evaluates rules against entry using rsync's first-match-wins
+// semantics; if no rule matches, the entry is included by default.
 func Included(rules []Rule, entry FileEntry) bool {
 	for _, r := range rules {
 		if r.matches(entry.Path, entry.IsDir) {
@@ -335,11 +290,7 @@ func Included(rules []Rule, entry FileEntry) bool {
 	return true
 }
 
-// FilterEntries returns the subset of entries that rules includes, in
-// their original order. It is a post-pass over an already-collected
-// Walk() result rather than a predicate threaded into Walk() itself - see
-// the design note on this tradeoff where FilterEntries is introduced in
-// the accompanying documentation/commit.
+// FilterEntries returns the subset of entries that rules includes, preserving order.
 func FilterEntries(entries []FileEntry, rules []Rule) []FileEntry {
 	kept := make([]FileEntry, 0, len(entries))
 	for _, e := range entries {

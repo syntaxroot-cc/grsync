@@ -44,9 +44,6 @@ func TestCreateTempFile_DefaultModeMatchesOsWriteFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	// os.CreateTemp's own default is 0600; createTempFile must override
-	// that to 0644 so a sync run without --perms doesn't quietly start
-	// producing more restrictive files than os.WriteFile always has.
 	if info.Mode().Perm() != 0o644 {
 		t.Errorf("temp file mode = %v, want 0644 (matching os.WriteFile's own default for a no---perms sync)", info.Mode().Perm())
 	}
@@ -74,11 +71,6 @@ func TestPartialFilePath_AbsoluteDirMirrorsRelativePath(t *testing.T) {
 	}
 }
 
-// TestPartialFilePath_AbsoluteDirAvoidsBasenameCollisions is the actual
-// reason the absolute case mirrors the full relative path instead of
-// just the basename: two different source files sharing a basename in
-// different subdirectories must not collide under one shared
-// partial-dir.
 func TestPartialFilePath_AbsoluteDirAvoidsBasenameCollisions(t *testing.T) {
 	absDir := string(filepath.Separator) + "partial-store"
 	if runtime.GOOS == "windows" {
@@ -163,11 +155,6 @@ func TestFinishRegularFileWrite_SuccessRenamesIntoPlace(t *testing.T) {
 	}
 }
 
-// TestFinishRegularFileWrite_SuccessCleansUpUsedPartialBasis is real
-// rsync's own documented "delete it after it has served its purpose"
-// behavior: once a partial-dir file's content has been successfully
-// folded into a completed transfer, it should be removed so it doesn't
-// linger as stale, misleading resume data for a future run.
 func TestFinishRegularFileWrite_SuccessCleansUpUsedPartialBasis(t *testing.T) {
 	dir := t.TempDir()
 	destPath := filepath.Join(dir, "file.txt")
@@ -248,12 +235,6 @@ func TestAbandonOrKeep_PartialDirMovesContentThereInsteadOfDestPath(t *testing.T
 	}
 }
 
-// TestAbandonOrKeep_PartialDirNeverOverwritesExistingDestContent is the
-// self-review's own "could a partial file leak outside --partial-dir"
-// question, answered concretely: an aborted transfer with --partial-dir
-// set must never modify whatever was already sitting at the real
-// destination path, even though a plain --partial (no dir) would
-// deliberately overwrite it with the partial content.
 func TestAbandonOrKeep_PartialDirNeverOverwritesExistingDestContent(t *testing.T) {
 	dir := t.TempDir()
 	destPath := filepath.Join(dir, "file.txt")
@@ -274,12 +255,6 @@ func TestAbandonOrKeep_PartialDirNeverOverwritesExistingDestContent(t *testing.T
 	}
 }
 
-// TestAbandonOrKeep_NeverLeavesATempFileNextToDestPath is the same
-// self-review question from the opposite angle: regardless of which
-// policy applies, the raw ".file.txt.*.grsync-tmp" temp file must never
-// be the thing left behind in the destination's own directory - it's
-// always either deleted or moved to one of the two real, documented
-// destinations (destPath itself, or inside PartialDir).
 func TestAbandonOrKeep_NeverLeavesATempFileNextToDestPath(t *testing.T) {
 	for _, ropts := range []ReceiverOptions{
 		{},

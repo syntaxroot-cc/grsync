@@ -18,13 +18,8 @@ func TestStrongChecksum(t *testing.T) {
 	}
 }
 
-// TestWeakChecksum_RollMatchesFromScratch is the load-bearing test for the
-// entire rolling-checksum design: it proves roll() produces exactly the
-// same result as recomputing from scratch, at every single offset across
-// a test string, not just a couple of spot checks. If this property ever
-// broke, the delta algorithm would silently miss real block matches (or
-// worse, produce false ones that only got caught by the strong checksum,
-// masking the bug) - so this needs direct proof, not just "it compiles".
+// TestWeakChecksum_RollMatchesFromScratch checks that roll() matches
+// recomputing from scratch at every offset across a test string.
 func TestWeakChecksum_RollMatchesFromScratch(t *testing.T) {
 	data := []byte("the quick brown fox jumps over the lazy dog, then jumps back again")
 	const windowSize = 8

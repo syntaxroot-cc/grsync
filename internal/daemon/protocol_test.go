@@ -18,9 +18,7 @@ func TestReadLine_RejectsOverLongLineInsteadOfUnboundedGrowth(t *testing.T) {
 	}
 }
 
-// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter -
-// the same small helper internal/transport and internal/pipeline each
-// define for their own tests.
+// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter.
 type pipeReadWriter struct {
 	io.Reader
 	io.Writer
@@ -74,11 +72,9 @@ func TestGreeting_UnknownModuleErrors(t *testing.T) {
 	if _, err := DialGreeting(client, "does-not-exist"); err != nil {
 		t.Fatalf("DialGreeting returned error: %v", err)
 	}
-	// DialGreeting itself doesn't interpret the server's post-selection
-	// response (that's the auth phase's job, in a later step) - so the
-	// test reads it directly here, both to confirm the server actually
-	// sent an @ERROR line and to drain the pipe so ServeGreeting's write
-	// doesn't block forever waiting for a reader that will never come.
+	// DialGreeting doesn't interpret the server's post-selection response,
+	// so read it directly here to confirm the @ERROR line and drain the
+	// pipe so ServeGreeting's write doesn't block.
 	response, err := readLine(client.r)
 	if err != nil {
 		t.Fatalf("reading server response: %v", err)
@@ -127,10 +123,8 @@ func TestGreeting_ModuleListingHidesListFalseModules(t *testing.T) {
 }
 
 func TestGreeting_HiddenModuleStillReachableByName(t *testing.T) {
-	// "list = false" hides a module from listing, but real rsyncd.conf
-	// does not make it unreachable to a client who already knows its
-	// name - confirming that distinction is implemented correctly, not
-	// just "list = false" accidentally behaving like a full block.
+	// "list = false" hides a module from listing but doesn't block access
+	// to a client who already knows its name.
 	clientR, serverW := io.Pipe()
 	serverR, clientW := io.Pipe()
 	client := newConn(pipeReadWriter{Reader: clientR, Writer: clientW})

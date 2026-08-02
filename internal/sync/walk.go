@@ -1,6 +1,5 @@
-// Package sync builds the file list ("flist") that grsync compares between
-// source and destination before any data transfer happens - the same
-// planning phase upstream rsync performs before its delta algorithm runs.
+// Package sync builds the file list that grsync compares between source and
+// destination before any data transfer happens.
 package sync
 
 import (
@@ -12,11 +11,8 @@ import (
 )
 
 // FileEntry describes a single file, directory, or symlink discovered under
-// a source root. Path is always relative to that root, using "/" as the
-// separator regardless of host OS - rsync's wire protocol and file lists
-// are always "/"-separated, and grsync targets protocol-level
-// interoperability, so paths are normalized at collection time rather than
-// left OS-native and converted later.
+// a source root. Path is always relative to that root and "/"-separated
+// regardless of host OS, matching rsync's wire protocol.
 type FileEntry struct {
 	Path    string
 	Size    int64
@@ -24,10 +20,9 @@ type FileEntry struct {
 	Mode    fs.FileMode
 	UID     uint32
 	GID     uint32
-	// OwnershipAvailable reports whether UID/GID were actually populated.
-	// A real uid/gid of 0 (root) is a valid value, so callers must check
-	// this rather than treating a zero UID/GID as "unavailable" - see
-	// uidgid_windows.go, where it is always false.
+	// OwnershipAvailable reports whether UID/GID were actually populated: a
+	// real uid/gid of 0 (root) is valid, so a zero value alone doesn't mean
+	// "unavailable" (see uidgid_windows.go, where this is always false).
 	OwnershipAvailable bool
 	LinkTarget         string
 	IsDir              bool
@@ -36,24 +31,19 @@ type FileEntry struct {
 // WalkOptions controls how far Walk descends, mirroring rsync's own
 // -r/--recursive and -d/--dirs flags:
 //
-//   - Recursive=false, Dirs=false (rsync's default with neither flag):
-//     directories are skipped entirely - not listed, not descended into.
-//     Only regular files/symlinks directly under root are collected.
-//   - Recursive=false, Dirs=true (-d): directories are listed (so they can
-//     be created on the receiving end) but their contents are not - Walk
-//     does not descend into them.
-//   - Recursive=true (-r): full recursion into every subdirectory,
-//     regardless of Dirs - this matches rsync, where -r makes -d redundant.
+//   - Recursive=false, Dirs=false: directories are skipped entirely (rsync's
+//     default with neither flag).
+//   - Recursive=false, Dirs=true (-d): directories are listed but not
+//     descended into.
+//   - Recursive=true (-r): full recursion regardless of Dirs, since -r makes
+//     -d redundant.
 type WalkOptions struct {
 	Recursive bool
 	Dirs      bool
 }
 
 // buildFileEntry constructs a FileEntry for path from its already-Lstat'd
-// info, leaving Path unset - Walk fills it in as a root-relative,
-// "/"-separated string; LstatEntry (below) leaves it empty, since a
-// caller comparing a single existing destination path against a received
-// FileEntry has no use for a second, redundant Path value.
+// info, leaving Path unset for the caller to fill in.
 func buildFileEntry(path string, info fs.FileInfo) (FileEntry, error) {
 	entry := FileEntry{
 		Size:    info.Size(),
@@ -62,17 +52,10 @@ func buildFileEntry(path string, info fs.FileInfo) (FileEntry, error) {
 		IsDir:   info.IsDir(),
 	}
 
-	// lookupUIDGID is platform-specific (see uidgid_unix.go /
-	// uidgid_windows.go): on Windows it always reports unavailable,
-	// leaving UID/GID at their zero value. OwnershipAvailable carries
-	// that ok flag through so callers can't mistake the zero value for
-	// a real uid/gid of 0 (root) - see uidgid_windows.go for why.
 	entry.UID, entry.GID, entry.OwnershipAvailable = lookupUIDGID(info)
 
-	// info.Mode()&fs.ModeSymlink is only ever set by Lstat (Stat
-	// resolves through it), which is exactly why every caller of this
-	// function Lstats rather than Stats: this branch would never be
-	// reachable otherwise.
+	// info.Mode()&fs.ModeSymlink is only ever set by Lstat, not Stat - every
+	// caller of this function must Lstat, or this branch is unreachable.
 	if info.Mode()&fs.ModeSymlink != 0 {
 		target, err := os.Readlink(path)
 		if err != nil {
@@ -84,17 +67,10 @@ func buildFileEntry(path string, info fs.FileInfo) (FileEntry, error) {
 	return entry, nil
 }
 
-// LstatEntry builds a FileEntry for a single existing path the same way
-// Walk builds one for each path it visits (same fields, same Lstat-not-Stat
-// symlink handling), without needing a whole tree walk - for a caller that
-// already knows the one path it cares about, e.g. comparing a sync's
-// incoming FileEntry against whatever currently exists at the destination.
-// Path is left empty; the caller already knows what path it asked about.
-//
-// The returned error satisfies os.IsNotExist(err) when path doesn't exist,
-// exactly like a direct os.Lstat call would - callers should check for
-// that the same way they already do for os.ReadFile/os.Stat elsewhere in
-// this codebase, not a distinct "found bool" out-parameter.
+// LstatEntry builds a FileEntry for a single existing path the same way Walk
+// builds one for each path it visits, without needing a whole tree walk.
+// Path is left empty. The returned error satisfies os.IsNotExist(err) when
+// path doesn't exist, exactly like a direct os.Lstat call would.
 func LstatEntry(path string) (FileEntry, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -114,14 +90,10 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 			return err
 		}
 		if path == root {
-			// The root itself isn't part of its own file list.
 			return nil
 		}
 
 		if !opts.Recursive && d.IsDir() && !opts.Dirs {
-			// Neither -r nor -d: rsync skips directories entirely rather
-			// than creating them empty, so this one is neither listed nor
-			// descended into.
 			return filepath.SkipDir
 		}
 
@@ -131,11 +103,7 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 		}
 
 		// os.Lstat, not os.Stat: a symlink must be reported as itself, not
-		// resolved to whatever it points at. WalkDir's own DirEntry is
-		// already lstat-derived (it never follows symlinks when deciding
-		// what to recurse into), but calling Lstat explicitly here makes
-		// that guarantee obvious at the call site rather than implicit in
-		// WalkDir's internals.
+		// resolved to whatever it points at.
 		info, err := os.Lstat(path)
 		if err != nil {
 			return err
@@ -150,8 +118,6 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 		entries = append(entries, entry)
 
 		if !opts.Recursive && d.IsDir() {
-			// Whether or not -d caused this directory to be listed above,
-			// without -r its contents are never descended into.
 			return filepath.SkipDir
 		}
 
@@ -161,13 +127,10 @@ func Walk(root string, opts WalkOptions) ([]FileEntry, error) {
 		return nil, err
 	}
 
-	// filepath.WalkDir only guarantees lexicographic order within each
-	// directory, not across the whole tree (a directory's contents are
-	// interleaved with sibling entries in traversal order, not sorted
-	// globally). Sorting the flattened list by full path afterward is what
-	// actually gives deterministic, rsync-comparable ordering; plain Go
-	// string comparison is byte-wise, matching C's strcmp, which is what
-	// rsync's own pathname sort relies on.
+	// filepath.WalkDir only guarantees order within each directory, not
+	// across the whole tree, so sort the flattened list by full path. Go's
+	// byte-wise string comparison matches C's strcmp, which rsync's own
+	// pathname sort relies on.
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Path < entries[j].Path
 	})

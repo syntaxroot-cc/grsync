@@ -43,11 +43,8 @@ func TestItemizeFile_PermsOwnerGroupChanged(t *testing.T) {
 		Size: 10, ModTime: time.Unix(1000, 0), Mode: fs.FileMode(0o600),
 		UID: 1000, GID: 1000, OwnershipAvailable: true,
 	}
-	// Content unchanged (contentChanged=false) so this exercises the
-	// "attributes-only update" case: Y must be '.', not '>', matching
-	// real rsync's own documented meaning of '.' - "the item is not
-	// being updated (though it might have attributes that are being
-	// modified)".
+	// contentChanged=false exercises the attributes-only update case: Y
+	// must be '.', not '>'.
 	code, report := itemizeFile(entry, old, true, false, fullAttrOpts)
 	if !report {
 		t.Fatalf("report = false for a file with changed perms/owner/group, want true")
@@ -69,9 +66,6 @@ func TestItemizeFile_UnchangedIsNotReported(t *testing.T) {
 func TestItemizeFile_AttrsIgnoredWhenNotRequested(t *testing.T) {
 	entry := sync.FileEntry{Path: "f.txt", Size: 10, ModTime: time.Unix(2000, 0), Mode: fs.FileMode(0o600)}
 	old := sync.FileEntry{Size: 10, ModTime: time.Unix(1000, 0), Mode: fs.FileMode(0o644)}
-	// opts requests none of Times/Perms/Owner/Group - real rsync's own
-	// rule is that each attribute letter "requires" its flag; without
-	// it, even a real underlying difference must not be reported.
 	_, report := itemizeFile(entry, old, true, false, sync.AttrOptions{})
 	if report {
 		t.Errorf("report = true when no attribute flags were requested, want false")

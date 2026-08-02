@@ -13,11 +13,7 @@ import (
 )
 
 // startTestDaemon listens on 127.0.0.1:0 (an OS-assigned free port) and
-// serves cfg in the background until the test ends. Using a real TCP
-// listener rather than io.Pipe is deliberate here: unlike the SSH
-// transport tests, this needs no external binary or environment
-// dependency (no sshd), so there's no reason to settle for anything less
-// than a real end-to-end loopback round trip.
+// serves cfg in the background until the test ends.
 func startTestDaemon(t *testing.T, cfg *Config) (addr string, errLog *bytes.Buffer) {
 	t.Helper()
 
@@ -165,12 +161,8 @@ func TestDaemon_RealTCP_ModuleListing(t *testing.T) {
 	}
 }
 
-// TestDaemon_RealTCP_DryRunPutMakesNoChanges is the daemon protocol's
-// real proof for the dry-run wire extension: a DirectionPut with
-// ReceiverOptions.DryRun set sends "put --dry-run" on the direction line
-// (see dryRunToken), and the module's directory - where ServeModule's
-// Receiver actually runs - must stay completely empty afterward, over an
-// actual TCP connection, not just a same-process pipe.
+// TestDaemon_RealTCP_DryRunPutMakesNoChanges confirms a DirectionPut with
+// DryRun set leaves the module directory completely empty.
 func TestDaemon_RealTCP_DryRunPutMakesNoChanges(t *testing.T) {
 	modRoot := t.TempDir()
 	cfg := &Config{Modules: map[string]Module{
@@ -210,11 +202,7 @@ func TestDaemon_RealTCP_DryRunPutMakesNoChanges(t *testing.T) {
 }
 
 // TestDaemon_RealTCP_DryRunGetMakesNoChanges is DryRun's counterpart for
-// DirectionGet: unlike PUT, this needs no protocol extension at all - the
-// client's own Receiver runs locally here, so ReceiverOptions.DryRun is
-// simply consulted directly, the same as a local sync - but it's worth
-// proving over a real daemon connection too, not just assumed from the
-// PUT case working.
+// DirectionGet, where the client's own Receiver runs locally.
 func TestDaemon_RealTCP_DryRunGetMakesNoChanges(t *testing.T) {
 	modRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(modRoot, "readme.txt"), "should never be downloaded")
@@ -251,10 +239,7 @@ func TestDaemon_RealTCP_DryRunGetMakesNoChanges(t *testing.T) {
 }
 
 // TestDaemon_RealTCP_StatsWorkForGet confirms Stats works fully for a
-// module download, over a real TCP connection: DirectionGet's Receiver
-// runs on the client, exactly like a local sync, so ReceiverOptions
-// reaches it directly with no protocol involvement at all - unlike
-// DirectionPut, there is no daemon-specific limitation here to disclose.
+// module download, since DirectionGet's Receiver runs on the client.
 func TestDaemon_RealTCP_StatsWorkForGet(t *testing.T) {
 	modRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(modRoot, "readme.txt"), "some real content to report stats about")
@@ -287,16 +272,10 @@ func TestDaemon_RealTCP_StatsWorkForGet(t *testing.T) {
 	}
 }
 
-// TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks confirms
-// the disclosed daemon-PUT limitation fails safely rather than breaking
-// anything: even if a caller sets Progress/Stats on the *client's*
-// ReceiverOptions for a DirectionPut, the transfer still completes
-// correctly, because those fields never cross the wire at all - only
-// DryRun does, via dryRunToken (see ServeModule/DialModule's own doc
-// comments) - so the server-side Receiver that would actually need them
-// never even sees them. This is what "consistent, not a new gap" means
-// concretely: the same fields SC-11 already established as inert for
-// daemon-PUT stay inert for Progress/Stats too, without erroring.
+// TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks confirms that
+// setting Progress/Stats on a DirectionPut's client-side ReceiverOptions
+// is silently inert (only DryRun crosses the wire, via dryRunToken)
+// rather than causing an error.
 func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 	modRoot := t.TempDir()
 	cfg := &Config{Modules: map[string]Module{
@@ -319,8 +298,6 @@ func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
 
-	// Progress/Stats set here deliberately, to prove they're harmlessly
-	// ignored for this direction rather than causing an error.
 	var clientSideOutput bytes.Buffer
 	ropts := pipeline.ReceiverOptions{Progress: true, Stats: true, Output: &clientSideOutput}
 	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts, pipeline.CompressOptions{}); err != nil {
@@ -334,11 +311,6 @@ func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 	if string(got) != "pushed despite requesting progress/stats" {
 		t.Errorf("uploaded content = %q, want %q", got, "pushed despite requesting progress/stats")
 	}
-	// Nothing was ever printed on the client side either: DialModule's
-	// DirectionPut branch runs pipeline.Sender, which never consults
-	// ReceiverOptions at all (see pipeline.Sender's own doc comment) -
-	// there is no client-side reporting output for an upload regardless
-	// of transport.
 	if clientSideOutput.Len() != 0 {
 		t.Errorf("client-side output = %q, want empty (Sender never reports progress/stats)", clientSideOutput.String())
 	}
@@ -347,14 +319,9 @@ func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 	}
 }
 
-// TestDaemon_RealTCP_PutWithCompressUploadsCorrectly is SC-9's real,
-// over-the-wire proof for the daemon transport: DirectionPut runs
-// pipeline.Sender on the client side (see DialModule's own doc comment),
-// exactly where --compress/-z's decision belongs, so this drives that
-// same client-side Sender with CompressOptions.Enabled against a real
-// TCP daemon connection and confirms the upload still arrives byte-
-// correct - the server's Receiver only ever reacts to each deltaMessage's
-// own Compressed marker, needing no daemon-protocol change at all.
+// TestDaemon_RealTCP_PutWithCompressUploadsCorrectly confirms a
+// DirectionPut with CompressOptions.Enabled arrives byte-correct over a
+// real TCP daemon connection.
 func TestDaemon_RealTCP_PutWithCompressUploadsCorrectly(t *testing.T) {
 	modRoot := t.TempDir()
 	cfg := &Config{Modules: map[string]Module{

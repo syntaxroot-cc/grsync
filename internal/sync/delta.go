@@ -2,51 +2,45 @@ package sync
 
 import "fmt"
 
-// DeltaOp is one operation in a delta stream, produced by GenerateDelta
-// and consumed by ApplyDelta. It's a sealed interface - isDeltaOp is
-// unexported, so CopyOp and DataOp are its only implementations; callers
-// type-switch on the concrete type.
+// DeltaOp is one operation in a delta stream, produced by GenerateDelta and
+// consumed by ApplyDelta. isDeltaOp is unexported so CopyOp and DataOp are
+// its only implementations; callers type-switch on the concrete type.
 type DeltaOp interface {
 	isDeltaOp()
 }
 
-// CopyOp copies block BlockIndex - an index into the Blocks of the
-// Signature that GenerateDelta was given - from the receiver's old file,
-// unchanged.
+// CopyOp copies block BlockIndex - an index into the Signature's Blocks
+// that GenerateDelta was given - from the receiver's old file, unchanged.
 type CopyOp struct {
 	BlockIndex int
 }
 
 func (CopyOp) isDeltaOp() {}
 
-// DataOp writes Bytes literally: data present in the new file that didn't
-// match any block in the old file's signature.
+// DataOp writes Bytes literally: data that didn't match any signature block.
 type DataOp struct {
 	Bytes []byte
 }
 
 func (DataOp) isDeltaOp() {}
 
-// GenerateDelta compares newData against sig - a signature of some old
-// data the receiver already has - and produces an ordered delta that,
-// applied to that old data via ApplyDelta, reconstructs newData.
+// GenerateDelta compares newData against sig, a signature of old data the
+// receiver already has, and produces an ordered delta that reconstructs
+// newData when applied to that old data via ApplyDelta.
 //
 // It slides a blockSize-byte window across newData one byte at a time,
 // maintaining the rolling weak checksum incrementally (weakChecksum.roll,
-// O(1) per byte) rather than recomputing it from scratch at every
-// position - recomputing would silently make this an O(n*blockSize)
-// scan, defeating the entire reason a rolling checksum exists.
+// O(1) per byte) instead of recomputing it from scratch at every position,
+// which would degrade this to an O(n*blockSize) scan.
 func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 	blockSize := sig.BlockSize
 	if blockSize <= 0 {
 		blockSize = DefaultBlockSize
 	}
 
-	// weak checksum -> indices of every block sharing it. A weak checksum
-	// collision (two different blocks that happen to produce the same
-	// 32-bit weak sum) is expected to happen occasionally by chance; the
-	// slice of candidates lets the strong-checksum check below disambiguate
-	// rather than assuming the first weak match is correct.
+	// weak checksum -> indices of every block sharing it. Two different
+	// blocks colliding on their 32-bit weak sum is expected occasionally by
+	// chance; the strong-checksum check below disambiguates candidates.
 	weakIndex := make(map[uint32][]int, len(sig.Blocks))
 	for i, b := range sig.Blocks {
 		weakIndex[b.Weak] = append(weakIndex[b.Weak], i)
@@ -60,15 +54,13 @@ func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 			return
 		}
 		ops = append(ops, DataOp{Bytes: pending})
-		// Reset to nil (not just len 0) so the next append starts a fresh
-		// backing array instead of potentially growing into - and
-		// corrupting - the slice just handed to the DataOp above.
+		// Reset to nil, not just len 0, so the next append starts a fresh
+		// backing array instead of growing into the slice just handed to DataOp.
 		pending = nil
 	}
 
-	// tryMatch checks whether the blockSize-byte window at newData[at:] -
-	// whose already-computed rolling checksum is weak - matches a
-	// signature block. Confirms via strong checksum before accepting.
+	// tryMatch checks whether the blockSize-byte window at newData[at:], with
+	// already-computed rolling checksum weak, matches a signature block.
 	tryMatch := func(at int, weak weakChecksum) (blockIndex int, ok bool) {
 		candidates, found := weakIndex[weak.sum()]
 		if !found {
@@ -87,17 +79,12 @@ func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 	pos := 0
 	for pos < n {
 		if pos+blockSize > n {
-			// Fewer than blockSize bytes remain: no full window left to
-			// possibly match, so the rest of the file is literal data.
-			// (No need to advance pos before this break - nothing reads
-			// it again once the loop exits.)
+			// Fewer than blockSize bytes remain: no full window left to match.
 			pending = append(pending, newData[pos:]...)
 			break
 		}
 
-		// Freshly computed only here - once per match/skip-ahead, not per
-		// byte - then advanced with roll() for every subsequent byte the
-		// inner loop steps through without a match.
+		// Computed fresh only here, then advanced with roll() per byte below.
 		weak := newWeakChecksum(newData[pos : pos+blockSize])
 		for {
 			if idx, ok := tryMatch(pos, weak); ok {
@@ -110,7 +97,7 @@ func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 			pending = append(pending, newData[pos])
 			pos++
 			if pos+blockSize > n {
-				break // not enough bytes left for a full window anymore
+				break
 			}
 			weak = weak.roll(newData[pos-1], newData[pos+blockSize-1])
 		}
@@ -121,34 +108,17 @@ func GenerateDelta(sig Signature, newData []byte) []DeltaOp {
 }
 
 // ApplyDelta reconstructs a file from oldData and an ordered []DeltaOp
-// produced by GenerateDelta(sig, ...) against that same oldData: each
-// CopyOp copies its referenced block out of oldData, and each DataOp
-// writes its literal bytes, in order.
+// produced by GenerateDelta(sig, ...) against that same oldData.
 //
-// sig must be the exact Signature GenerateDelta was called with - a
-// CopyOp only carries a block index, not byte offsets, so BlockSize is
-// the only way to recover which bytes of oldData that index refers to.
-// Passing a different Signature (or a hand-built one with a mismatched
-// BlockSize) would silently reconstruct the wrong bytes; that's exactly
-// the class of bug bundling BlockSize into Signature (see signature.go)
-// is meant to make harder, by giving ApplyDelta and GenerateDelta the
-// same single source of truth for it instead of two independent
-// parameters that could drift apart.
+// sig must be the exact Signature GenerateDelta was called with: a CopyOp
+// only carries a block index, not byte offsets, so BlockSize is the only way
+// to recover which bytes of oldData that index refers to. A mismatched
+// BlockSize would silently reconstruct the wrong bytes.
 //
-// The result is returned as a []byte rather than written to an io.Writer:
-// every function in this package so far (Walk aside) operates on
-// in-memory byte slices - there's no streaming I/O anywhere yet for this
-// to plug into - so an io.Writer parameter would just be unused
-// flexibility at this stage. That can change if/when a streaming
-// transport is introduced later.
-// blockSize is validated lazily, only once a CopyOp actually needs it to
-// translate a BlockIndex into a byte range - not unconditionally up
-// front - so a delta with no CopyOps at all (every real caller today
-// still has BlockSize > 0 via GenerateSignature's own DefaultBlockSize,
-// but SC-12's append-mode construction can legitimately produce a
-// Signature with BlockSize == 0 when the receiver's existing file is
-// empty, since there is then no prefix block to describe at all) never
-// gets rejected for a value that would never actually be used.
+// blockSize is validated lazily, only once a CopyOp needs it to translate a
+// BlockIndex into a byte range - append-mode construction can legitimately
+// produce a Signature with BlockSize == 0 when the old file is empty, and a
+// delta with no CopyOps should not be rejected for a value it never uses.
 func ApplyDelta(oldData []byte, ops []DeltaOp, sig Signature) ([]byte, error) {
 	blockSize := sig.BlockSize
 

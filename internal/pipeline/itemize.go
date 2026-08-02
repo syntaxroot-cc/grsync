@@ -10,82 +10,49 @@ import (
 )
 
 // ReceiverOptions bundles Receiver's dry-run and reporting behavior -
-// kept separate from sync.AttrOptions, which controls *what* gets
-// preserved, not whether writes happen at all or what gets reported
-// about them.
+// kept separate from sync.AttrOptions, which controls what gets
+// preserved, not whether writes happen or what gets reported.
 type ReceiverOptions struct {
-	// DryRun, when true, makes Receiver perform every planning step
-	// (signature/delta exchange, hard-link grouping, itemize
-	// computation) exactly as a real run would, but skip every
-	// filesystem write - see Receiver's doc comment for the audited
-	// list of exactly which calls that covers.
+	// DryRun, when true, runs every planning step but skips filesystem writes.
 	DryRun bool
-	// Itemize, when true, writes one real-rsync-format %i line (see
-	// itemizeFile/itemizeDir/itemizeSymlink) per changed entry to
-	// Output. Takes precedence over Verbose when both are set, matching
-	// real rsync's own -i implying strictly more detail than -v alone.
+	// Itemize, when true, writes one real-rsync-format %i line per changed
+	// entry to Output. Takes precedence over Verbose when both are set.
 	Itemize bool
 	// Verbose, when true and Itemize is false, writes just the path
-	// (plus " -> target" for a changed symlink) per changed entry to
-	// Output - real rsync's own default "%n%L" format for -v without -i.
+	// (plus " -> target" for a changed symlink) per changed entry to Output.
 	Verbose bool
 	// Progress, when true, writes a live-updating line per regular file
-	// as its data is written to disk (see progress.go's own doc comment
-	// for exactly what this measures and why, given grsync's non-
-	// streaming wire protocol), to Output.
+	// as its data is written to disk.
 	Progress bool
-	// Stats, when true, writes a real-rsync-format summary block (see
-	// stats.go's formatStats) to Output once the whole sync completes.
+	// Stats, when true, writes a summary block to Output once the sync completes.
 	Stats bool
 	// Output is where Itemize/Verbose/Progress/Stats output is written.
-	// A nil Output is treated as io.Discard, so a caller that wants none
-	// of this doesn't need to construct a discard writer itself.
+	// A nil Output is treated as io.Discard.
 	Output io.Writer
 
-	// Partial, when true, keeps a regular file's temp file (rather than
-	// deleting it) if the transfer aborts before that file's rename into
-	// place - see partial.go's own doc comment for exactly what "partial"
-	// means in grsync's frame-per-file architecture (file granularity,
-	// not true mid-file resumption). Implied by a non-empty PartialDir,
-	// matching real rsync's own documented "--partial-dir... also
-	// implying that [--partial] be enabled."
+	// Partial, when true, keeps a regular file's temp file instead of
+	// deleting it if the transfer aborts before rename into place.
+	// Implied by a non-empty PartialDir.
 	Partial bool
 	// PartialDir, when non-empty, is where an abandoned temp file goes
-	// instead of being renamed onto the destination path directly - see
-	// partial.go's partialFilePath for the relative-vs-absolute placement
-	// rule. A file found here is also used as a resume basis (the
-	// signature comparison source) on a later run, then deleted once its
-	// transfer completes successfully.
+	// instead of the destination path directly. A file found here is also
+	// used as a resume basis on a later run, then deleted on success.
 	PartialDir string
 	// Append, when true, blindly trusts a shorter destination file's
-	// existing bytes and transfers only the new tail - see
-	// messages.go's appendTail and receiver.go's own doc comment for the
-	// real, verified-against-source distinction from AppendVerify.
-	// Mutually exclusive with AppendVerify (internal/cli validates this).
+	// existing bytes and transfers only the new tail. Mutually exclusive
+	// with AppendVerify (internal/cli validates this).
 	Append bool
-	// AppendVerify is like Append, but runs the completely normal
-	// signature/delta comparison over the existing prefix instead of
-	// trusting it blindly - see receiver.go's own doc comment for why
-	// this needs no new algorithm at all, just an eligibility gate on
-	// top of the pre-existing flow.
+	// AppendVerify is like Append, but verifies the existing prefix via a
+	// normal signature/delta comparison instead of trusting it blindly.
 	AppendVerify bool
 }
 
-// AppendMode reports whether either append flag is set - Append and
-// AppendVerify share the same file-eligibility rules (see receiver.go),
-// differing only in whether the existing prefix is trusted or verified.
-// Exported since internal/cli needs it too, to warn when combined with
-// an rsync:// daemon upload destination (see runSync's own comment on
-// why that direction can't honor either flag, the same disclosed
-// daemon-PUT limitation SC-10/SC-11 already established for reporting).
+// AppendMode reports whether either append flag is set.
 func (o ReceiverOptions) AppendMode() bool {
 	return o.Append || o.AppendVerify
 }
 
-// KeepPartial reports whether an aborted temp file should be kept at
-// all - PartialDir implies Partial, matching real rsync's own
-// documented "--partial-dir... also implying that [--partial] be
-// enabled." Exported for the same reason AppendMode is.
+// KeepPartial reports whether an aborted temp file should be kept at all.
 func (o ReceiverOptions) KeepPartial() bool {
 	return o.Partial || o.PartialDir != ""
 }
@@ -97,24 +64,16 @@ func (o ReceiverOptions) output() io.Writer {
 	return o.Output
 }
 
-// Reporting reports whether o requests any output at all - Itemize,
-// Verbose, Progress, or Stats - exported since callers outside this
-// package (internal/cli, deciding whether to print its own one-time
-// daemon-PUT no-reporting-channel note) need it too, not just Receiver
-// itself. All four share the same disclosed daemon-PUT limitation (see
-// the README's Progress and Stats section), so one check covers all of
-// them consistently rather than needing a separate one per flag.
+// Reporting reports whether o requests any output at all: Itemize,
+// Verbose, Progress, or Stats.
 func (o ReceiverOptions) Reporting() bool {
 	return o.Itemize || o.Verbose || o.Progress || o.Stats
 }
 
 // itemizeAttrs holds the 9 attribute-letter positions of real rsync's
-// %i format (the "cstpoguax" tail of "YXcstpoguax", see rsync.1's
-// --itemize-changes section) in order: checksum/value, size, time,
-// perms, owner, group, atime/crtime, ACL, xattr. The last three (atime/
-// crtime, ACL, xattr) are never set to anything but '.' anywhere in this
-// package - grsync has no --atimes/--acl/--xattr flags, matching real
-// rsync's own behavior when those options aren't given.
+// %i format ("cstpoguax") in order: checksum/value, size, time, perms,
+// owner, group, atime/crtime, ACL, xattr. The last three are never set
+// to anything but '.' here - grsync has no --atimes/--acl/--xattr flags.
 type itemizeAttrs [9]byte
 
 func newItemizeAttrs() itemizeAttrs {
@@ -123,9 +82,7 @@ func newItemizeAttrs() itemizeAttrs {
 
 func (a itemizeAttrs) String() string { return string(a[:]) }
 
-// changed reports whether any position was set to something other than
-// ".", i.e. whether this attrs value actually represents a difference
-// worth reporting at all.
+// changed reports whether any position differs from the "unchanged" default.
 func (a itemizeAttrs) changed() bool {
 	for _, b := range a {
 		if b != '.' {
@@ -135,21 +92,12 @@ func (a itemizeAttrs) changed() bool {
 	return false
 }
 
-const itemizeNewSuffix = "+++++++++" // real rsync's own "newly created" marker, all 9 positions
+const itemizeNewSuffix = "+++++++++" // real rsync's "newly created" marker, all 9 positions
 
-// itemizeFile computes the %i code for a regular-file entry, comparing
-// it against old (the destination's current state, from
-// sync.LstatEntry) when existed is true. contentChanged reports whether
-// the file's actual bytes differ - computed by the caller via
-// sync.ApplyDelta, since that's the only way grsync (which has no
-// --checksum-gated shortcut and no quick-check) can know for certain,
-// and it costs nothing extra to compute since ApplyDelta is pure
-// in-memory work Receiver already has to do for dry-run's planning-only
-// requirement anyway.
-//
-// report is false exactly when nothing about the entry differs at all -
-// matching real rsync's own default (single -i) behavior of not
-// mentioning completely unchanged items.
+// itemizeFile computes the %i code for a regular-file entry, comparing it
+// against old (the destination's current state) when existed is true.
+// contentChanged reports whether the file's actual bytes differ.
+// report is false when nothing about the entry differs.
 func itemizeFile(entry sync.FileEntry, old sync.FileEntry, existed bool, contentChanged bool, opts sync.AttrOptions) (line string, report bool) {
 	if !existed {
 		return ">f" + itemizeNewSuffix, true
@@ -176,11 +124,7 @@ func itemizeFile(entry sync.FileEntry, old sync.FileEntry, existed bool, content
 		return "", false
 	}
 
-	// Real rsync's own distinction: '>' means the file's data was
-	// actually transferred; '.' means it wasn't (attributes-only
-	// update) - see the man page's own "." definition: "the item is not
-	// being updated (though it might have attributes that are being
-	// modified)".
+	// '>' means data was actually transferred; '.' means attributes-only.
 	y := byte('.')
 	if contentChanged {
 		y = '>'
@@ -188,10 +132,7 @@ func itemizeFile(entry sync.FileEntry, old sync.FileEntry, existed bool, content
 	return string(y) + "f" + a.String(), true
 }
 
-// itemizeDir computes the %i code for a directory entry. Directories
-// have no byte content, so there is no "s" (size) or content-changed
-// concept for them at all - only the attribute letters real rsync's own
-// format actually applies to a directory.
+// itemizeDir computes the %i code for a directory entry.
 func itemizeDir(entry sync.FileEntry, old sync.FileEntry, existed bool, opts sync.AttrOptions) (line string, report bool) {
 	if !existed {
 		return "cd" + itemizeNewSuffix, true
@@ -217,13 +158,9 @@ func itemizeDir(entry sync.FileEntry, old sync.FileEntry, existed bool, opts syn
 	return ".d" + a.String(), true
 }
 
-// itemizeSymlink computes the %i code for a symlink entry. A symlink
-// is always fully recreated (never diffed byte-by-byte - see
-// sync.applySymlink), so its own attribute-"c" position means "the
-// link's target value differs", the same "changed value" meaning the
-// man page documents for symlinks/devices/specials, distinct from what
-// "c" means for a regular file (checksum, which grsync never sets for
-// files at all - see itemizeFile).
+// itemizeSymlink computes the %i code for a symlink entry. Its "c"
+// position means the link target changed, unlike "c" for a regular file
+// (checksum, which grsync never sets).
 func itemizeSymlink(entry sync.FileEntry, old sync.FileEntry, existed bool, opts sync.AttrOptions) (line string, report bool) {
 	if !existed {
 		return "cL" + itemizeNewSuffix, true
@@ -243,28 +180,16 @@ func itemizeSymlink(entry sync.FileEntry, old sync.FileEntry, existed bool, opts
 	if !a.changed() {
 		return "", false
 	}
-	// Y is always 'c' when a symlink is being reported at all: unlike a
-	// regular file, there is no "attributes changed but the link itself
-	// wasn't re-created" case - applySymlink always removes and
-	// recreates it (see its own doc comment), so any reported symlink
-	// change is by definition a local recreation.
 	return "cL" + a.String(), true
 }
 
 // itemizeHardLink is the %i code for a hard-link group's secondary
-// member: real rsync's own 'h' update type ("the item is a hard link to
-// another item"). Unlike the other item kinds, this never depends on
-// comparing against any prior destination state - sync.ApplyHardLinks
-// always removes and relinks unconditionally (see its own doc comment),
-// so a secondary member is always reported, exactly like a symlink is
-// always reported as a full recreation rather than a partial update.
+// member (real rsync's 'h' update type).
 func itemizeHardLink() string {
 	return "hf" + itemizeNewSuffix
 }
 
-// formatItemizeLine joins an %i code with the real "%i %n%L" layout
-// real rsync's own -i uses: the code, a space, the path, and - for a
-// symlink - " -> target".
+// formatItemizeLine joins an %i code with real rsync's "%i %n%L" layout.
 func formatItemizeLine(code, path, linkTarget string) string {
 	var b strings.Builder
 	b.WriteString(code)
@@ -277,8 +202,8 @@ func formatItemizeLine(code, path, linkTarget string) string {
 	return b.String()
 }
 
-// formatVerboseLine is real rsync's own "%n%L" format, used when -v is
-// given without -i: just the path, plus " -> target" for a symlink.
+// formatVerboseLine is real rsync's "%n%L" format, used when -v is given
+// without -i.
 func formatVerboseLine(path, linkTarget string) string {
 	if linkTarget == "" {
 		return path
@@ -287,13 +212,7 @@ func formatVerboseLine(path, linkTarget string) string {
 }
 
 // reportChange writes one itemize/verbose line for entry to ropts.Output,
-// if ropts requests itemize or verbose reporting specifically (not
-// ropts.Reporting(), which also covers Progress/Stats - those have
-// nothing to do with per-entry itemize/verbose lines, and gating on the
-// broader check would incorrectly print verbose-style lines for a caller
-// that asked only for --progress or --stats) and report says this entry
-// is actually worth mentioning - matching real rsync's own default
-// (single -i) behavior of never mentioning a completely unchanged item.
+// if requested and report says this entry is worth mentioning.
 func reportChange(ropts ReceiverOptions, code string, report bool, entry sync.FileEntry) {
 	if (!ropts.Itemize && !ropts.Verbose) || !report {
 		return

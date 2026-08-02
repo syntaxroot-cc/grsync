@@ -70,10 +70,6 @@ func TestCompileRules_Anchoring(t *testing.T) {
 }
 
 func TestCompileRules_InternalSlashAnchorsWithoutLeadingSlash(t *testing.T) {
-	// Real rsync's actual rule: a pattern anchors to the root if it has a
-	// leading "/", OR contains any other "/", OR contains "**" - not just
-	// on an explicit leading "/". "src/main.go" (no leading slash, but an
-	// internal one) must behave the same as "/src/main.go" here.
 	rules := mustCompile(t, []RawRule{
 		{Kind: RuleExclude, Pattern: "src/main.go"},
 	})
@@ -91,8 +87,6 @@ func TestCompileRules_InternalSlashAnchorsWithoutLeadingSlash(t *testing.T) {
 }
 
 func TestCompileRules_DoubleStarAnchorsWithoutSlash(t *testing.T) {
-	// Same rsync rule, the "**" half: a pattern containing "**" anchors
-	// even with no "/" anywhere in it.
 	rules := mustCompile(t, []RawRule{
 		{Kind: RuleExclude, Pattern: "**cache**"},
 	})
@@ -102,7 +96,6 @@ func TestCompileRules_DoubleStarAnchorsWithoutSlash(t *testing.T) {
 }
 
 func TestCompileRules_BareFilenameStaysUnanchored(t *testing.T) {
-	// The one case that must NOT anchor: no "/" at all, no "**" at all.
 	rules := mustCompile(t, []RawRule{
 		{Kind: RuleExclude, Pattern: "*.log"},
 	})
@@ -163,10 +156,6 @@ func TestIncluded_NoRulesMatchDefaultsToIncluded(t *testing.T) {
 func TestIncluded_FirstMatchWinsOrderMatters(t *testing.T) {
 	entry := FileEntry{Path: "keep.log"}
 
-	// Same two rules, opposite order: the first one to match should win in
-	// both cases, so swapping the order must flip the outcome. If it
-	// didn't, evaluation wouldn't actually be "first match wins" - it'd be
-	// "last match wins" or "most specific wins" or something else.
 	includeFirst := mustCompile(t, []RawRule{
 		{Kind: RuleInclude, Pattern: "keep.log"},
 		{Kind: RuleExclude, Pattern: "*.log"},
@@ -221,10 +210,6 @@ func TestCompileRules_ExcludeFromPreservesPosition(t *testing.T) {
 		{Kind: RuleInclude, Pattern: "last.txt"},
 	})
 
-	// Position matters here: the two patterns read from the file must land
-	// between "first.txt" and "last.txt", not get appended after
-	// "last.txt" - that would silently reorder rules relative to what the
-	// user typed on the command line, breaking first-match-wins semantics.
 	want := []struct {
 		action  Action
 		pattern string
@@ -344,14 +329,12 @@ func TestCompileRules_EmptyPatternErrors(t *testing.T) {
 	for _, pattern := range tests {
 		_, err := CompileRules([]RawRule{{Kind: RuleExclude, Pattern: pattern}})
 		if err == nil {
-			t.Errorf("CompileRules with pattern %q returned nil error, want an error (a silent no-op rule is worse than a clear failure)", pattern)
+			t.Errorf("CompileRules with pattern %q returned nil error, want an error", pattern)
 		}
 	}
 }
 
 func TestRule_WildcardOnlyPatternsMatchEverything(t *testing.T) {
-	// This is intended behavior, matching real rsync: a bare "*" or "**"
-	// is a deliberate "match everything" rule, not a bug to guard against.
 	entries := []FileEntry{{Path: "a"}, {Path: "a/b"}, {Path: "a/b/c.txt"}}
 
 	star := mustCompile(t, []RawRule{{Kind: RuleExclude, Pattern: "*"}})

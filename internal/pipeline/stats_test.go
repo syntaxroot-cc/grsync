@@ -12,8 +12,6 @@ import (
 )
 
 func TestSpeedupRatio_MatchesRealRsyncFormula(t *testing.T) {
-	// Verified against real rsync's own source (main.c's output_summary):
-	// total_size / (total_written + total_read).
 	s := Stats{TotalFileSize: 1000, BytesSent: 100, BytesReceived: 150}
 	got := s.SpeedupRatio()
 	want := 1000.0 / (100.0 + 150.0)
@@ -82,26 +80,14 @@ func statsField(t *testing.T, output, label string) int64 {
 	return n
 }
 
-// TestReceiver_StatsAccuracy is SC-10's core accuracy proof: a small
-// tree where every number is exactly predictable by construction (not
-// approximated) - two brand-new regular files (entirely literal data,
-// no old data to match against), one byte-identical existing file
-// (entirely matched data, zero literal), and one new directory - checked
-// against the actual printed --stats output, not the internal Stats
-// struct directly, so this proves the real end-user-visible behavior,
-// not just the accumulation logic in isolation.
 func TestReceiver_StatsAccuracy(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
 
 	const newContent = "0123456789" // 10 bytes, brand new
-	// unchangedContent is deliberately 2 full blocks (sync.DefaultBlockSize
-	// is 700): GenerateDelta can only ever produce a CopyOp for a window
-	// at least one full block long (see delta.go's own "fewer than
-	// blockSize bytes remain" comment), so a short "identical" file - one
-	// shorter than a single block - would always transfer as 100% literal
-	// data regardless of whether it actually matches, proving nothing
-	// about Matched data specifically.
+	// 2 full blocks (sync.DefaultBlockSize is 700): GenerateDelta can only
+	// produce a CopyOp for a window at least one full block long, so a
+	// shorter "identical" file would always transfer as literal data.
 	unchangedContent := strings.Repeat("ABCDEFGHIJ", 140) // 1400 bytes, byte-identical at both ends
 	const nestedContent = "nested"                        // 6 bytes, brand new, inside a brand-new directory
 
@@ -142,9 +128,6 @@ func TestReceiver_StatsAccuracy(t *testing.T) {
 		t.Errorf("Total transferred file size = %d, want %d", got, wantTransferredSize)
 	}
 
-	// new.txt and nested.txt are entirely literal (no old data existed to
-	// match against); unchanged.txt is entirely matched (byte-identical),
-	// contributing 0 literal and its full size to matched.
 	wantLiteral := int64(len(newContent) + len(nestedContent))
 	if got := statsField(t, output, "Literal data"); got != wantLiteral {
 		t.Errorf("Literal data = %d, want %d", got, wantLiteral)
@@ -160,21 +143,15 @@ func TestReceiver_StatsAccuracy(t *testing.T) {
 		t.Errorf("Total bytes sent/received = %d/%d, want both > 0", sent, received)
 	}
 
-	// The speedup line is self-consistent with the formula and the
-	// actual sent/received counts already verified above - not an
-	// independently hard-coded expectation, which would just duplicate
-	// (and risk silently drifting from) the real byte counts gob
-	// encoding happens to produce.
+	// Self-consistent with the formula and the sent/received counts
+	// already verified above, rather than an independently hard-coded
+	// expectation.
 	wantSpeedup := commaFloat2(float64(wantTotalSize) / float64(sent+received))
 	if !bytes.Contains(out.Bytes(), []byte("speedup is "+wantSpeedup)) {
 		t.Errorf("output does not contain expected speedup %q:\n%s", wantSpeedup, output)
 	}
 }
 
-// TestReceiver_StatsOmitsDeletedFilesLine confirms real rsync's own
-// documented rule is followed: "Number of deleted files" is only
-// printed when deletions are in effect - grsync never implements
-// --delete at all (see the README), so this line must never appear.
 func TestReceiver_StatsOmitsDeletedFilesLine(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -190,13 +167,6 @@ func TestReceiver_StatsOmitsDeletedFilesLine(t *testing.T) {
 	}
 }
 
-// TestReceiver_StatsCountsNewEmptyFileAsTransferred is a deliberate edge
-// case: a brand-new *empty* file has oldData == nil and newData == nil
-// (ApplyDelta's accumulator is never appended to when there are no
-// delta ops at all), so a naive bytes.Equal(oldData, newData) check
-// alone would say "unchanged" even though a real file was just created -
-// this is exactly the gap receiveRegularFile's transferred variable
-// (distinct from contentChanged) exists to close.
 func TestReceiver_StatsCountsNewEmptyFileAsTransferred(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -215,12 +185,6 @@ func TestReceiver_StatsCountsNewEmptyFileAsTransferred(t *testing.T) {
 	}
 }
 
-// TestReceiver_StatsWorksInDryRun confirms Stats is fully dry-run
-// compatible, unlike Progress: every field it reports (file counts,
-// sizes, literal/matched data, even bytes sent/received) is derived
-// from planning data and the wire exchange, neither of which dry-run
-// skips - only the final disk write is skipped, and Stats doesn't
-// depend on that.
 func TestReceiver_StatsWorksInDryRun(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
