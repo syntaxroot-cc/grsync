@@ -40,8 +40,8 @@ type Session struct {
 // stubbed-out or weakened host-key behavior to document here because none
 // of that logic is reimplemented at all; it's entirely the system ssh
 // client's own, unchanged behavior.
-func Dial(rsh, user, host string, remoteArgs []string) (*Session, error) {
-	argv := BuildRSHCommand(rsh, user, host, remoteArgs)
+func Dial(rsh, user, host string, remoteArgs []string, ipv4, ipv6 bool) (*Session, error) {
+	argv := BuildRSHCommand(rsh, user, host, remoteArgs, ipv4, ipv6)
 	cmd := exec.Command(argv[0], argv[1:]...)
 
 	stdin, err := cmd.StdinPipe()

@@ -59,7 +59,7 @@ func TestSSHLocalhost_HandshakeRoundTrip(t *testing.T) {
 	requireLocalSSHServer(t)
 	grsyncPath := buildGrsyncBinary(t)
 
-	session, err := Dial("", "", "127.0.0.1", []string{grsyncPath, "--server"})
+	session, err := Dial("", "", "127.0.0.1", []string{grsyncPath, "--server"}, false, false)
 	if err != nil {
 		t.Fatalf("Dial returned error: %v", err)
 	}

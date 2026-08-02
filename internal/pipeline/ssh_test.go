@@ -69,7 +69,7 @@ func TestSSHLocalhost_SyncRoundTrip(t *testing.T) {
 	mustMkdirAll(t, filepath.Join(src, "sub"))
 	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
 
-	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest})
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest}, false, false)
 	if err != nil {
 		t.Fatalf("Dial returned error: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestSSHLocalhost_DryRunMakesNoChanges(t *testing.T) {
 	mustMkdirAll(t, filepath.Join(src, "sub"))
 	mustWriteFile(t, filepath.Join(src, "sub", "nested.txt"), "nested content")
 
-	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--dry-run", dest})
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--dry-run", dest}, false, false)
 	if err != nil {
 		t.Fatalf("Dial returned error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer(t *testing.T) {
 	content := strings.Repeat("z", progressWriteChunkSize*2+500)
 	mustWriteFile(t, filepath.Join(src, "big.bin"), content)
 
-	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--progress", "--stats", dest})
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", "--progress", "--stats", dest}, false, false)
 	if err != nil {
 		t.Fatalf("Dial returned error: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestSSHLocalhost_CompressDoesNotBreakTheTransfer(t *testing.T) {
 	content := strings.Repeat("compressible ssh transfer content ", 2000)
 	mustWriteFile(t, filepath.Join(src, "big.txt"), content)
 
-	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest})
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest}, false, false)
 	if err != nil {
 		t.Fatalf("Dial returned error: %v", err)
 	}
@@ -251,4 +251,51 @@ func TestSSHLocalhost_CompressDoesNotBreakTheTransfer(t *testing.T) {
 	}
 
 	assertSameContent(t, filepath.Join(src, "big.txt"), filepath.Join(dest, "big.txt"))
+}
+
+// TestSSHLocalhost_IPv4ForwardedToSSHDoesNotBreakTheTransfer is SC-14's
+// real, over-the-wire proof for the SSH transport: transport.Dial's
+// ipv4 parameter reaches transport.BuildRSHCommand, which inserts a real
+// "-4" into the spawned ssh process's own argv (see BuildRSHCommand's
+// own doc comment - grsync never dials this connection itself, ssh
+// does) - this drives that real path end to end against a real local
+// sshd and confirms the forwarded -4 doesn't break anything, connecting
+// to 127.0.0.1 (a genuine IPv4 address, so ssh's own -4 has nothing to
+// object to here).
+func TestSSHLocalhost_IPv4ForwardedToSSHDoesNotBreakTheTransfer(t *testing.T) {
+	requireLocalSSHServer(t)
+	grsyncPath := buildGrsyncBinary(t)
+
+	src := t.TempDir()
+	dest := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "top.txt"), "synced over ssh with -4 forwarded")
+
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest}, true, false)
+	if err != nil {
+		t.Fatalf("Dial returned error: %v", err)
+	}
+
+	if err := transport.Handshake(session); err != nil {
+		t.Fatalf("Handshake returned error: %v", err)
+	}
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Sender did not complete within 20s")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Errorf("Session.Close returned error: %v", err)
+	}
+
+	assertSameContent(t, filepath.Join(src, "top.txt"), filepath.Join(dest, "top.txt"))
 }

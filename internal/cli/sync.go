@@ -145,6 +145,24 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		return fmt.Errorf("compiling filter rules: %w", err)
 	}
 
+	// Resolved once, up front, regardless of destination type: --ipv4 and
+	// --ipv6 conflicting is a flag-level error, not something that should
+	// only surface once a particular destination happens to need it (see
+	// tcpNetwork's own doc comment for why the combination is rejected
+	// outright rather than picking one). network only actually changes
+	// behavior for an rsync:// daemon destination (syncToRsyncDaemon,
+	// below) and --ipv4/--ipv6's forwarding to ssh (syncToRemote, below) -
+	// it's meaningless for a local sync, exactly like real rsync's own
+	// scope for these flags.
+	network, err := tcpNetwork(opts.ipv4, opts.ipv6)
+	if err != nil {
+		return err
+	}
+	localAddr, err := resolveLocalAddr(network, opts.address)
+	if err != nil {
+		return err
+	}
+
 	// isRsyncURL is checked, and rsyncURL parsed, before
 	// transport.ParseRemotePath ever looks at destination: an rsync://
 	// URL is never valid [user@]host:path syntax (ParseRemotePath itself
@@ -199,11 +217,11 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 	for _, src := range sources {
 		switch {
 		case isRsyncDaemon:
-			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks, opts.dryRun, copts); err != nil {
+			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks, opts.dryRun, copts, network, localAddr); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		case isRemote:
-			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts, copts); err != nil {
+			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts, copts, opts.ipv4, opts.ipv6); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		default:
@@ -266,7 +284,19 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // --server process to be told via argv at all. The remote Receiver just
 // decompresses whatever each deltaMessage's own Compressed marker says,
 // exactly like every other transport.
-func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
+//
+// ipv4/ipv6 are SC-14's own contribution, and land somewhere different
+// again: grsync never dials this connection itself at all (ssh, or
+// whatever --rsh overrides it to, does), so there's no net.Dial call
+// here to pass a network string to. Instead they're forwarded straight
+// through to transport.Dial/BuildRSHCommand, which inserts a real -4/-6
+// onto the spawned command's own argv - but only when that command is
+// genuinely ssh (see BuildRSHCommand's own doc comment for exactly when,
+// verified against real rsync's own identical behavior). --address has
+// no equivalent here at all: real rsync's own documented --address scope
+// never includes the rsh/ssh transport (see resolveLocalAddr's own doc
+// comment), so it isn't threaded through to this function.
+func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions, ipv4, ipv6 bool) error {
 	remoteArgs := []string{"grsync", "--server"}
 	if ropts.DryRun {
 		remoteArgs = append(remoteArgs, "--dry-run")
@@ -285,7 +315,7 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 	}
 	remoteArgs = append(remoteArgs, remote.Path)
 
-	session, err := transport.Dial(rsh, remote.User, remote.Host, remoteArgs)
+	session, err := transport.Dial(rsh, remote.User, remote.Host, remoteArgs, ipv4, ipv6)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", remote.Host, err)
 	}

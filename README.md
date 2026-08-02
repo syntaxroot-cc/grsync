@@ -35,7 +35,10 @@ upstream rsync, verified against its actual source rather than assumed.
 today, credentials and all. See
 [rsync Daemon Mode](#rsync-daemon-mode) below for exactly what that
 covers and where it hands off to grsync's own (non-rsync-wire-format)
-transfer protocol.
+transfer protocol. `--ipv4`/`-4`, `--ipv6`/`-6`, and `--address` now
+genuinely control which address family and local address every transport
+uses, matching real rsync's own documented scope for each (see
+[IPv4/IPv6 Support](#ipv4ipv6-support) below).
 
 ## Build
 
@@ -1018,6 +1021,129 @@ exercise this end to end. `internal/cli`'s tests drive the real
 `NewRootCmd()` command, the same way `TestE2E_LocalToLocal` does for a
 local sync, against a real daemon started in-process - not
 `internal/pipeline` or `internal/daemon` called directly.
+
+## IPv4/IPv6 Support
+
+`--ipv4`/`-4` and `--ipv6`/`-6` constrain which address family a
+connection uses; `--address` binds to a specific local IP or hostname.
+Both are implemented per real rsync's own actual, verified scope for
+each - not a uniform "add a flag everywhere" treatment - because that
+scope genuinely differs by transport, and pretending otherwise would
+either silently no-op somewhere or invent behavior real rsync itself
+doesn't have.
+
+### Every `net.Dial`/`net.Listen`/subprocess-network call site (the full audit)
+
+- `internal/cli/daemon.go` - the `--daemon` listener. **Fully honors
+  `--ipv4`/`--ipv6`/`--address`.**
+- `internal/cli/rsync_url.go` - dialing an `rsync://` daemon as a client
+  (`syncToRsyncDaemon`). **Fully honors all three.**
+- `internal/transport/rsh.go`/`session.go` - spawning `ssh` (or whatever
+  `--rsh` overrides it to). **Honors `--ipv4`/`--ipv6` by forwarding a
+  real `-4`/`-6` onto the spawned command's own argv - but only when that
+  command is genuinely `ssh` (see below). `--address` never applies
+  here at all** - grsync doesn't dial this connection itself, `ssh` does,
+  and controlling its own local bind address isn't part of what any
+  remote-shell transport lets a wrapping tool like rsync (or grsync)
+  control.
+- `internal/daemon/server.go`'s `Serve`, `session.go`, `client.go` -
+  all operate on an already-built `net.Listener`/`net.Conn` handed to
+  them from `internal/cli`; none call `net.Dial`/`net.Listen`
+  themselves, so there was nothing here to change.
+
+### `--ipv4`/`-4`, `--ipv6`/`-6`
+
+For the daemon listener and the `rsync://` client dial, these select
+`"tcp4"`/`"tcp6"` over the default dual-stack `"tcp"` passed to
+`net.Listen`/a `net.Dialer` - `tcpNetwork` (`internal/cli/netopts.go`).
+
+For the SSH transport, grsync never dials the connection itself, so
+there is no network string to pick - real rsync solves this by
+forwarding `-4`/`-6` onto the spawned remote-shell command's own argv,
+but **only when it can tell that command is genuinely `ssh`**, verified
+against upstream's actual source (`main.c`'s `do_cmd()`:
+`if (default_af_hint == AF_INET && strcmp(t, "ssh") == 0) args[argc++] = "-4";`,
+where `t` is the resolved command's basename) rather than assumed.
+`rsync.1`'s own wording confirms the scope explicitly: "the forwarding
+of the `-4` or `-6` option to ssh when rsync can deduce that ssh is
+being used as the remote shell. For other remote shells you'll need to
+specify `--rsh SHELL -4` directly." grsync's `sshAddressFamilyFlag`
+(`internal/transport/rsh.go`) replicates this exactly: a real `-4`/`-6`
+is inserted into the spawned argv, right before the target host, if and
+only if the resolved remote-shell program's basename is `ssh` (or
+`ssh.exe` - a Windows-specific addition real rsync's own Unix-only C
+code never needed). Any other `--rsh`/`-e` override (`rsh`, `mosh`, a
+custom wrapper script, ...) gets nothing forwarded - the same documented
+limit real rsync itself has, not a gap grsync introduces. Use
+`--rsh "SHELL -4"` directly for those, exactly as real rsync's own docs
+say to.
+
+**Mutual exclusion**: giving both `--ipv4` and `--ipv6` is a clear,
+immediate error (`tcpNetwork`), validated once up front regardless of
+destination type - even for a local sync, where neither flag does
+anything at all, for predictable, uniform behavior rather than a
+destination-dependent one. This is a deliberate departure from real
+rsync's own actual behavior: upstream's `-4`/`-6` popt registration
+writes both flags into the very same C variable
+(`default_af_hint`), so whichever one is parsed last on the command line
+silently wins if both are given - not a designed behavior, just an
+artifact of shared storage. An explicit error is a better user
+experience than a silently arbitrary "whichever came last" outcome.
+
+### `--address`
+
+Verified against `rsync.1`'s own documented scope rather than assumed:
+client-side, `--address` is "the wildcard address when connecting to an
+rsync daemon" - i.e. the *local/source* address of that outbound
+connection; daemon-side, it's the listen address. Neither mention applies
+to the rsh/ssh transport at all - matching the audit above.
+
+- **Daemon listen** (`internal/cli/daemon.go`): `opts.address` (`""` by
+  default, meaning the wildcard address - every interface, unchanged
+  from before this ticket) is joined with the port and passed straight to
+  `net.Listen`, which resolves a hostname itself if given one.
+- **`rsync://` client dial** (`internal/cli/rsync_url.go`): resolved once
+  via `resolveLocalAddr` (`internal/cli/netopts.go`) into a `*net.TCPAddr`
+  and set as a `net.Dialer`'s `LocalAddr` - `net.ResolveTCPAddr` accepts
+  either a literal IP or a hostname, matching real rsync's own documented
+  "(or hostname)" scope, and is given the same `"tcp4"`/`"tcp6"`/`"tcp"`
+  network hint the actual dial will use, so `--address host.example
+  --ipv6` resolves to that host's IPv6 address specifically, not
+  whichever family a plain lookup happens to return first.
+
+  A subtle Go correctness point worth calling out explicitly:
+  `resolveLocalAddr` returns a nil `*net.TCPAddr` for an empty
+  `--address`, and the caller only assigns it into `net.Dialer.LocalAddr`
+  when it's genuinely non-nil - assigning a nil `*net.TCPAddr` directly
+  into that `net.Addr` interface field would otherwise produce a
+  non-nil interface wrapping a nil pointer (Go's classic typed-nil
+  gotcha), which the dialer would then try to actually use as a local
+  address instead of correctly treating it as "no preference."
+
+An `--address` that's the wrong family for the network in use (e.g.
+`--ipv4` combined with an IPv6 literal `--address`) fails with a clear
+error from `net.Listen`/`net.ResolveTCPAddr` themselves - inherent to how
+sockets work, not something grsync adds special-case handling for.
+
+### Testing
+
+Real loopback listen+dial round trips for both `127.0.0.1` and `::1`
+(the ticket's own explicit requirement), not mocks: `TestE2E_DaemonListensOnIPv4LoopbackWithAddressFlag`/
+`_IPv6_...` drive the actual `--daemon` CLI command bound to each address
+and sync a real file to it; `TestE2E_ClientDialsOverIPv6` proves the
+client-dial side against a real IPv6 socket independently.
+`TestE2E_ForcingIPv4AgainstIPv6OnlyDaemonFails` is the address-family
+*constraint* proof the ticket asked for specifically: a daemon bound only
+to `::1`, dialed with `--ipv4` forced against a hostname that resolves to
+both families, fails with a real `dial tcp4 ... refused` error - proving
+`--ipv4` genuinely restricts which family gets tried, not just that the
+flag is silently accepted. `TestBuildRSHCommand_IPv4ForwardedToDefaultSSH`
+and its siblings (`internal/transport/rsh_test.go`) cover the ssh-argv
+forwarding logic directly, including the exact non-forwarding case for a
+non-ssh `--rsh` override. IPv6-dependent tests call `requireIPv6Loopback`
+first and skip gracefully (not fail) in an environment without a working
+IPv6 loopback, the same established pattern `requireLocalSSHServer`
+already uses for the SSH tests.
 
 ## Architecture
 
