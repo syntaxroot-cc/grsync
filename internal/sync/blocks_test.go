@@ -27,9 +27,6 @@ func TestSplitBlocks(t *testing.T) {
 					t.Errorf("block %d: len = %d, want %d", i, len(blocks[i]), wantLen)
 				}
 			}
-			// Reassembling every block must exactly reproduce the input -
-			// this is the property that actually matters (no bytes lost,
-			// duplicated, or reordered), not just the length list.
 			var got []byte
 			for _, b := range blocks {
 				got = append(got, b...)

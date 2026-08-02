@@ -9,19 +9,12 @@ import (
 	"strings"
 )
 
-// DefaultCompressLevel is real rsync's own zlib default, verified against
-// upstream's token.c (init_compression_level's def_level for the zlib/
-// zlibx choice) rather than assumed.
+// DefaultCompressLevel is real rsync's own zlib default compression level.
 const DefaultCompressLevel = 6
 
-// ClampCompressLevel mirrors real rsync's own --compress-level handling
-// for zlib compression (token.c's init_compression_level), verified
-// against upstream source and rsync.1's own documented wording rather
-// than guessed: 0 is a distinct "off" sentinel, not clamped up into
-// range; -1 (zlib.DefaultCompression) explicitly means "use the default
-// level" (6); anything else out of [1, 9] is silently limited into range
-// ("If you specify a too-large or too-small value, the number is
-// silently limited to a valid value" - rsync.1's own wording).
+// ClampCompressLevel mirrors real rsync's own --compress-level handling:
+// 0 is a distinct "off" sentinel, -1 means "use the default level", and
+// anything else out of [1, 9] is silently clamped into range.
 func ClampCompressLevel(level int) int {
 	switch {
 	case level == zlib.NoCompression: // 0: explicit "off"
@@ -38,34 +31,21 @@ func ClampCompressLevel(level int) int {
 }
 
 // CompressOptions governs whether/how Sender compresses each regular
-// file's literal delta data (--compress/-z) before sending it - see the
-// README's Compression section. It is consulted only by Sender: Receiver
-// needs no compression options of its own at all, since each
-// deltaMessage's own Compressed marker (messages.go) already says
-// whether its literal data needs decompressing first - a purely
-// data-driven decision on that side, not a policy one.
+// file's literal delta data (--compress/-z) before sending it.
 type CompressOptions struct {
 	Enabled bool
-	// Level is a zlib compression level from 1 (fastest) to 9 (smallest),
-	// meaningful only when Enabled - see ClampCompressLevel, which every
-	// caller that constructs a CompressOptions with Enabled: true is
-	// expected to have already run Level through.
+	// Level is a zlib compression level from 1 (fastest) to 9 (smallest);
+	// callers should run it through ClampCompressLevel first.
 	Level int
 	// SkipSuffixes is a lowercase, dot-free list of file suffixes (e.g.
-	// "gz", "jpg") to send uncompressed even when Enabled - real rsync's
-	// own --skip-compress default list (DefaultSkipCompressSuffixes) or a
-	// caller override (see ParseSkipCompressList). Nil/empty means "skip
-	// nothing," matching real rsync's own documented meaning of an empty
-	// --skip-compress=LIST.
+	// "gz", "jpg") to send uncompressed even when Enabled. Nil/empty means
+	// "skip nothing".
 	SkipSuffixes []string
 }
 
 // DefaultSkipCompressSuffixes is real rsync's own built-in --skip-compress
-// suffix list, copied verbatim from rsync.1.md's own documented default
-// (the same list default-dont-compress.h is generated from) rather than
-// invented - files with one of these suffixes are already compressed
-// formats where running zlib over them again wastes CPU for no size
-// benefit.
+// suffix list: file types that are already compressed, so recompressing
+// them wastes CPU for no size benefit.
 var DefaultSkipCompressSuffixes = []string{
 	"3g2", "3gp", "7z", "aac", "ace", "apk", "avi", "bz2", "deb", "dmg",
 	"ear", "f4v", "flac", "flv", "gpg", "gz", "iso", "jar", "jpeg", "jpg",
@@ -81,16 +61,7 @@ var DefaultSkipCompressSuffixes = []string{
 
 // ParseSkipCompressList parses a real rsync --skip-compress=LIST value:
 // suffixes without their leading dot, separated by "/". An empty string
-// is a meaningful value in its own right ("skip nothing"), not "unset" -
-// see effectiveCompressOptions (internal/cli) for how that distinction
-// from "the flag was never given at all" is made.
-//
-// Real rsync's own LIST grammar also supports bracketed character
-// classes inside a suffix (e.g. "mp[34]" for "mp3"/"mp4"); grsync's
-// --skip-compress does not, a deliberate, disclosed scope reduction (see
-// the README's Compression section) rather than a silent gap - plain
-// slash-separated suffixes cover the default list and the overwhelming
-// majority of real-world uses.
+// is a meaningful value in its own right ("skip nothing"), not "unset".
 func ParseSkipCompressList(list string) []string {
 	if list == "" {
 		return nil
@@ -125,29 +96,12 @@ func skipCompressSuffix(path string, skipSuffixes []string) bool {
 // compressLiteral zlib-compresses data at level, returning ok == false if
 // compression didn't actually help (the result is not smaller than data
 // itself) so the caller can fall back to sending it raw.
-//
-// This check matters more here than it would for real rsync's own zlib
-// usage: real rsync keeps one persistent deflate stream open per file,
-// so its fixed ~8-byte zlib header/trailer cost is paid once per file no
-// matter how many separate literal runs cross the wire. grsync's
-// deltaMessage is sent as a single, independent frame per file with no
-// persistent compression context to reuse across files - toWireDeltaOps
-// already amortizes that overhead across everything within one file by
-// compressing the whole concatenated literal stream as a single unit
-// rather than op-by-op (see deltaMessage's own doc comment), but a file
-// whose total literal data is tiny (a few changed bytes in an otherwise-
-// unchanged large file - exactly the case delta transfer exists for) or
-// already-incompressible can still legitimately come out larger
-// compressed than raw. Falling back per file, only when it doesn't pay
-// off, is a small, real improvement over always compressing regardless.
 func compressLiteral(data []byte, level int) (compressed []byte, ok bool) {
 	var buf bytes.Buffer
 	w, err := zlib.NewWriterLevel(&buf, level)
 	if err != nil {
-		// ClampCompressLevel guarantees level is 1-9, which zlib always
-		// accepts - this should be unreachable, but treating any error as
-		// "just send raw" is safe (a pure optimization, never required
-		// for correctness) rather than propagating a hard failure for it.
+		// level is always 1-9 via ClampCompressLevel, so this should be
+		// unreachable; falling back to raw is safe either way.
 		return nil, false
 	}
 	if _, err := w.Write(data); err != nil {

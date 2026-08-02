@@ -141,13 +141,6 @@ func TestDeltaRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDeltaRoundTrip_Compressed is SC-9's core wire-format proof: sending
-// a delta with compression enabled must produce a smaller frame than the
-// same ops sent uncompressed, and recvDelta on the compressed side must
-// still reconstruct byte-identical ops - proving toWireDeltaOps/
-// fromWireDeltaOps' compress-once-per-file, re-slice-by-Length design
-// (see deltaMessage's own doc comment) round-trips correctly, not just
-// that compression was attempted.
 func TestDeltaRoundTrip_Compressed(t *testing.T) {
 	literal := []byte(strings.Repeat("compressible literal data ", 200))
 	ops := []sync.DeltaOp{
@@ -198,13 +191,8 @@ func TestDeltaRoundTrip_Compressed(t *testing.T) {
 	}
 }
 
-// TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed is the
-// ticket's explicit "inspect actual bytes sent, not just trust the flag
-// was read" requirement: it decodes the raw gob frame directly (the same
-// way recvDelta itself does internally) and asserts deltaMessage.Compressed
-// is false and every op still carries its own literal Bytes, for a path
-// whose suffix is in copts.SkipSuffixes - even though copts.Enabled is
-// true and the literal data is highly compressible.
+// Decodes the raw gob frame directly to inspect deltaMessage itself,
+// rather than trusting that the Enabled flag was merely read.
 func TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed(t *testing.T) {
 	literal := []byte(strings.Repeat("z", 5000)) // trivially compressible
 	ops := []sync.DeltaOp{sync.DataOp{Bytes: literal}}
@@ -235,11 +223,6 @@ func TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed(t *testing.T) 
 	}
 }
 
-// TestDeltaRoundTrip_DisabledIsGenuinelyUncompressed is
-// TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed's
-// counterpart for CompressOptions{} (the zero value, --compress not
-// given at all): the wire frame must be byte-identical in shape to the
-// pre-SC-9 format, not merely "the same size by coincidence."
 func TestDeltaRoundTrip_DisabledIsGenuinelyUncompressed(t *testing.T) {
 	ops := []sync.DeltaOp{sync.DataOp{Bytes: []byte(strings.Repeat("y", 5000))}}
 

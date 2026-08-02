@@ -20,8 +20,7 @@ func writeSecretsFile(t *testing.T, content string) string {
 }
 
 // authPipe wires up a client/server conn pair over io.Pipe, each side's
-// writes also captured into its own log buffer - so a test can inspect
-// every byte either side put on the wire, not just the final result.
+// writes also captured into its own log buffer.
 func authPipe() (client, server *conn, clientWireLog, serverWireLog *bytes.Buffer) {
 	clientR, serverW := io.Pipe()
 	serverR, clientW := io.Pipe()
@@ -117,10 +116,8 @@ func TestAuth_UnauthorizedUserFails(t *testing.T) {
 	}
 }
 
-// TestAuth_NoPlaintextPasswordOnWire is the self-review requirement made
-// concrete: it inspects the actual bytes each side wrote, not just the
-// outcome, and fails if the raw password ever appears in either
-// direction.
+// TestAuth_NoPlaintextPasswordOnWire fails if the raw password ever
+// appears in either side's wire bytes.
 func TestAuth_NoPlaintextPasswordOnWire(t *testing.T) {
 	const password = "correct-horse-battery-staple"
 	secretsPath := writeSecretsFile(t, "alice:"+password+"\n")

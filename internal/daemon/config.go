@@ -1,10 +1,8 @@
 // Package daemon implements grsync's rsync-daemon-protocol server: parsing
 // rsyncd.conf, the rsync:// URL scheme, the @RSYNCD greeting/handshake,
 // MD4 challenge-response authentication, and per-module access control.
-// Once a client has authenticated and selected a module, this package
-// hands the connection straight to internal/pipeline's existing
-// Sender/Receiver - the daemon protocol is a second way to *establish* a
-// connection, not a second way to *transfer files*.
+// Once a client has authenticated and selected a module, the connection is
+// handed to internal/pipeline's Sender/Receiver for the actual transfer.
 package daemon
 
 import (
@@ -19,31 +17,24 @@ import (
 // whatever global defaults it didn't override.
 type Module struct {
 	Name string
-	// Path is the directory on the daemon's filesystem this module
-	// exposes. Required for every module - rsyncd.conf itself requires it.
+	// Path is the directory on the daemon's filesystem this module exposes.
 	Path string
-	// ReadOnly defaults to true, matching real rsync: "The default is for
-	// all modules to be read only."
+	// ReadOnly defaults to true, matching real rsync.
 	ReadOnly bool
-	// List defaults to true; "list = false" hides the module from a
-	// #list request without preventing a client who already knows its
-	// name from connecting to it - a real, documented rsyncd.conf option,
-	// not an invented one.
+	// List defaults to true; false hides the module from a #list request
+	// without preventing a client who already knows its name from connecting.
 	List bool
-	// Comment is shown alongside the module name in a #list response
-	// ("<name>\t<comment>", real rsync's own listing format).
+	// Comment is shown alongside the module name in a #list response.
 	Comment string
 	// Exclude is the raw, space-separated pattern list from the "exclude"
-	// parameter, not yet compiled into sync.Rule - see access.go.
+	// parameter, not yet compiled into sync.Rule.
 	Exclude []string
 	// AuthUsers is the raw, comma/space-separated list from "auth users".
 	// A non-empty list means this module requires authentication.
 	AuthUsers []string
-	// SecretsFile is the path to a "name:password" per-line file, per
-	// "secrets file".
+	// SecretsFile is the path to a "name:password" per-line file.
 	SecretsFile string
-	// MaxConnections is the simultaneous-connection cap for this module;
-	// 0 (the default) means unlimited, matching real rsync.
+	// MaxConnections is the simultaneous-connection cap; 0 means unlimited.
 	MaxConnections int
 }
 
@@ -52,33 +43,14 @@ type Config struct {
 	Modules map[string]Module
 }
 
-// moduleDefaults returns the built-in defaults every module starts from
-// before its own [section] parameters (or the file's global parameters,
-// set before any module header) are applied on top.
 func moduleDefaults() Module {
 	return Module{ReadOnly: true, List: true}
 }
 
-// ParseConfig parses rsyncd.conf content from r.
-//
-// Syntax, matching the real format (verified against the actual
-// rsyncd.conf(5) man page, not assumed): global parameters may appear
-// before any module header and become that module's starting defaults;
-// a module begins with "[name]" and continues until the next module or
-// EOF; "#"-prefixed lines are comments; blank lines are ignored; a line
-// ending in "\" continues on the next line; only the first "=" in a
-// "name = value" line is significant, and whitespace around it is
-// trimmed.
-//
-// A parameter name this package doesn't implement (real rsyncd.conf has
-// dozens - "uid", "hosts allow", "log file", "timeout", and more) is
-// accepted and silently ignored, not an error: rejecting a real,
-// syntactically valid config file just because it uses an option this
-// package hasn't implemented yet would be worse than ignoring that one
-// line. A line that isn't valid "name = value" or "[section]" syntax at
-// all, or a recognized parameter with a malformed value (e.g.
-// "max connections = abc"), is a hard parse error - that distinction is
-// deliberate, not an oversight.
+// ParseConfig parses rsyncd.conf content from r. Global parameters before
+// any module header become that module's starting defaults. An
+// unrecognized parameter name is silently ignored; a malformed line or a
+// recognized parameter with an invalid value is a hard error.
 func ParseConfig(r io.Reader) (*Config, error) {
 	lines, err := readLogicalLines(r)
 	if err != nil {

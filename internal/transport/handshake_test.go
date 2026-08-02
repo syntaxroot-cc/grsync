@@ -5,18 +5,13 @@ import (
 	"testing"
 )
 
-// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter, so
-// Handshake (which needs one bidirectional stream, like a real Session)
-// can be driven against an in-memory pipe instead of a real subprocess.
+// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter.
 type pipeReadWriter struct {
 	io.Reader
 	io.Writer
 }
 
 func TestHandshake_PureLogic(t *testing.T) {
-	// Two independent pipes, one per direction, wired crosswise so each
-	// side's writes become the other side's reads - simulating a real
-	// bidirectional Session without spawning a subprocess at all.
 	clientReadsFromServer, serverWritesToClient := io.Pipe()
 	serverReadsFromClient, clientWritesToServer := io.Pipe()
 
@@ -66,9 +61,7 @@ func TestHandshake_RejectsWrongFrameType(t *testing.T) {
 		_ = w.Close()
 	}()
 
-	// Handshake's own outgoing FrameHello is simply discarded here - this
-	// test only cares what happens when the response it reads back isn't
-	// a FrameHelloAck.
+	// Outgoing FrameHello is discarded; only the response matters here.
 	client := pipeReadWriter{Reader: r, Writer: io.Discard}
 	if err := Handshake(client); err == nil {
 		t.Fatalf("Handshake with a non-HelloAck frame returned nil error, want an error")

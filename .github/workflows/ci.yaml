@@ -75,12 +75,15 @@ jobs:
       # windows-latest's own default toolchain without access to a real
       # GitHub Actions runner to test against - so -race runs where it's
       # known-good (Linux), and windows-latest still gets a full,
-      # real, native (not cross-compiled) test run without it. The
-      # actual value -race provides - catching a genuine data race in
-      # this project's own logic (SC-10's progress-reporter goroutine,
-      # SC-6's per-connection daemon handling) - isn't platform-specific
-      # in what it would find, so one platform running it is enough to
-      # get that benefit.
+      # real, native (not cross-compiled) test run without it. This
+      # isn't just checkbox coverage: the first real CI run of this leg
+      # caught a genuine deadlock in syncLocal (internal/cli/sync.go) -
+      # a receiver failure partway through a sync left the sender
+      # goroutine parked forever reading a reply that would never come,
+      # timing out the whole test binary after 10 minutes. The bug ran
+      # fine every time on Windows without -race (the race window never
+      # opened), which is exactly why relying on local, non-race runs
+      # alone would never have caught it.
       - name: go test -race (Linux)
         if: runner.os == 'Linux'
         run: go test -race -timeout 10m ./...

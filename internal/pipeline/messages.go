@@ -1,8 +1,6 @@
 // Package pipeline wires internal/sync (file enumeration, filtering,
 // delta algorithm, attribute preservation) and internal/transport (framed
-// subprocess/SSH connections) together into an actual sync. Neither of
-// those packages imports the other - this package sits above both,
-// importing them, so that layering stays intact.
+// subprocess/SSH connections) together into an actual sync.
 package pipeline
 
 import (
@@ -16,14 +14,8 @@ import (
 )
 
 // Encoding note: every message below is encoded with encoding/gob, not
-// upstream rsync's actual wire protocol. That's a deliberate scope
-// boundary, not an oversight: rsync's real wire format is an intricate,
-// versioned binary protocol, and reimplementing it is a large, separate
-// effort that doesn't belong inside this already-large integration
-// ticket. gob is a reasonable, low-effort, *correct* choice specifically
-// because grsync only ever talks to grsync here, never to real rsync -
-// but true rsync protocol interoperability, if ever wanted, is future
-// work, not something to let "protocol" quietly come to mean "gob."
+// upstream rsync's actual wire protocol - a deliberate scope boundary,
+// since grsync only ever talks to grsync here.
 
 // deltaOpKind tags which sync.DeltaOp variant a wireDeltaOp represents.
 type deltaOpKind byte
@@ -34,10 +26,8 @@ const (
 )
 
 // wireDeltaOp is a wire-safe stand-in for sync.DeltaOp: DeltaOp is a
-// sealed interface (CopyOp/DataOp), which gob cannot encode directly
-// without registering concrete types with the encoder. Converting
-// explicitly to/from this struct is more transparent than relying on
-// gob's interface-registration machinery for just two variants.
+// sealed interface (CopyOp/DataOp), which gob can't encode directly
+// without registering concrete types.
 type wireDeltaOp struct {
 	Kind       deltaOpKind
 	BlockIndex int    // valid when Kind == deltaOpKindCopy
@@ -45,13 +35,10 @@ type wireDeltaOp struct {
 	Length     int    // valid when Kind == deltaOpKindData and the enclosing deltaMessage IS compressed: how many bytes of its decompressed Literal stream belong to this op
 }
 
-// toWireDeltaOps converts ops to their wire form, compressing this
-// file's entire literal-data stream as a single zlib unit when copts
-// calls for it (see deltaMessage's own doc comment for why whole-file,
-// not per-op) - path is only used to check copts.SkipSuffixes, never
-// otherwise. CopyOp block indices are never touched: they're plain
-// integers, not data, and compressing them would only add overhead for
-// nothing.
+// toWireDeltaOps converts ops to their wire form, compressing this file's
+// entire literal-data stream as a single zlib unit when copts calls for
+// it. CopyOp block indices are never compressed, since they're plain
+// integers, not data.
 func toWireDeltaOps(ops []sync.DeltaOp, path string, copts CompressOptions) (wire []wireDeltaOp, compressed bool, literal []byte, err error) {
 	wire = make([]wireDeltaOp, len(ops))
 
@@ -89,9 +76,8 @@ func toWireDeltaOps(ops []sync.DeltaOp, path string, copts CompressOptions) (wir
 }
 
 // fromWireDeltaOps reverses toWireDeltaOps: when compressed is true, it
-// decompresses literal once and re-slices it back into each op's own
-// bytes using the Length each wireDeltaOp carried; otherwise each op's
-// Bytes is used directly, exactly as before compression existed.
+// decompresses literal once and re-slices it back into each op's bytes
+// using the Length each wireDeltaOp carried.
 func fromWireDeltaOps(wire []wireDeltaOp, compressed bool, literal []byte) ([]sync.DeltaOp, error) {
 	var decompressed []byte
 	if compressed {
@@ -127,18 +113,13 @@ func fromWireDeltaOps(wire []wireDeltaOp, compressed bool, literal []byte) ([]sy
 }
 
 // signatureMessage is FrameSignature's payload: one regular file's
-// signature, tagged with its Path. Path is included even though both
-// sides already process the file list in the same agreed-upon order -
-// it's a cheap, valuable consistency check (see recvSignature/recvDelta)
-// against a class of bug (an off-by-one, a dropped frame) that
-// position-only encoding could never detect and would silently
-// misapply one file's delta to another.
+// signature, tagged with Path as a consistency check against an
+// off-by-one or dropped frame silently misapplying one file's delta to
+// another.
 //
-// Append (SC-12's own contribution) tells Sender how to respond to this
-// signature - see appendAction's own doc comment for the three
-// possibilities. It defaults to appendNone (gob's zero value), so every
-// signatureMessage sent before --append/--append-verify existed decodes
-// exactly as it always did.
+// Append tells Sender how to respond to this signature, and defaults to
+// appendNone (gob's zero value), so a signatureMessage sent before
+// --append existed still decodes correctly.
 type signatureMessage struct {
 	Path   string
 	Sig    sync.Signature
@@ -146,43 +127,33 @@ type signatureMessage struct {
 }
 
 // appendAction is carried on a signatureMessage to tell Sender how to
-// respond to it - see receiver.go's own doc comment on where each value
-// gets chosen, and sender.go's own doc comment on how each is handled.
+// respond to it.
 type appendAction byte
 
 const (
-	// appendNone is the normal, pre-SC-12 flow: Sender runs
-	// sync.GenerateDelta against Sig exactly as it always has.
+	// appendNone is the normal flow: Sender runs sync.GenerateDelta
+	// against Sig as usual.
 	appendNone appendAction = iota
-	// appendTail means "the receiver's existing Sig.BlockSize bytes are
-	// blindly trusted, unverified - send only the literal tail past
-	// that offset" (--append). Sig.BlockSize carries that trusted
-	// offset (not a real block size at all here); Sig.Blocks is unused.
-	// See receiver.go for exactly when this is chosen and sender.go for
-	// how it's handled.
+	// appendTail means the receiver's existing Sig.BlockSize bytes are
+	// trusted unverified; only the literal tail past that offset is sent.
+	// Sig.BlockSize carries that trusted offset, not a real block size;
+	// Sig.Blocks is unused.
 	appendTail
-	// appendSkip means "the destination is already at least as long as
-	// the source - don't read or compare anything at all, just
-	// acknowledge with an empty delta" (the --append/--append-verify
-	// "not shorter, skip entirely" eligibility rule).
+	// appendSkip means the destination is already at least as long as the
+	// source: acknowledge with an empty delta without reading or
+	// comparing anything.
 	appendSkip
 )
 
 // deltaMessage is FrameDelta's payload: one regular file's delta ops,
-// tagged with its Path for the same reason as signatureMessage.
+// tagged with Path for the same reason as signatureMessage.
 //
 // Literal holds every DataOp's bytes for this file, zlib-compressed
-// together as a single stream when Compressed is true - each op's own
-// wireDeltaOp.Bytes is left empty in that case, and its Length instead
-// says how many of Literal's decompressed bytes are its (see
-// toWireDeltaOps/fromWireDeltaOps). Compressing the whole file's literal
-// data as one unit, rather than op-by-op, amortizes zlib's fixed ~8-byte
-// header/trailer overhead across the entire file instead of paying it
-// again for every small literal run a scattered-changes file can
-// produce - see compressLiteral's own doc comment. When Compressed is
-// false, Literal is unused (nil) and every op carries its own Bytes
-// directly, exactly the wire shape this type had before --compress
-// existed.
+// together as a single stream when Compressed is true, amortizing zlib's
+// fixed header/trailer overhead across the whole file instead of paying
+// it per op; each wireDeltaOp's Length then says how many of Literal's
+// decompressed bytes are its own. When Compressed is false, Literal is
+// unused and every op carries its own Bytes directly.
 type deltaMessage struct {
 	Path       string
 	Ops        []wireDeltaOp
@@ -205,10 +176,8 @@ func decodeGob(data []byte, v any) error {
 	return nil
 }
 
-// readTypedFrame reads one frame from rw and confirms it has the
-// expected type, translating a FrameError from the peer into a normal Go
-// error along the way so a remote-side failure surfaces as an error here
-// rather than a confusing "wrong frame type" mismatch.
+// readTypedFrame reads one frame from rw and confirms it has the expected
+// type, translating a peer's FrameError into a normal Go error.
 func readTypedFrame(rw io.Reader, want transport.FrameType, what string) (transport.Frame, error) {
 	f, err := transport.ReadFrame(rw)
 	if err != nil {
@@ -224,12 +193,8 @@ func readTypedFrame(rw io.Reader, want transport.FrameType, what string) (transp
 }
 
 // fileListMessage is FrameFileList's payload: the filtered file list plus
-// which entries are hard-linked to each other on the source, so that
-// grouping travels with the list itself rather than needing a separate
-// round trip - HardLinkGroups is empty exactly when there's nothing to
-// say about hard links, either because the source tree has none or
-// because the sending platform can't detect them (sync.HardLinksSupported()
-// is false).
+// which entries are hard-linked to each other, so the grouping travels
+// with the list instead of needing a separate round trip.
 type fileListMessage struct {
 	Entries        []sync.FileEntry
 	HardLinkGroups []sync.HardLinkGroup

@@ -15,36 +15,16 @@ type RemotePath struct {
 	Path string
 }
 
-// ParseRemotePath reports whether s looks like a remote
-// [user@]host:path (or IPv6 [user@][host]:path) endpoint rather than a
-// local filesystem path, returning the parsed form when it does.
+// ParseRemotePath reports whether s is a remote [user@]host:path (or IPv6
+// [user@][host]:path) endpoint rather than a local filesystem path,
+// returning the parsed form when it does.
 //
-// Disambiguation rule, in order:
-//
-//  0. A "://" anywhere in s (e.g. "rsync://host/module") is never this
-//     syntax at all - real [user@]host:path syntax never contains one,
-//     and without this check "rsync://host/module" would otherwise parse
-//     as host "rsync", path "//host/module", which is wrong in a way
-//     that's easy to miss (it "succeeds" instead of failing loudly).
-//     Checked alongside the Windows-drive-letter case below, before any
-//     of the numbered rules that follow ever run.
-//  1. A single ASCII letter immediately followed by ":" (e.g. "C:",
-//     "C:\Users\...") is always a Windows drive letter, never a remote
-//     host - real single-letter hostnames in this position are
-//     vanishingly rare in practice, while grsync runs natively on
-//     Windows (unlike upstream rsync), so this ambiguity has to be
-//     resolved in favor of the overwhelmingly common case.
-//  2. A "/" appearing before the separating ":" means this can't be
-//     [user@]host:path at all - no real hostname contains a "/", so
-//     finding one first proves whatever precedes the colon is a path
-//     segment, not a host (this also naturally handles a "user@" prefix
-//     that isn't really one, e.g. a local path that happens to contain
-//     "@").
-//  3. Otherwise, an "[...]" immediately after any "user@" prefix is an
-//     IPv6 literal - the separating ":" is the one right after the
-//     closing "]", not the first ":" in the string (an IPv6 address is
-//     full of colons itself).
-//  4. Otherwise, the first ":" is the separator.
+// A "://" anywhere disqualifies it (so rsync daemon URLs aren't
+// misparsed as host "rsync"), a leading single-letter drive spec like
+// "C:" is always treated as a Windows path, and a "/" before the
+// separating ":" also disqualifies it since no real hostname contains
+// one. IPv6 hosts must be bracketed, since the address itself is full of
+// colons.
 func ParseRemotePath(s string) (RemotePath, bool) {
 	if s == "" || isWindowsDriveLetterPath(s) || strings.Contains(s, "://") {
 		return RemotePath{}, false

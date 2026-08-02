@@ -5,19 +5,8 @@ import (
 	"testing"
 )
 
-// FuzzReadFrame is a bonus SC-15 target beyond the ticket's own three
-// named ones: the literal "binary parsing of untrusted input" its own
-// rationale describes, one layer below internal/daemon's text-based
-// greeting/auth lines - every transport (local pipe, SSH session, and a
-// daemon connection once its own text handshake ends) reads its actual
-// payload frames through this exact function. The property checked is
-// ReadFrame's own documented safety guarantee: it never panics, and it
-// never attempts to allocate a payload larger than maxFramePayload,
-// regardless of what bytes a corrupted stream or hostile peer sends -
-// precisely the protection SC-13's own TestE2E_ReadBatchOfMalformedFileFailsClearly
-// found catching a garbage --read-batch file cleanly rather than
-// crashing; this fuzz target explores far beyond that one hand-picked
-// case.
+// FuzzReadFrame checks that ReadFrame never panics or over-allocates
+// beyond maxFramePayload on a corrupted or hostile stream.
 func FuzzReadFrame(f *testing.F) {
 	var valid bytes.Buffer
 	_ = WriteFrame(&valid, Frame{Type: FrameFileList, Payload: []byte("hello")})

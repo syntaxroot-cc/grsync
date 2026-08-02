@@ -15,9 +15,7 @@ import (
 )
 
 // runSenderReceiver drives Sender and Receiver concurrently over a pair
-// of io.Pipes wired crosswise, the same in-memory-transport pattern used
-// in internal/transport's own handshake test - no subprocess or SSH
-// needed to validate the pipeline logic itself.
+// of in-memory pipes wired crosswise.
 func runSenderReceiver(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions) {
 	t.Helper()
 
@@ -51,11 +49,7 @@ func runSenderReceiver(t *testing.T, src, dest string, walkOpts sync.WalkOptions
 	}
 }
 
-// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter,
-// the same helper internal/transport's own handshake test defines for
-// itself - duplicated here rather than exported from transport, since
-// it's a small, test-only convenience, not part of either package's
-// real API.
+// pipeReadWriter joins two io.Pipe halves into a single io.ReadWriter.
 type pipeReadWriter struct {
 	io.Reader
 	io.Writer
@@ -120,15 +114,6 @@ func TestSenderReceiver_DestinationOnlyFileIsLeftAlone(t *testing.T) {
 	}
 }
 
-// TestSenderReceiver_VerboseAloneShowsNamesOnly is SC-10's Step 4
-// confirmation, not a reimplementation: SC-11 already wired -v to print
-// real rsync's own "%n%L" (bare path, no itemize code) when Verbose is
-// set without Itemize, but no test ever exercised that combination
-// directly - worth checking explicitly, especially since this exact area
-// (reportChange's gating) turned out to have a real bug introduced while
-// broadening ReceiverOptions.Reporting() for --progress/--stats (see
-// itemize.go's reportChange, which now correctly gates on Itemize/Verbose
-// specifically, not the broader Reporting()).
 func TestSenderReceiver_VerboseAloneShowsNamesOnly(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -149,7 +134,6 @@ func TestSenderReceiver_VerboseAloneShowsNamesOnly(t *testing.T) {
 	if !strings.Contains(output, "sub/nested.txt") {
 		t.Errorf("output = %q, want it to mention sub/nested.txt", output)
 	}
-	// The defining difference from -i: no itemize code prefix at all.
 	if strings.Contains(output, "+++++++++") {
 		t.Errorf("output = %q, want bare paths only (no itemize codes) since Itemize was not requested", output)
 	}
@@ -183,14 +167,6 @@ func TestSenderReceiver_Symlink(t *testing.T) {
 	}
 }
 
-// TestSenderReceiver_DirectoryAttributesSurviveChildCreation is the direct
-// proof for the ordering fix in Receiver: a directory's mtime is set to a
-// deliberately distinctive value at the source. If Receiver applied
-// directory attributes immediately upon creating the directory (before
-// writing its children), the filesystem would silently bump that mtime
-// again the moment the child file inside it gets created afterward,
-// and this test would catch that regression by finding the destination
-// directory's mtime does NOT match the source's.
 func TestSenderReceiver_DirectoryAttributesSurviveChildCreation(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -199,11 +175,7 @@ func TestSenderReceiver_DirectoryAttributesSurviveChildCreation(t *testing.T) {
 	mustMkdirAll(t, srcSub)
 	mustWriteFile(t, filepath.Join(srcSub, "child.txt"), "child content")
 
-	// A deliberately distinctive, easy-to-misidentify-as-"now" mtime, set
-	// on the source directory *after* its child already exists - matching
-	// what a real source tree looks like (the directory's own mtime
-	// reflects whenever it was last deliberately touched, not literally
-	// "the moment before this test ran").
+	// Set after the child already exists, matching a real source tree.
 	wantDirTime := time.Date(2019, time.May, 4, 10, 0, 0, 0, time.UTC)
 	if err := os.Chtimes(srcSub, wantDirTime, wantDirTime); err != nil {
 		t.Fatalf("Chtimes on source directory: %v", err)
@@ -218,32 +190,14 @@ func TestSenderReceiver_DirectoryAttributesSurviveChildCreation(t *testing.T) {
 		t.Fatalf("Stat destination directory: %v", err)
 	}
 	if !info.ModTime().Equal(wantDirTime) {
-		t.Errorf("destination directory ModTime = %v, want %v (likely bumped by child creation - "+
-			"directory attributes must be applied AFTER children are written, not before)",
+		t.Errorf("destination directory ModTime = %v, want %v (likely bumped by child creation)",
 			info.ModTime(), wantDirTime)
 	}
 }
 
-// TestSenderReceiver_HardLinks is SC-18's end-to-end proof, with
-// AttrOptions.HardLinks explicitly requested (the -H/--hard-links
-// opt-in - see TestSenderReceiver_HardLinksNotPreservedWithoutOptIn for
-// the default-off case): two hard-linked source files must arrive at the
-// destination still hard-linked to each other (the same underlying file,
-// not two independent copies that merely happen to have identical
-// content), and an unrelated third file must NOT be linked to either of
-// them. Where this platform can't detect hard links at all (Windows -
-// sync.HardLinksSupported()), the same sync must still succeed and
-// produce byte-correct content - as independent copies, not an error -
-// exactly the graceful-degradation behavior sync.DetectHardLinks itself
-// already documents.
-//
-// os.SameFile is used for the linked/unlinked check rather than
-// platform-specific stat code in the test itself: it reports genuine
-// same-file identity on every platform Go supports, including Windows
-// (via the Win32 file index), even though grsync's own hard-link
-// *detection* can't see that identity there - so this test can assert
-// the real, portable ground truth regardless of what grsync itself was
-// able to observe.
+// TestSenderReceiver_HardLinks also covers graceful degradation on a
+// platform where sync.HardLinksSupported() is false: the sync must still
+// succeed, as independent copies rather than an error.
 func TestSenderReceiver_HardLinks(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -294,9 +248,8 @@ func TestSenderReceiver_HardLinks(t *testing.T) {
 		t.Fatalf("%q and %q are independent files at the destination, want them hard-linked (same underlying file) like they are at the source", destOriginal, destLinked)
 	}
 
-	// Prove it directly, not just via os.SameFile: a write through one
-	// path must be visible through the other, the same proof
-	// internal/sync's own TestApplyHardLinks uses.
+	// Prove it directly: a write through one path must be visible through
+	// the other.
 	if err := os.WriteFile(destLinked, []byte("changed via the linked path"), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q): %v", destLinked, err)
 	}
@@ -309,15 +262,6 @@ func TestSenderReceiver_HardLinks(t *testing.T) {
 	}
 }
 
-// TestSenderReceiver_HardLinksNotPreservedWithoutOptIn is
-// TestSenderReceiver_HardLinks's counterpart for the default case:
-// without AttrOptions.HardLinks set, hard-linked source files must sync
-// as independent copies - correct content, but not linked - even on a
-// platform that could have detected and preserved the relationship. This
-// is the direct proof that hard-link detection is genuinely opt-in
-// (matching real rsync's own -H/--hard-links, not implied by any other
-// flag), not just documented as opt-in while actually running
-// unconditionally.
 func TestSenderReceiver_HardLinksNotPreservedWithoutOptIn(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -347,12 +291,8 @@ func TestSenderReceiver_HardLinksNotPreservedWithoutOptIn(t *testing.T) {
 	}
 }
 
-// runSenderReceiverWithOptions is runSenderReceiver's counterpart for
-// tests that need control over ReceiverOptions (dry-run, itemize
-// reporting) - kept as a separate helper rather than adding a parameter
-// to runSenderReceiver itself, since none of that function's many
-// existing callers care, and ReceiverOptions{} (real writes, no
-// reporting) is exactly what they already get.
+// runSenderReceiverWithOptions is runSenderReceiver with control over
+// ReceiverOptions.
 func runSenderReceiverWithOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions) {
 	t.Helper()
 
@@ -386,19 +326,10 @@ func runSenderReceiverWithOptions(t *testing.T, src, dest string, walkOpts sync.
 	}
 }
 
-// runSenderReceiverWithCompressOptions is runSenderReceiverWithOptions's
-// counterpart for tests that need control over the sender's compression
-// behavior - kept separate for the same reason runSenderReceiverWithOptions
-// itself was (see its own doc comment): none of the many existing
-// runSenderReceiver/runSenderReceiverWithOptions callers care about
-// compression, so Sender's CompressOptions parameter stays defaulted to
-// CompressOptions{} (disabled) in those two instead of forcing every
-// existing call site to pass one.
-//
-// Returns the number of bytes Sender actually wrote to the connection
-// (via the same countingReadWriter Stats itself uses - see stats.go), so
-// callers can compare compressed vs. uncompressed wire size against real
-// bytes sent, not just trust that the flag was read.
+// runSenderReceiverWithCompressOptions is runSenderReceiverWithOptions
+// with control over Sender's CompressOptions. Returns the number of bytes
+// Sender actually wrote to the connection, so callers can compare
+// compressed vs. uncompressed wire size.
 func runSenderReceiverWithCompressOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions, copts CompressOptions) (bytesWritten int64) {
 	t.Helper()
 
@@ -434,12 +365,6 @@ func runSenderReceiverWithCompressOptions(t *testing.T, src, dest string, walkOp
 	return sender.written
 }
 
-// TestSenderReceiver_CompressReducesWireBytesForCompressibleContent is
-// SC-9's core end-to-end proof: syncing the exact same highly-compressible
-// file with --compress enabled must write genuinely fewer bytes to the
-// wire than syncing it uncompressed, and the destination content must
-// still come out byte-identical to the source either way - compression
-// must never be observable in the result, only in the traffic.
 func TestSenderReceiver_CompressReducesWireBytesForCompressibleContent(t *testing.T) {
 	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000) // ~90KB, highly compressible
 
@@ -462,13 +387,6 @@ func TestSenderReceiver_CompressReducesWireBytesForCompressibleContent(t *testin
 	assertSameContent(t, filepath.Join(compressedSrc, "big.txt"), filepath.Join(compressedDest, "big.txt"))
 }
 
-// TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed proves
-// --skip-compress end to end, not just at the wire-message level
-// (TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed already
-// covers that): a highly-compressible file whose suffix is skip-listed
-// must write essentially the same number of bytes as a fully-disabled
-// compression run, while an identical file whose suffix is NOT
-// skip-listed, synced in the same run, still compresses.
 func TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed(t *testing.T) {
 	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000)
 
@@ -484,12 +402,8 @@ func TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed(t *testing.
 		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{},
 		CompressOptions{Enabled: true, Level: DefaultCompressLevel, SkipSuffixes: []string{"bin"}})
 
-	// Not asserting exact equality - gob framing overhead can vary by a
-	// handful of bytes for unrelated reasons - but a skipped file must be
-	// nowhere near as small as a genuinely compressed one would be; the
-	// compressible-content test above already shows compression more than
-	// halving a similarly-sized file, so any close-to-baseline result here
-	// is conclusive that skip-compress actually took effect.
+	// Not exact equality (gob framing overhead varies slightly), but a
+	// skipped file must stay close to the uncompressed baseline.
 	if skipBytes < baselineBytes*9/10 {
 		t.Errorf("skip-listed file wrote %d bytes, baseline (uncompressed) wrote %d bytes, want them close - skip-compress should have left this file uncompressed", skipBytes, baselineBytes)
 	}
@@ -497,22 +411,8 @@ func TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed(t *testing.
 	assertSameContent(t, filepath.Join(src, "skip.bin"), filepath.Join(dest, "skip.bin"))
 }
 
-// TestReceiver_StatsBytesReceivedReflectCompressedSize confirms Step 5's
-// stats convention: real rsync's own "Total bytes sent"/"Total bytes
-// received" measure what actually crossed the wire, which - once
-// --compress is in play - genuinely is the compressed size, not the
-// original file size. stats.go's countingReadWriter already wraps the
-// raw connection needing no changes for this (see its own doc comment);
-// this test is the proof that holds end to end, not just an inspection
-// of the code.
-//
-// It's specifically "Total bytes received" (not "sent") that carries the
-// file's compressible data here: Stats is computed on the Receiver side
-// (SC-10's own design - see stats.go), and Receiver receives the file
-// list and delta payloads from Sender while only ever sending small
-// signature/ack messages back - so the large, compression-sensitive
-// traffic flows in the "received" direction from this side's own point
-// of view, not "sent".
+// Uses "Total bytes received" since Stats is computed receiver-side, and
+// the compressible payload flows from Sender to Receiver.
 func TestReceiver_StatsBytesReceivedReflectCompressedSize(t *testing.T) {
 	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000)
 
@@ -539,20 +439,15 @@ func TestReceiver_StatsBytesReceivedReflectCompressedSize(t *testing.T) {
 			"stats must reflect actual wire bytes, not original file size", compressedReceived, uncompressedReceived)
 	}
 
-	// Total file size is a property of the files themselves, unaffected by
-	// compression - the two runs synced byte-identical content, so this
-	// field specifically must match despite bytes sent differing.
+	// Total file size is unaffected by compression, unlike bytes sent.
 	if got, want := statsField(t, compressedOut.String(), "Total file size"), statsField(t, uncompressedOut.String(), "Total file size"); got != want {
 		t.Errorf("Total file size = %d with compression, %d without, want equal - compression must not affect this field", got, want)
 	}
 }
 
 // runSenderReceiverWithCompressAndReceiverOptions combines
-// runSenderReceiverWithCompressOptions and runSenderReceiverWithOptions'
-// separate concerns (compression behavior and receiver-side reporting)
-// for the one test above that needs both at once, rather than growing
-// either of those two into a shared do-everything helper every other
-// caller would need to pass zero values through.
+// runSenderReceiverWithCompressOptions and runSenderReceiverWithOptions
+// for tests needing both compression and receiver-side reporting control.
 func runSenderReceiverWithCompressAndReceiverOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions, copts CompressOptions) {
 	t.Helper()
 
@@ -586,12 +481,6 @@ func runSenderReceiverWithCompressAndReceiverOptions(t *testing.T, src, dest str
 	}
 }
 
-// TestSenderReceiver_CompressWorksWithDryRun confirms Step 5's dry-run
-// interaction: the signature/delta exchange (including compression of
-// the delta's literal data) still needs to run byte-correct for accurate
-// itemize output even though nothing is written - compression must not
-// break that, and the dry-run destination must still end up completely
-// empty.
 func TestSenderReceiver_CompressWorksWithDryRun(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -617,13 +506,6 @@ func TestSenderReceiver_CompressWorksWithDryRun(t *testing.T) {
 	}
 }
 
-// TestSenderReceiver_CompressWorksWithHardLinks confirms Step 5's
-// hard-link interaction: a hard-link group's secondary members never go
-// through the signature/delta exchange at all (Sender/Receiver both skip
-// them outright), so --compress is moot for them by construction: this
-// test's only job is to confirm that skip still holds correctly with
-// --compress enabled, i.e. compression didn't somehow reintroduce a
-// signature/delta round trip for a secondary member.
 func TestSenderReceiver_CompressWorksWithHardLinks(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -657,15 +539,9 @@ func TestSenderReceiver_CompressWorksWithHardLinks(t *testing.T) {
 	}
 }
 
-// TestSenderReceiver_CompressWorksWithEmptyAndUnchangedFiles is a
-// self-review edge case: toWireDeltaOps only attempts compression when a
-// file's concatenated literal data is non-empty (see its own doc
-// comment), so a brand-new empty file (zero DataOps, per SC-10's own
-// investigation into ApplyDelta's accumulator) and a byte-identical
-// unchanged file (all CopyOps, zero DataOps) both take the "nothing to
-// compress" path through that same function - this confirms both still
-// sync correctly with --compress enabled, not just that compressible
-// content does.
+// Covers the edge case where toWireDeltaOps' "nothing to compress" path
+// is taken: an empty file (zero DataOps) and an unchanged file (all
+// CopyOps).
 func TestSenderReceiver_CompressWorksWithEmptyAndUnchangedFiles(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -684,11 +560,8 @@ func TestSenderReceiver_CompressWorksWithEmptyAndUnchangedFiles(t *testing.T) {
 }
 
 // buildRichTree creates a source tree exercising every write path
-// Receiver has: a top-level file, a nested directory with a file inside
-// it, a symlink, and (best-effort - silently omitted if unsupported in
-// this environment) two hard-linked files - so a dry-run test against it
-// genuinely exercises all eight audited write call sites from Receiver's
-// own doc comment, not just the easy ones.
+// Receiver has: a file, a nested directory with a file, a symlink, and
+// (best-effort) two hard-linked files.
 func buildRichTree(t *testing.T, root string) {
 	t.Helper()
 	mustWriteFile(t, filepath.Join(root, "top.txt"), "top level content")
@@ -703,17 +576,6 @@ func buildRichTree(t *testing.T, root string) {
 	}
 }
 
-// TestReceiver_DryRunMakesNoFilesystemChanges is SC-11's single most
-// important test: a dry-run sync against a completely empty destination
-// must leave it completely empty afterward - not just "no error was
-// returned." buildRichTree's source is specifically built to exercise
-// every one of Receiver's eight audited write call sites (two regular-
-// file MkdirAlls plus a WriteFile, a symlink's MkdirAll plus
-// ApplyAttributes - which itself calls os.Symlink, not just chmod/
-// chtimes - a directory's deferred ApplyAttributes, and
-// ApplyHardLinks); if any one of them were reachable despite DryRun
-// being set, this test catches it directly, by finding something in
-// destRoot that shouldn't be there, rather than trusting the audit alone.
 func TestReceiver_DryRunMakesNoFilesystemChanges(t *testing.T) {
 	srcRoot := t.TempDir()
 	destRoot := t.TempDir()
@@ -733,13 +595,9 @@ func TestReceiver_DryRunMakesNoFilesystemChanges(t *testing.T) {
 	}
 }
 
-// TestReceiver_DryRunItemizeMatchesRealRunItemize is real rsync's own
-// documented dry-run guarantee, made concrete: "The output of
-// --itemize-changes is supposed to be exactly the same on a dry run and
-// a subsequent real run" (rsync.1's --dry-run section) - compared here
-// against a real run on a *separate*, equally fresh destination, not a
-// second real run against the same one (which would legitimately report
-// nothing left to do, proving nothing about the dry run's accuracy).
+// Checks real rsync's documented guarantee that --itemize-changes output
+// is identical between a dry run and a real run, comparing against a
+// real run on a separate, equally fresh destination.
 func TestReceiver_DryRunItemizeMatchesRealRunItemize(t *testing.T) {
 	srcRoot := t.TempDir()
 	buildRichTree(t, srcRoot)
@@ -766,10 +624,6 @@ func TestReceiver_DryRunItemizeMatchesRealRunItemize(t *testing.T) {
 			dryRunOutput.String(), realRunOutput.String())
 	}
 
-	// The dry run's destination must still be untouched - what makes the
-	// comparison above meaningful in the first place: if the dry run had
-	// actually written files, it wouldn't be comparable to a real run
-	// against a genuinely fresh destination at all.
 	entries, err := os.ReadDir(dryRunDest)
 	if err != nil {
 		t.Fatalf("ReadDir(dryRunDest): %v", err)
@@ -779,22 +633,12 @@ func TestReceiver_DryRunItemizeMatchesRealRunItemize(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppliesHardLinksFromReceivedGroups exercises Receiver's
-// hard-link handling directly against a hand-built file list, the same
-// way TestReceiver_ConnectionDropsMidTransfer drives Receiver against a
-// raw peer goroutine rather than a real Sender. This matters on a
-// platform where sync.HardLinksSupported() is false (Windows): Receiver's
-// own linking logic - skip a group's secondary members in the main loop,
-// link them once their primary is written - has nothing to do with
-// whether *this* platform's Sender could have detected the grouping, so
-// it can and should be verified directly, standing in for whatever
-// Sender a real Linux/macOS peer would be running.
-//
-// The peer goroutine responds to a signature request for "original.txt"
-// only; if Receiver incorrectly asked for a signature for "linked.txt"
-// too (i.e. failed to skip it as a secondary member), nothing would ever
-// answer that second request and the test would time out rather than
-// silently pass.
+// TestReceiver_AppliesHardLinksFromReceivedGroups drives Receiver
+// directly against a hand-built file list, so hard-link handling is
+// verified even on a platform where Sender itself can't detect them
+// (Windows). If Receiver failed to skip a secondary member, the peer
+// goroutine below would never see its signature request and the test
+// would time out rather than silently pass.
 func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 	destRoot := t.TempDir()
 
@@ -802,11 +646,8 @@ func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 	receiverReadsFromPeer, peerWritesToReceiver := io.Pipe()
 	receiver := pipeReadWriter{Reader: receiverReadsFromPeer, Writer: receiverWritesToPeer}
 
-	// Named so the alphabetical sort order sync.DetectHardLinks itself
-	// would produce is obvious at a glance: "aaa-primary.txt" sorts
-	// first, so it's group[0] - the member Receiver writes normally -
-	// and "zzz-secondary.txt" is the one that must be skipped and linked
-	// instead.
+	// aaa-primary.txt sorts first, so it's group[0] (written normally);
+	// zzz-secondary.txt must be skipped and linked instead.
 	const content = "shared content, sent once for the whole group"
 	entries := []sync.FileEntry{
 		{Path: "aaa-primary.txt", Mode: 0o644, Size: int64(len(content))},
@@ -904,11 +745,6 @@ func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 	}
 }
 
-// TestSender_ConnectionDropsMidTransfer confirms a dropped connection
-// produces a prompt, clear error - not a hang and not a silently
-// swallowed failure. The "receiver" here reads the file list (so Sender
-// gets past that point) and then closes its side without ever sending a
-// signature, simulating a connection that dies mid-transfer.
 func TestSender_ConnectionDropsMidTransfer(t *testing.T) {
 	srcRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(srcRoot, "file.txt"), "content that will never get a delta exchanged for it")
@@ -918,10 +754,7 @@ func TestSender_ConnectionDropsMidTransfer(t *testing.T) {
 	sender := pipeReadWriter{Reader: senderReadsFromPeer, Writer: senderWritesToPeer}
 
 	go func() {
-		// Read (and discard) exactly the file list frame, then vanish -
-		// close both pipe halves without ever sending a signature back,
-		// simulating a connection that dies immediately after the initial
-		// exchange.
+		// Read the file list, then vanish without ever sending a signature.
 		_, _ = transport.ReadFrame(peerReadsFromSender)
 		_ = peerWritesToSender.Close()
 		_ = peerReadsFromSender.Close()
@@ -942,10 +775,6 @@ func TestSender_ConnectionDropsMidTransfer(t *testing.T) {
 	}
 }
 
-// TestReceiver_ConnectionDropsMidTransfer is TestSender_ConnectionDropsMidTransfer's
-// counterpart for the other direction: the "sender" here sends a valid
-// file list, then vanishes without ever responding to the signature
-// Receiver sends back.
 func TestReceiver_ConnectionDropsMidTransfer(t *testing.T) {
 	destRoot := t.TempDir()
 
@@ -955,9 +784,7 @@ func TestReceiver_ConnectionDropsMidTransfer(t *testing.T) {
 
 	go func() {
 		_ = sendFileList(peerWritesToReceiver, []sync.FileEntry{{Path: "file.txt", Mode: 0o644}}, nil)
-		// Read (and discard) the signature Receiver sends back for
-		// file.txt, then vanish - closing both pipe halves without ever
-		// sending a delta.
+		// Read the signature, then vanish without ever sending a delta.
 		_, _ = transport.ReadFrame(peerReadsFromReceiver)
 		_ = peerWritesToReceiver.Close()
 		_ = peerReadsFromReceiver.Close()

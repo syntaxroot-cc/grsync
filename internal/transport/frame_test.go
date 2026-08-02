@@ -62,9 +62,6 @@ func TestWriteReadFrame_MultipleFramesInSequence(t *testing.T) {
 		}
 	}
 
-	// The stream must be fully consumed - proves frame boundaries were
-	// tracked correctly rather than one frame's read accidentally
-	// consuming into the next frame's bytes (or leaving some behind).
 	if buf.Len() != 0 {
 		t.Errorf("%d bytes left unread after consuming all frames", buf.Len())
 	}

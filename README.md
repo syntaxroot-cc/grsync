@@ -1589,14 +1589,21 @@ matters as much as its size for real throughput.
 Windows runners. `-race` runs on the Linux leg only: it requires cgo and
 a C toolchain, reliably available on `ubuntu-latest` but not something
 this project can verify for `windows-latest` without a real runner to
-test against, and the races it would actually catch (SC-10's
-progress-reporter goroutine, SC-6's per-connection daemon handling)
-aren't platform-specific in nature, so one reliable platform is enough.
-The Linux leg also installs a real `rsync` binary so the comparison tests
-above get a genuine execution somewhere in CI, not just a proof they can
-skip; the Windows leg has no equivalent easy install and instead
-exercises the graceful-skip path, matching a real Windows dev machine
-without rsync.
+test against. This isn't theoretical - the first real CI run of this leg
+caught a genuine deadlock in `syncLocal` (`internal/cli/sync.go`): a
+receiver failure partway through a sync left the sender goroutine parked
+forever reading a reply that would never come, timing out the whole test
+binary after 10 minutes. The same test passed instantly, every time, on
+Windows without `-race` - the race window only opened under `-race`'s own
+added scheduling overhead - which is exactly why local, non-race runs
+alone would never have caught it. (Fixed by having both `syncLocal`
+goroutines close the pipe halves they own, with `CloseWithError`, once
+they're done - see the function's own comments for the full
+explanation.) The Linux leg also installs a real `rsync` binary so the
+comparison tests above get a genuine execution somewhere in CI, not just
+a proof they can skip; the Windows leg has no equivalent easy install and
+instead exercises the graceful-skip path, matching a real Windows dev
+machine without rsync.
 
 ## Architecture
 

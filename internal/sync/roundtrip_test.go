@@ -5,13 +5,9 @@ import (
 	"testing"
 )
 
-// TestRoundTrip runs the full receiver/sender/receiver cycle for each
-// case: generate a Signature from the old file, generate a delta from
-// (old, new) against that signature, apply the delta to the old file, and
-// confirm the result is byte-for-byte identical to the new file. This is
-// the property the whole algorithm exists to guarantee - none of the
-// individual-step tests elsewhere in this package substitute for actually
-// proving the full cycle reproduces the target file exactly.
+// TestRoundTrip generates a Signature from the old file, generates a delta
+// from (old, new) against it, applies the delta to the old file, and
+// confirms the result is byte-for-byte identical to the new file.
 func TestRoundTrip(t *testing.T) {
 	const blockSize = 8
 

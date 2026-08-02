@@ -6,44 +6,26 @@ import (
 	"io"
 )
 
-// FrameType tags what kind of message a Frame carries, so a single
-// stdin/stdout byte stream can multiplex different message kinds (file
-// list entries, signatures, delta ops, control messages) without a
-// separate channel for each.
+// FrameType tags what kind of message a Frame carries.
 type FrameType byte
 
 const (
-	// FrameHello and FrameHelloAck are the minimal --server handshake:
-	// the client sends FrameHello, the server replies with FrameHelloAck.
+	// FrameHello is the client's handshake greeting.
 	FrameHello FrameType = iota
 	// FrameHelloAck is the server's reply to FrameHello.
 	FrameHelloAck
-	// FrameError carries a human-readable error message from one side to
-	// the other, rather than the connection just dying silently.
+	// FrameError carries a human-readable error message from one side to the other.
 	FrameError
-	// FrameFileList carries a gob-encoded []sync.FileEntry, sent once by
-	// the sender after a successful handshake: the filtered list of
-	// everything it intends to sync. internal/pipeline owns the encoding;
-	// this package only tags and frames the bytes.
+	// FrameFileList carries a gob-encoded []sync.FileEntry.
 	FrameFileList
-	// FrameSignature carries a gob-encoded per-file signature, sent by
-	// the receiver for each regular-file entry in the list it received -
-	// proactively, in list order, not in response to a separate request
-	// message (the file list itself is the implicit request for all of
-	// them).
+	// FrameSignature carries a gob-encoded per-file signature.
 	FrameSignature
-	// FrameDelta carries a gob-encoded per-file delta (the sender's reply
-	// to a FrameSignature), in the same list order.
+	// FrameDelta carries a gob-encoded per-file delta.
 	FrameDelta
 )
 
-// maxFramePayload bounds how large a single frame's payload may be. A
-// length prefix isn't validated against anything else in this protocol
-// (there's no higher-level "expected size" to check it against), so
-// without a cap, a corrupted stream or a hostile peer could send a
-// length like 0xFFFFFFFF and force ReadFrame to attempt a multi-gigabyte
-// allocation before ever reading a single payload byte. 64 MiB is
-// comfortably larger than any frame type this ticket defines needs.
+// maxFramePayload bounds a frame's payload size so a corrupted or hostile
+// length prefix can't force an oversized allocation before any data is read.
 const maxFramePayload = 64 * 1024 * 1024
 
 // Frame is a single multiplexed protocol message.

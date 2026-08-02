@@ -58,9 +58,6 @@ func TestWalk_Symlink(t *testing.T) {
 
 	linkPath := filepath.Join(root, "link.txt")
 	if err := os.Symlink("real.txt", linkPath); err != nil {
-		// Creating symlinks on Windows requires Developer Mode or an
-		// elevated process; treat that as "unsupported here", not a
-		// failure, rather than forcing every environment to be elevated.
 		t.Skipf("symlink creation unsupported in this environment: %v", err)
 	}
 
@@ -89,18 +86,13 @@ func TestWalk_Symlink(t *testing.T) {
 		t.Errorf("link.txt: LinkTarget = %q, want %q", link.LinkTarget, "real.txt")
 	}
 
-	// The symlink must not have been followed: its own Size should reflect
-	// the length of the link text, not the 5-byte target file's contents.
+	// Must not have been followed: Size should reflect the link text, not
+	// the 5-byte target file.
 	if link.Size == 5 {
 		t.Errorf("link.txt: Size = %d looks like the resolved target's size, want the symlink's own size", link.Size)
 	}
 }
 
-// TestLstatEntry_MatchesWalk confirms LstatEntry and Walk build identical
-// FileEntry data for the same path (everything except Path itself, which
-// Walk fills in as root-relative and LstatEntry deliberately leaves
-// empty) - proving the extracted buildFileEntry helper didn't silently
-// diverge between the two call sites.
 func TestLstatEntry_MatchesWalk(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "file.txt"), "content")
@@ -210,8 +202,6 @@ func TestWalk_OwnershipAvailable(t *testing.T) {
 	}
 	entry := entries[0]
 
-	// Windows has no POSIX uid/gid concept; every other platform this repo
-	// builds for does (see uidgid_unix.go / uidgid_windows.go).
 	wantAvailable := runtime.GOOS != "windows"
 	if entry.OwnershipAvailable != wantAvailable {
 		t.Errorf("OwnershipAvailable = %v, want %v (GOOS=%s)", entry.OwnershipAvailable, wantAvailable, runtime.GOOS)
@@ -258,9 +248,7 @@ func TestWalk_VaryingFileSizes(t *testing.T) {
 func TestWalk_DeterministicSortOrder(t *testing.T) {
 	root := t.TempDir()
 
-	// Create files in an order that does not match their sorted order, so a
-	// pass would only happen if Walk actually sorts rather than incidentally
-	// returning creation order or directory-read order.
+	// Created out of sorted order so a pass requires Walk to actually sort.
 	for _, name := range []string{"charlie.txt", "alpha.txt", "bravo.txt", "delta.txt"} {
 		mustWriteFile(t, filepath.Join(root, name), name)
 	}

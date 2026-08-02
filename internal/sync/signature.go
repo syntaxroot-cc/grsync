@@ -10,13 +10,11 @@ type BlockSignature struct {
 	Strong [md5.Size]byte
 }
 
-// Signature is an ordered list of per-block checksums for a file, plus
-// the block size used to produce them. BlockSize travels with the
-// checksums (rather than being a separate parameter callers must keep in
-// sync) because delta generation and reconstruction both need to know
-// exactly how the blocks were cut - a mismatched block size would make
-// every checksum meaningless. A block's position in Blocks is its index,
-// which is how a CopyOp (see delta.go) refers back to it.
+// Signature is an ordered list of per-block checksums for a file, plus the
+// block size used to produce them. BlockSize travels with the checksums
+// rather than being a separate parameter, since a mismatched block size
+// would make every checksum meaningless. A block's position in Blocks is
+// its index, which is how a CopyOp (see delta.go) refers back to it.
 type Signature struct {
 	BlockSize int
 	Blocks    []BlockSignature

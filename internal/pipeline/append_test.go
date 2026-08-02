@@ -55,23 +55,12 @@ func TestAppendTailOps_ExactMatchOmitsDataOp(t *testing.T) {
 	opsEqual(t, ops, []sync.DeltaOp{sync.CopyOp{BlockIndex: 0}})
 }
 
-// TestAppendTailOps_DiminishedFileReturnsError is the "diminished file"
-// race real rsync itself warns about (source shrank below what the
-// receiver already trusted) - grsync treats it as a hard error rather
-// than real rsync's own skip-with-warning, a disclosed, deliberate
-// simplification (see appendTailOps' own doc comment).
 func TestAppendTailOps_DiminishedFileReturnsError(t *testing.T) {
 	if _, err := appendTailOps(100, []byte("short")); err == nil {
 		t.Error("appendTailOps with a source shorter than the trusted length returned nil error, want an error")
 	}
 }
 
-// TestReceiver_AppendTransfersOnlyNewTail is --append's core wire-level
-// proof: a destination file that's a genuine prefix of the source must
-// end up correct, while sending meaningfully fewer bytes than a full
-// re-transfer would need - proving the existing prefix was never
-// resent as literal data, not just that the final content happens to be
-// right.
 func TestReceiver_AppendTransfersOnlyNewTail(t *testing.T) {
 	prefix := strings.Repeat("already on disk, must not be resent ", 100)
 	tail := strings.Repeat("brand new tail data ", 100)
@@ -86,14 +75,9 @@ func TestReceiver_AppendTransfersOnlyNewTail(t *testing.T) {
 
 	assertSameContent(t, filepath.Join(appendSrc, "growing.log"), filepath.Join(appendDest, "growing.log"))
 
-	// Baseline: the exact same transfer with no append mode at all, which
-	// still needs to run the full weak/strong rolling-checksum block scan
-	// (real, genuine work, not literal retransmission) - --append is
-	// specifically about skipping the SIGNATURE exchange for the prefix
-	// entirely (see sender.go's own appendTailOps), not just about the
-	// resulting delta happening to be efficient, so this baseline mainly
-	// confirms append mode isn't somehow *more* expensive; the literal-data
-	// byte count comparison below is append's real, direct proof.
+	// Baseline: the same transfer without append mode, mainly to confirm
+	// append isn't somehow more expensive; the literal-data byte count
+	// comparison below is append's real, direct proof.
 	normalSrc, normalDest := t.TempDir(), t.TempDir()
 	mustWriteFile(t, filepath.Join(normalSrc, "growing.log"), full)
 	mustWriteFile(t, filepath.Join(normalDest, "growing.log"), prefix)
@@ -104,9 +88,8 @@ func TestReceiver_AppendTransfersOnlyNewTail(t *testing.T) {
 		t.Errorf("--append wrote %d bytes, normal delta-transfer wrote %d bytes, want --append no larger", appendBytes, normalBytes)
 	}
 
-	// The direct proof: --stats' own "Literal data" field for the append
-	// run must equal exactly len(tail) - if the prefix had been resent as
-	// literal data too, this would be much larger.
+	// "Literal data" must equal exactly len(tail): if the prefix had been
+	// resent as literal data too, this would be much larger.
 	var out bytes.Buffer
 	statsSrc, statsDest := t.TempDir(), t.TempDir()
 	mustWriteFile(t, filepath.Join(statsSrc, "growing.log"), full)
@@ -119,13 +102,6 @@ func TestReceiver_AppendTransfersOnlyNewTail(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppendDoesNotVerifyCorruptedPrefix is the self-review's
-// own explicit ask made concrete: --append's documented real-rsync risk
-// ("can be dangerous if you aren't 100% sure... existing content...is
-// also known to be the same") is reproduced faithfully here, not
-// silently made safer or worse - a WRONG existing prefix is blindly
-// trusted and the final file ends up with that wrong prefix intact, not
-// silently corrected and not aborted with an error either.
 func TestReceiver_AppendDoesNotVerifyCorruptedPrefix(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 	realContent := "AAAAAAAAAA" + "tail data that gets appended"
@@ -147,11 +123,6 @@ func TestReceiver_AppendDoesNotVerifyCorruptedPrefix(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppendVerifyDetectsCorruptedPrefix is
-// TestReceiver_AppendDoesNotVerifyCorruptedPrefix's --append-verify
-// counterpart: the exact same corrupted-prefix scenario must instead
-// produce a fully correct result, proving verification actually caught
-// and fixed the mismatch rather than blindly trusting it.
 func TestReceiver_AppendVerifyDetectsCorruptedPrefix(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 	realContent := strings.Repeat("A", 1400) + "tail data that gets appended, well past one block"
@@ -166,12 +137,6 @@ func TestReceiver_AppendVerifyDetectsCorruptedPrefix(t *testing.T) {
 	assertSameContent(t, filepath.Join(srcRoot, "file.txt"), filepath.Join(destRoot, "file.txt"))
 }
 
-// TestReceiver_AppendSkipsDestinationNotShorterThanSource is real
-// rsync's own documented eligibility rule made concrete: a destination
-// that's already at least as long as the source must be left completely
-// untouched, even though its content genuinely differs from the
-// source's - --append/--append-verify unconditionally skip such files
-// rather than comparing and possibly updating them.
 func TestReceiver_AppendSkipsDestinationNotShorterThanSource(t *testing.T) {
 	for _, ropts := range []ReceiverOptions{{Append: true}, {AppendVerify: true}} {
 		srcRoot, destRoot := t.TempDir(), t.TempDir()
@@ -191,12 +156,6 @@ func TestReceiver_AppendSkipsDestinationNotShorterThanSource(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppendTransfersBrandNewFileNormally confirms real
-// rsync's own documented "new files are transferred" rule: append
-// semantics only ever apply to an EXISTING, shorter destination file -
-// a file that doesn't exist yet at the destination is transferred
-// completely normally under --append/--append-verify, not skipped and
-// not specially handled.
 func TestReceiver_AppendTransfersBrandNewFileNormally(t *testing.T) {
 	for _, ropts := range []ReceiverOptions{{Append: true}, {AppendVerify: true}} {
 		srcRoot, destRoot := t.TempDir(), t.TempDir()
@@ -209,9 +168,6 @@ func TestReceiver_AppendTransfersBrandNewFileNormally(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppendWorksWithDryRun confirms Step 4's dry-run
-// requirement: the append-aware signature/delta exchange still runs (for
-// accurate itemize planning), but no file is created or modified.
 func TestReceiver_AppendWorksWithDryRun(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 	mustWriteFile(t, filepath.Join(srcRoot, "growing.log"), "prefixTAIL")
@@ -244,13 +200,6 @@ func TestReceiver_AppendWorksWithDryRun(t *testing.T) {
 	}
 }
 
-// TestReceiver_AppendExcludesHardLinkSecondaryMembers locks in Step 4's
-// hard-link requirement: a hard-link group's secondary member never goes
-// through the signature/delta exchange at all (it's linked directly from
-// the group's first member instead - see Receiver's own hard-link pass),
-// so --append is structurally moot for it, not specially excluded by any
-// append-specific code. This test's real job is proving that structural
-// fact still holds with --append enabled, not just documenting it.
 func TestReceiver_AppendExcludesHardLinkSecondaryMembers(t *testing.T) {
 	srcRoot, destRoot := t.TempDir(), t.TempDir()
 

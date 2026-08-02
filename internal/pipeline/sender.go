@@ -11,33 +11,19 @@ import (
 )
 
 // Sender runs the sending side of a sync over rw: walks and filters src,
-// detects which entries are hard-linked to each other (only if
-// hardLinks is true - see below), sends the resulting file list (with
-// that grouping attached), then for each regular-file entry that isn't a
-// secondary member of a hard-link group receives the receiver's
-// signature, computes a delta against the current source bytes, and
-// sends it back.
+// detects hard links (if hardLinks is true), sends the resulting file
+// list, then for each regular-file entry that isn't a hard-link group's
+// secondary member, receives the receiver's signature, computes a delta
+// against the current source bytes, and sends it back.
 //
-// Directories and symlinks are deliberately not part of this exchange at
-// all: a directory has no byte content to diff, and a symlink's entire
-// "content" is its LinkTarget, which already travels inside the FileEntry
-// in the file list itself. A hard-linked group's second-and-later members
-// are skipped the same way, for a different reason: their data is
-// byte-identical to the group's first member by definition (they're the
-// same inode), so exchanging a signature/delta for them would just
-// re-transfer bytes the receiver is about to get for free via
-// sync.ApplyHardLinks instead.
+// Directories and symlinks never exchange a signature/delta: a directory
+// has no content to diff, and a symlink's content already travels as its
+// LinkTarget in the file list. A hard-link group's secondary members are
+// skipped too, since they're byte-identical to the first member by
+// definition; the receiver relinks them instead via sync.ApplyHardLinks.
 //
-// hardLinks mirrors real rsync's own -H/--hard-links flag: off by
-// default, and deliberately not implied by --archive (real rsync's -a is
-// -rlptgoD, no H) - detecting hard links means an extra Lstat per entry,
-// a cost real rsync doesn't spend unless asked to, so grsync doesn't
-// either.
-//
-// copts governs --compress/-z: entirely a sending-side decision (see
-// CompressOptions' own doc comment) - Receiver needs no counterpart
-// parameter at all, since decompression is driven purely by what each
-// deltaMessage's own Compressed marker says, on every transport.
+// hardLinks mirrors real rsync's -H flag: off by default and not implied
+// by --archive, since detecting hard links costs an extra Lstat per entry.
 func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, copts CompressOptions) error {
 	entries, err := sync.Walk(src, walkOpts)
 	if err != nil {
@@ -45,11 +31,9 @@ func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []syn
 	}
 	entries = sync.FilterEntries(entries, rules)
 
-	// DetectHardLinks is skipped entirely, not just left to return no
-	// groups, in two cases: hardLinks wasn't requested, or the platform
-	// can't detect them at all (DetectHardLinks would always return
-	// nothing there anyway, but skipping the call also skips the
-	// Lstat-per-entry cost that would otherwise buy nothing).
+	// Skipped entirely (not just left to return nothing) when hardLinks is
+	// off or the platform can't detect them, avoiding a wasted
+	// Lstat-per-entry cost.
 	var groups []sync.HardLinkGroup
 	if hardLinks && sync.HardLinksSupported() {
 		groups, err = sync.DetectHardLinks(src, entries)
@@ -78,22 +62,15 @@ func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []syn
 		if err != nil {
 			return fmt.Errorf("receiving signature for %q: %w", entry.Path, err)
 		}
-		// Both sides process the same file list in the same order, so
-		// this should never actually mismatch - but checking it costs
-		// nothing and turns a silent "wrong file's delta computed
-		// against the wrong signature" corruption bug into a clear,
-		// immediate error instead.
+		// Both sides process the same file list in the same order; this
+		// check turns a silent delta/signature mismatch into a clear error.
 		if sigMsg.Path != entry.Path {
 			return fmt.Errorf("signature arrived out of order: got %q, want %q", sigMsg.Path, entry.Path)
 		}
 
 		if sigMsg.Append == appendSkip {
-			// The receiver already decided this file doesn't need
-			// touching at all (--append/--append-verify's "destination
-			// not shorter than source" eligibility rule) - acknowledge
-			// with an empty delta without even opening the file,
-			// matching real rsync's own documented behavior of never
-			// comparing such files at all.
+			// The receiver already decided this file needs no comparison
+			// at all; acknowledge with an empty delta without opening it.
 			if err := sendDelta(rw, entry.Path, nil, copts); err != nil {
 				return fmt.Errorf("sending delta for %q: %w", entry.Path, err)
 			}
@@ -123,26 +100,14 @@ func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []syn
 	return nil
 }
 
-// appendTailOps builds the delta for --append: a single CopyOp
-// representing "trust the receiver's first trustedLen bytes exactly as
-// they are, without verifying them at all" - a legitimate, direct use of
-// CopyOp's own documented contract (it only ever claims to copy a block
-// unchanged, never that the block was checksum-verified; that
-// verification is a property of how sync.GenerateDelta happens to find
-// a match, not of CopyOp itself), followed by a DataOp for whatever of
-// data comes after that offset - literal bytes the receiver has never
-// seen. Verified against real rsync's own source (generator.c/sender.c)
-// for the underlying "trust the prefix, send only the tail" behavior.
+// appendTailOps builds the --append delta: a CopyOp{BlockIndex: 0}
+// trusting the receiver's first trustedLen bytes unverified, followed by
+// a DataOp for whatever of data comes after that offset.
 //
-// A source file that has shrunk below trustedLen since the receiver
-// last checked its own file's length (a narrow, real race - real
-// rsync calls this a "diminished" file and skips it with a warning,
-// continuing the rest of the transfer) is treated as a hard error here
-// instead: grsync's Receiver has no general "skip this one file, keep
-// going" mechanism anywhere else in the codebase, and inventing one
-// solely for this narrow race is a bigger change than this ticket
-// calls for - see the README's Partial and Append Transfers section for
-// this disclosed scope difference.
+// A source file that has shrunk below trustedLen (real rsync calls this a
+// "diminished" file and skips it with a warning, continuing the transfer)
+// is a hard error here instead: grsync has no general per-file
+// skip-and-continue mechanism.
 func appendTailOps(trustedLen int, data []byte) ([]sync.DeltaOp, error) {
 	if trustedLen > len(data) {
 		return nil, fmt.Errorf("source file shrank to %d bytes, below the %d bytes already trusted on the receiving side (a \"diminished\" file - see real rsync's own --append docs)", len(data), trustedLen)
