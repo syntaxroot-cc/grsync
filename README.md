@@ -45,44 +45,79 @@ grsync <source>... <destination> [flags]
 At least one source and exactly one destination are required; the last
 argument is always the destination.
 
+Flags are grouped the same way `grsync --help` groups them.
+
+**Core**
+
 | Flag | Short | Description |
 |---|---|---|
 | `--archive` | `-a` | archive mode: `-rlptgo` (see below) |
+| `--verbose` | `-v` | print each updated item's path |
+| `--dry-run` | `-n` | plan the sync without changing anything on disk |
 | `--recursive` | `-r` | recurse into directories |
 | `--dirs` | `-d` | list directories without recursing into them (implied by `-r`) |
+
+**Attributes** (what `--archive` bundles)
+
+| Flag | Short | Description |
+|---|---|---|
 | `--perms` | `-p` | preserve permissions |
 | `--times` | `-t` | preserve modification times |
 | `--owner` | `-o` | preserve owner (needs privileges on most systems) |
 | `--group` | `-g` | preserve group (needs privileges on most systems) |
 | `--links` | `-l` | recreate symlinks as symlinks |
 | `--hard-links` | `-H` | preserve hard links (not implied by `--archive`, same as real rsync) |
-| `--verbose` | `-v` | print each updated item's path |
+
+**Filtering**
+
+| Flag | Description |
+|---|---|
+| `--exclude PATTERN` | exclude matching files (repeatable) |
+| `--include PATTERN` | include matching files (repeatable) |
+| `--filter RULE` | add a raw filter rule (repeatable) |
+| `--exclude-from FILE` | read exclude patterns from FILE (repeatable) |
+| `--include-from FILE` | read include patterns from FILE (repeatable) |
+
+**Output**
+
+| Flag | Short | Description |
+|---|---|---|
 | `--itemize-changes` | `-i` | print a per-item change summary, rsync's `%i` format (takes precedence over `-v`) |
-| `--dry-run` | `-n` | plan the sync without changing anything on disk |
 | `--progress` | | show live per-file transfer progress |
 | `--stats` | | print a summary after the sync completes |
+
+**Transport**
+
+| Flag | Short | Description |
+|---|---|---|
+| `--rsh COMMAND` | `-e` | remote shell command for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` |
+| `--address` | | bind to a specific local address |
+| `--ipv4` | `-4` | use IPv4 only |
+| `--ipv6` | `-6` | use IPv6 only |
+| `--password-file FILE` | | read an `rsync://` password from FILE |
+
+**Daemon mode**
+
+| Flag | Description |
+|---|---|
+| `--daemon` | run as an rsync daemon (see [Daemon Mode](#daemon-mode)) |
+| `--config PATH` | `rsyncd.conf` to serve (required with `--daemon`) |
+| `--port PORT` | daemon TCP port (default `873`) |
+
+**Advanced/edge cases**
+
+| Flag | Short | Description |
+|---|---|---|
 | `--compress` | `-z` | compress transferred data |
 | `--compress-level N` | | 1 (fastest) to 9 (smallest); default 6 |
 | `--skip-compress LIST` | | comma-separated suffixes to send uncompressed |
-| `--exclude PATTERN` | | exclude matching files (repeatable) |
-| `--include PATTERN` | | include matching files (repeatable) |
-| `--filter RULE` | | add a raw filter rule (repeatable) |
-| `--exclude-from FILE` | | read exclude patterns from FILE (repeatable) |
-| `--include-from FILE` | | read include patterns from FILE (repeatable) |
 | `--partial` | | keep partially-transferred files instead of deleting them |
 | `--partial-dir DIR` | | put partial files in DIR instead of next to the destination |
 | `--append` | | append data to shorter files, trusting the existing content |
 | `--append-verify` | | like `--append`, but verifies the existing content first |
 | `--write-batch FILE` | | save the transfer as a batch file (grsync's own format, see [Batch Mode](#batch-mode)) |
 | `--read-batch FILE` | | replay a batch file previously saved with `--write-batch` |
-| `--rsh COMMAND` | `-e` | remote shell command for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` |
-| `--daemon` | | run as an rsync daemon (see [Daemon Mode](#daemon-mode)) |
-| `--config PATH` | | `rsyncd.conf` to serve (required with `--daemon`) |
-| `--port PORT` | | daemon TCP port (default `873`) |
-| `--password-file FILE` | | read an `rsync://` password from FILE |
-| `--ipv4` | `-4` | use IPv4 only |
-| `--ipv6` | `-6` | use IPv6 only |
-| `--address` | | bind to a specific local address |
+| `--delete` | | delete extraneous files from destination |
 
 ## How syncing works
 
