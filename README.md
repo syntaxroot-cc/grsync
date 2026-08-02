@@ -1,65 +1,28 @@
 # grsync
 
-An rsync-inspired file synchronization tool written in Go.
+grsync is a rewrite of [rsync](https://github.com/RsyncProject/rsync) in Go,
+aiming for full feature parity with the original C implementation: the
+delta-transfer algorithm, SSH and daemon transport, filtering, file
+attribute preservation, and the major CLI flags.
 
 ## Status
 
-**grsync can actually sync files now** - local-to-local and local-to-remote
-(SSH) - for the first time in this project's history, not just a
-collection of independently tested components. `grsync SRC... DEST`
-really walks, filters, diffs, transfers, and reconstructs files, applying
-requested attributes along the way. See
-[End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
-how the pieces connect and, just as importantly, what's still explicitly
-out of scope (full `--delete` and device/special files) - this is real,
-working sync, not yet full feature parity. Hard links
-*are* now preserved, opt-in via `-H`/`--hard-links` exactly like real
-rsync's own flag (see
-[File Attribute Preservation](#file-attribute-preservation) below), and
-`--dry-run`/`-n` is a genuine trial run - full planning, zero filesystem
-changes - with real `--itemize-changes`/`-i` output matching rsync's own
-format (see [Dry-Run Mode](#dry-run-mode) below). `--progress` and
-`--stats` are now implemented too, both matching real rsync's own output
-formats (see [Progress and Stats](#progress-and-stats) below).
-`--compress`/`-z` now genuinely compresses a file's literal delta data
-with zlib, including real rsync's own `--compress-level` and
-`--skip-compress` (see [Compression](#compression) below).
-`--partial`/`--partial-dir` and `--append`/`--append-verify` are now
-implemented too, with a real, disclosed scope boundary around what
-"partial" means in grsync's own architecture (see
-[Partial and Append Transfers](#partial-and-append-transfers) below).
-`--write-batch`/`--read-batch` are now implemented too - **but read this
-part carefully if batch-file interoperability with real rsync is why
-you're here**: they use grsync's own batch format, verified to be
-**incompatible with real rsync's actual batch files** (which are a raw
-capture of rsync's own binary wire protocol) - a deliberate decision,
-not an oversight, made for the same reason SC-6/SC-9/SC-16's own
-gob-vs-wire-format choices were: reimplementing real rsync's actual
-protocol is a separate, much larger effort this project has
-consistently declined to take on. See
-[Batch Mode](#batch-mode) below before relying on this for anything
-that needs to interoperate with a real `rsync` binary.
+grsync can sync files today, locally, over SSH, and to/from an `rsync://`
+daemon: `grsync SRC... DEST` walks the source, applies filters, computes a
+delta against the destination, transfers only what changed, and restores
+requested attributes.
 
-`grsync --daemon` also now speaks a real subset of the rsync daemon
-protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
-listing, and real MD4 challenge-response authentication all match
-upstream rsync, verified against its actual source rather than assumed.
-**`rsync://host/module` is now a real destination argument to the main
-`grsync SRC... DEST` command itself**, not just something exercised from
-`internal/daemon`'s own tests - `grsync -a src rsync://host/module` works
-today, credentials and all. See
-[rsync Daemon Mode](#rsync-daemon-mode) below for exactly what that
-covers and where it hands off to grsync's own (non-rsync-wire-format)
-transfer protocol. `--ipv4`/`-4`, `--ipv6`/`-6`, and `--address` now
-genuinely control which address family and local address every transport
-uses, matching real rsync's own documented scope for each (see
-[IPv4/IPv6 Support](#ipv4ipv6-support) below). The test suite now also
-includes real-rsync comparison integration tests, fuzz targets, and
-throughput benchmarks, with `-race` and `govulncheck` wired into CI (see
-[Testing](#testing) below) - including a genuine, previously-undisclosed
-finding from building those comparison tests: grsync has no
-trailing-slash sensitivity on source paths, unlike real rsync's `src` vs
-`src/` distinction.
+Two things worth knowing up front:
+
+- **grsync does not speak real rsync's wire protocol.** Its own
+  network/transfer format is a simple Go-specific encoding, not upstream
+  rsync's binary protocol. That means a grsync client can only sync with a
+  grsync server (or daemon) - not with the real `rsync` binary - and a
+  grsync batch file can't be read by real rsync either. The daemon's
+  *handshake and authentication* are real-protocol-compatible (see
+  [Daemon Mode](#daemon-mode)); only the transfer itself is not.
+- **`--delete` isn't implemented**, and device/special files are only
+  partially supported (see [Limitations](#limitations)).
 
 ## Build
 
@@ -67,7 +30,7 @@ trailing-slash sensitivity on source paths, unlike real rsync's `src` vs
 go build ./cmd/grsync
 ```
 
-Or run directly without building a binary:
+Or run directly:
 
 ```sh
 go run ./cmd/grsync <source>... <destination> [flags]
@@ -79,1560 +42,308 @@ go run ./cmd/grsync <source>... <destination> [flags]
 grsync <source>... <destination> [flags]
 ```
 
-At least one `source` and exactly one `destination` are required; the last
+At least one source and exactly one destination are required; the last
 argument is always the destination.
 
-| Flag | Shorthand | Description |
+| Flag | Short | Description |
 |---|---|---|
-| `--archive` | `-a` | archive mode |
-| `--verbose` | `-v` | print each updated item's path (superseded by `--itemize-changes` when both are given, see [Dry-Run Mode](#dry-run-mode)) |
-| `--compress` | `-z` | compress data during transfer |
+| `--archive` | `-a` | archive mode: `-rlptgo` (see below) |
 | `--recursive` | `-r` | recurse into directories |
 | `--dirs` | `-d` | list directories without recursing into them (implied by `-r`) |
-| `--dry-run` | `-n` | perform a trial run: full planning (file list, filters, deltas), zero filesystem changes (see [Dry-Run Mode](#dry-run-mode)) |
-| `--itemize-changes` | `-i` | print a change-summary line per updated item, real rsync's own 11-character `%i` format (see [Dry-Run Mode](#dry-run-mode)) |
-| `--delete` | | delete extraneous files from destination |
-| `--progress` | | show progress during transfer |
+| `--perms` | `-p` | preserve permissions |
+| `--times` | `-t` | preserve modification times |
+| `--owner` | `-o` | preserve owner (needs privileges on most systems) |
+| `--group` | `-g` | preserve group (needs privileges on most systems) |
+| `--links` | `-l` | recreate symlinks as symlinks |
+| `--hard-links` | `-H` | preserve hard links (not implied by `--archive`, same as real rsync) |
+| `--verbose` | `-v` | print each updated item's path |
+| `--itemize-changes` | `-i` | print a per-item change summary, rsync's `%i` format (takes precedence over `-v`) |
+| `--dry-run` | `-n` | plan the sync without changing anything on disk |
+| `--progress` | | show live per-file transfer progress |
+| `--stats` | | print a summary after the sync completes |
+| `--compress` | `-z` | compress transferred data |
+| `--compress-level N` | | 1 (fastest) to 9 (smallest); default 6 |
+| `--skip-compress LIST` | | comma-separated suffixes to send uncompressed |
 | `--exclude PATTERN` | | exclude matching files (repeatable) |
 | `--include PATTERN` | | include matching files (repeatable) |
-| `--filter RULE` | | add a filter rule (repeatable) |
-| `--exclude-from FILE` | | read exclude patterns from FILE, one per line (repeatable) |
-| `--include-from FILE` | | read include patterns from FILE, one per line (repeatable) |
-| `--rsh COMMAND` | `-e` | remote shell to use for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` (default: `ssh`) |
-| `--perms` | `-p` | preserve permissions (implied by `--archive`) |
-| `--times` | `-t` | preserve modification times (implied by `--archive`) |
-| `--owner` | `-o` | preserve owner (implied by `--archive`; requires appropriate privileges) |
-| `--group` | `-g` | preserve group (implied by `--archive`; requires appropriate privileges) |
-| `--links` | `-l` | recreate symlinks as symlinks (implied by `--archive`) |
-| `--hard-links` | `-H` | preserve hard links between files in the source (**NOT** implied by `--archive`, matching real rsync's own `-a`) |
-| `--daemon` | | run as an rsync-protocol daemon, serving modules from `--config` (see [rsync Daemon Mode](#rsync-daemon-mode)) |
-| `--config PATH` | | path to the `rsyncd.conf` to serve (required with `--daemon`) |
-| `--port PORT` | | TCP port to listen on in `--daemon` mode (default `873`, matching rsync) |
-| `--password-file FILE` | | read an `rsync://` daemon password from FILE instead of `RSYNC_PASSWORD` or an interactive prompt (see [rsync Daemon Mode](#rsync-daemon-mode)) |
+| `--filter RULE` | | add a raw filter rule (repeatable) |
+| `--exclude-from FILE` | | read exclude patterns from FILE (repeatable) |
+| `--include-from FILE` | | read include patterns from FILE (repeatable) |
+| `--partial` | | keep partially-transferred files instead of deleting them |
+| `--partial-dir DIR` | | put partial files in DIR instead of next to the destination |
+| `--append` | | append data to shorter files, trusting the existing content |
+| `--append-verify` | | like `--append`, but verifies the existing content first |
+| `--write-batch FILE` | | save the transfer as a batch file (grsync's own format, see [Batch Mode](#batch-mode)) |
+| `--read-batch FILE` | | replay a batch file previously saved with `--write-batch` |
+| `--rsh COMMAND` | `-e` | remote shell command for SSH transport, e.g. `"ssh -p 2222 -i key.pem"` |
+| `--daemon` | | run as an rsync daemon (see [Daemon Mode](#daemon-mode)) |
+| `--config PATH` | | `rsyncd.conf` to serve (required with `--daemon`) |
+| `--port PORT` | | daemon TCP port (default `873`) |
+| `--password-file FILE` | | read an `rsync://` password from FILE |
+| `--ipv4` | `-4` | use IPv4 only |
+| `--ipv6` | `-6` | use IPv6 only |
+| `--address` | | bind to a specific local address |
 
-All five filter-related flags share one ordered rule list - their relative
-order on the command line is preserved, matching rsync's first-match-wins
-semantics. See [Filter Rules](#filter-rules) below.
+## How syncing works
 
-## File Enumeration
+For each file, grsync avoids re-sending data that hasn't changed:
 
-`sync.Walk`, in the `internal/sync` package, recursively lists a source tree
-into a sorted `[]FileEntry` (path, size, mtime, mode, uid/gid, symlink
-target). Symlinks are captured via `Lstat`, never followed.
+1. **Signature** - the receiver splits its copy of the file into fixed-size
+   blocks and checksums each one (a fast rolling checksum plus an MD5
+   strong checksum).
+2. **Delta** - the sender slides a window over its own copy, checking every
+   byte offset against the receiver's checksums to find matching blocks. A
+   match is confirmed with the strong checksum before being trusted. The
+   result is a short list of instructions: "copy block N from the old
+   file" or "here are some new bytes."
+3. **Apply** - the receiver replays that list to reconstruct the file
+   exactly, writing to a temporary file first and renaming it into place
+   once complete.
 
-`-r`/`-d` control how far it descends:
+Real rsync scales its block size with file size; grsync currently uses a
+fixed block size, which is simpler but slightly less efficient on very
+large files.
 
-| Recursive | Dirs | Result |
-|---|---|---|
-| off | off | directories skipped entirely |
-| off | on | directories listed, not descended into |
-| on | any | full recursion |
+## What's preserved
 
-On Windows, `UID`/`GID` are always `0` - there's no POSIX ownership concept
-to read, so `0` means "unavailable," not a real value.
+`--perms`, `--times`, `--owner`, `--group`, and `--links` each control one
+attribute, and `--archive` turns all of them on at once (matching rsync's
+own `-a`, which is `-rlptgo` and does *not* include hard links).
 
-## Filter Rules
+- **Permissions and times** are applied after a file is written.
+- **Ownership** requires appropriate privileges (e.g. root) to change, the
+  same as with real rsync - this isn't something grsync works around. On
+  Windows there's no concept of POSIX ownership to preserve, so it's
+  always skipped there.
+- **Symlinks** are recreated as symlinks, never followed.
+- **Hard links** (`-H`/`--hard-links`) are detected by matching device and
+  inode numbers, so it's POSIX-only: on Windows, source-side hard links
+  can't be detected, though a Windows *destination* can still receive real
+  hard links from a Linux/macOS source.
+- **Device and special files**: named pipes (FIFOs) are fully supported.
+  Sockets and character/block devices are detected but not recreated,
+  since doing so needs root and isn't practical to support everywhere
+  grsync runs.
 
-`sync.CompileRules` turns the ordered `--exclude`/`--include`/`--filter`/
-`--exclude-from`/`--include-from` list into ready-to-match rules;
-`sync.Included`/`sync.FilterEntries` apply them to `sync.Walk`'s output as
-a separate pass, first-match-wins, defaulting to include when nothing
-matches.
+## Filtering
+
+`--exclude`, `--include`, `--filter`, `--exclude-from`, and `--include-from`
+all add to one ordered rule list, matched first-rule-wins, in command-line
+order - the same semantics as real rsync.
 
 Pattern syntax: `*` matches within one path segment, `**` crosses segment
-boundaries, `?` matches one character. A trailing `/` makes a pattern match
-directories only. `--filter` also accepts `merge FILE` to inline another
-rule file at that point in the list (one level deep - a merge file that
-itself tries to merge another file is an error, not silently ignored).
+boundaries, `?` matches one character, and a trailing `/` restricts a
+pattern to directories. A pattern anchors to the sync root (matched once
+against the full path) if it starts with `/`, contains another `/`, or
+contains `**`; a bare pattern like `*.log` matches at any depth instead.
+`--filter` also accepts `merge FILE` to insert another rule file inline.
 
-A pattern anchors to the transfer root - matched once against the full
-path, not tried at every depth - if it has a leading `/`, contains any
-other `/`, or contains `**`. Only a pattern with none of those (a bare
-filename like `*.log`) matches at any depth, against the final path
-component only. This matches real rsync's actual anchoring rule.
+## Connecting to a remote host
 
-## Delta-Transfer Algorithm
+**Over SSH** (`user@host:path`): grsync shells out to `ssh` (or whatever
+`--rsh`/`-e` specifies) and speaks its own protocol over that connection's
+stdin/stdout - the same approach real rsync uses. That means
+`~/.ssh/config`, `ssh-agent`, and host-key checking all work exactly as
+already configured, with no separate `--port` or `--identity` flag; use
+`--rsh "ssh -p 2222 -i key.pem"` instead, same as real rsync. The remote
+host needs `grsync` itself on its `PATH`.
 
-`internal/sync` implements rsync's signature-based delta algorithm for
-transferring a changed file without resending the parts that didn't
-change:
+**Over a daemon** (`rsync://host/module`): see [Daemon Mode](#daemon-mode)
+below.
 
-1. **Signature** (`sync.GenerateSignature`) - the receiver splits its copy
-   of the file into fixed-size blocks and computes two checksums per
-   block: a fast rolling checksum and an MD5 strong checksum.
-2. **Delta** (`sync.GenerateDelta`) - the sender slides a window over its
-   new copy of the file one byte at a time, using the rolling checksum to
-   cheaply test every offset (not just block boundaries) for a match
-   against the receiver's signature; a weak-checksum hit is confirmed
-   against the strong checksum before being trusted, since two different
-   blocks can share a weak checksum by chance. The result is an ordered
-   list of operations: copy block N from the old file, or write these
-   literal bytes.
-3. **Reconstruction** (`sync.ApplyDelta`) - the receiver replays that
-   operation list against its old copy to reproduce the sender's file
-   exactly.
-
-The block size is currently a fixed constant (`sync.DefaultBlockSize`).
-Real rsync scales it dynamically based on file size; fixed-size blocks are
-a deliberate simplification here, not a limitation of the algorithm
-itself.
-
-## File Attribute Preservation
-
-`sync.ApplyAttributes(entry, destPath, opts)` applies `--perms`/`--times`/
-`--owner`/`--group`/`--links` to an already-written destination path
-(`AttrOptions` mirrors each flag so they can be toggled independently, the
-same way `--archive` bundles several together). Hard links and device
-files are handled separately, described below, since both are inherently
-multi-file or multi-privilege concerns a single-entry function can't
-capture.
-
-- **Permissions**: only the permission bits (`Mode.Perm()`) are applied,
-  never the type bits `FileMode` also carries.
-- **Times**: `mtime` is preserved; `atime` is set to the same value rather
-  than "now," so reapplying identical attributes twice is idempotent
-  (rsync itself doesn't meaningfully preserve atime either).
-- **Ownership**: applied via `Lchown` (so a symlink's own ownership is set,
-  not its target's) - but only when `FileEntry.OwnershipAvailable` is
-  true. On Windows it never is, so ownership is always explicitly skipped
-  there, not silently attempted with a meaningless zero UID/GID. Changing
-  ownership to another user is a privileged operation on POSIX (needs
-  root/`CAP_CHOWN`) even when available - that's an operational
-  constraint on how grsync is run, not something this code works around.
-- **Symlinks**: created from `LinkTarget` directly, never followed.
-  `Perms`/`Times` are silently *not* applied to a symlink entry even if
-  requested, because `os.Chmod`/`os.Chtimes` both follow symlinks (Go has
-  no portable `Lchmod`/`Lchtimes`) - calling them on a symlink path would
-  modify its target instead of the link.
-- **Hard links** (`sync.DetectHardLinks`/`sync.ApplyHardLinks`): detected
-  via `(device, inode)` identity, POSIX-only. Windows has no equivalent
-  exposed the way this package reads it, so every file is treated as
-  unlinked there - space-saving is lost, but output is still correct.
-  Call `sync.HardLinksSupported()` to tell "this platform can't detect
-  hard links" apart from "this tree just has none," rather than guessing
-  from an empty result.
-
-  **Wired into the actual sync pipeline, opt-in via `-H`/`--hard-links`**
-  - exactly matching real rsync's own flag, including that `--archive`
-  does *not* imply it (real rsync's `-a` is `-rlptgoD`, no `H`; see
-  `effectiveAttrOptions` in `internal/cli/sync.go`). Only when requested,
-  `pipeline.Sender` runs `sync.DetectHardLinks` over the filtered file
-  list (skipping the call entirely, not just discarding its result, when
-  `sync.HardLinksSupported()` is false - no point paying for a per-entry
-  `Lstat` pass that would always come back empty either way) and attaches
-  the grouping to the same `FrameFileList` message the entries themselves
-  travel in, rather than a separate round trip. `pipeline.Receiver`
-  writes each group's first member through the normal signature/delta
-  path and recreates every other member with `sync.ApplyHardLinks`
-  (`os.Link`) instead of re-transferring bytes that are identical by
-  definition - in a pass that runs after every regular file is written
-  but *before* the deferred directory-attributes pass, since `os.Link`
-  touches its parent directory's mtime the same way creating any other
-  file does. Detection only has to succeed on the *sending* side:
-  `os.Link` itself works on Windows too, so a Linux/macOS sender pushing
-  to a Windows destination still produces real hard links there, even
-  though a Windows source's own links can't be detected in the first
-  place.
-
-  Tested end to end with `TestSenderReceiver_HardLinks` in
-  `internal/pipeline/pipeline_test.go` (proving the destination files are
-  genuinely the same file, not independent copies with matching content
-  - and that this degrades to correct independent copies, not an error,
-  where `HardLinksSupported()` is false),
-  `TestSenderReceiver_HardLinksNotPreservedWithoutOptIn` (the direct
-  proof that omitting `-H` really does leave files unlinked, not just
-  documented as opt-in while actually running unconditionally),
-  `TestReceiver_AppliesHardLinksFromReceivedGroups` (proving `Receiver`
-  never asks for a signature for a group's secondary member, regardless
-  of what the current platform can detect), and - at the real CLI command
-  level, in `internal/cli/sync_test.go` -
-  `TestE2E_HardLinksPreservedWithFlag`/`TestE2E_ArchiveAloneDoesNotImplyHardLinks`,
-  the latter being the specific regression test for `--archive` never
-  silently turning this on.
-- **Device/special files** (`sync.ApplySpecialFile`): deliberately scoped
-  down. Named pipes (FIFOs) are fully created via `Mkfifo`, since that
-  needs no elevated privilege. Sockets and character/block devices are
-  *detected* (`sync.ClassifySpecialFile`) but not recreated -
-  `Mknod`-based device creation needs root and can't be meaningfully
-  tested without it, so this returns `sync.ErrSpecialFileUnsupported`
-  rather than attempting a syscall that fails for most callers and
-  calling that "support."
-
-## SSH Transport
-
-`internal/transport` reaches a remote grsync the same way upstream rsync
-does: by spawning a remote-shell subprocess (`ssh` by default) and
-speaking a protocol over its stdin/stdout, rather than a native Go SSH
-client. This was a deliberate choice, not just the default option: the
-`--rsh`/`-e` flag's real meaning in rsync only makes sense if grsync is
-actually invoking an arbitrary shell command, and shelling out means
-`~/.ssh/config`, `ssh-agent`, and `known_hosts` all keep working exactly
-as already configured, instead of being reimplemented.
-
-- **Endpoint syntax**: `transport.ParseRemotePath` recognizes
-  `[user@]host:path`, including IPv6 literals (`user@[::1]:path`), while
-  correctly treating a Windows drive letter (`C:\...`) as local rather
-  than a remote host.
-- **`--rsh`/`-e`** is the *only* customization mechanism for the remote
-  shell - there's no separate `--port` or `--identity` flag. This matches
-  real rsync: upstream's `--port` only applies to daemon-mode (`rsync://`)
-  connections, and its `-i` flag already means `--itemize-changes`, not
-  "identity file." Port/identity/`ProxyJump`/etc. go through `-e` (e.g.
-  `-e "ssh -p 2222 -i key.pem"`) or `~/.ssh/config`, exactly as with real
-  rsync.
-- **Host-key verification** is not reimplemented at all, in either
-  direction: no flag here ever weakens it (no `StrictHostKeyChecking=no`,
-  no null `UserKnownHostsFile`), and none of its logic is duplicated
-  either. Whatever the invoked shell command does by default is exactly
-  what happens - this is genuinely real, not a stub, precisely because
-  nothing here touches it.
-- **Framing**: `transport.WriteFrame`/`transport.ReadFrame` multiplex the single
-  stdin/stdout stream into typed, length-prefixed messages (4-byte
-  length + 1-byte type + payload, capped at 64 MiB per frame against a
-  corrupt or hostile length prefix).
-- **`--server` mode**: hidden from `--help` (like rsync's own `--server`),
-  this is how a remotely-invoked grsync switches into speaking the
-  protocol instead of doing a normal sync. It now runs the handshake
-  *and* the full receiver pipeline (see
-  [End-to-End Sync Pipeline](#end-to-end-sync-pipeline)) against the
-  destination path passed as its one positional argument.
-- **Remote invocation assumes `grsync` is on the remote `PATH`**, exactly
-  like real rsync assumes `rsync` is (no `--rsync-path`-equivalent
-  override exists yet). `internal/cli/syncToRemote` invokes the remote
-  side as `ssh ... grsync --server DEST`, not a locally-resolved path -
-  this is a real, documented deployment assumption, not an oversight.
-
-**Testing note**: two tests exercise real `ssh` against `127.0.0.1`
-(`TestSSHLocalhost_HandshakeRoundTrip` in `internal/transport`,
-`TestSSHLocalhost_SyncRoundTrip` in `internal/pipeline`, the latter
-built the real binary and driving a full sync through it), both skipping
-gracefully if no SSH server is reachable there non-interactively. No such
-server was available in this development environment (an `ssh` client is
-present, but nothing was listening), so while both are believed correct
-by code review and by mirroring an already-working pattern, neither has
-been observed to pass against a live server.
-
-## End-to-End Sync Pipeline
-
-`internal/pipeline` is the new package that wires `internal/sync` and
-`internal/transport` together into an actual sync - it imports both, and
-neither of them imports it or each other, keeping that layering intact.
-`pipeline.Sender`/`pipeline.Receiver` run the same protocol whether the
-connection is a real SSH `Session` or, for a local-to-local sync, an
-in-memory `io.Pipe` with both sides running as goroutines in the same
-process - deliberately one code path, not two, so the local case
-(fast to test, no SSH required) exercises the exact logic the harder-to-
-verify remote case depends on.
-
-**Wire encoding**: every message is `encoding/gob`, not upstream rsync's
-actual wire protocol. That's a deliberate scope boundary: rsync's real
-format is an intricate, versioned binary protocol, and reimplementing it
-is separate, substantial work that doesn't belong in this already-large
-integration ticket. gob is a reasonable, low-effort, *correct* choice
-specifically because grsync only ever talks to grsync here, never to real
-rsync - but genuine rsync protocol interoperability, if ever wanted, is
-future work, not something to let "protocol" quietly come to mean "gob."
-
-**Three new frame types**, added to `transport.FrameType` (in
-`internal/transport`):
-`FrameFileList` (sender→receiver, the filtered `[]FileEntry`, sent once),
-`FrameSignature` (receiver→sender, per regular file, sent proactively in
-list order - no separate request message, since the file list itself is
-the implicit request for all of them), and `FrameDelta` (sender→receiver,
-the reply to each signature). Directories and symlinks never enter this
-exchange at all: a directory has no byte content to diff, and a symlink's
-entire "content" is its `LinkTarget`, already present in the file list
-itself - only regular files need a signature/delta round trip.
-
-**A real correctness issue found and fixed during this pass, not just a
-checklist item**: applying a directory's attributes (permissions, mtime)
-immediately upon creating it is wrong, because writing files into it
-afterward changes it again - a restrictive permission mode would block
-creating those children at all, and even a permissive mode's mtime gets
-silently bumped by the filesystem the moment something is created inside
-it, undoing the preservation just performed. `pipeline.Receiver` defers
-directory attribute application to a final pass, applied deepest-first
-(the reverse of `Walk`'s own parent-before-child sort, obtained for free
-rather than needing a second sort). `TestSenderReceiver_DirectoryAttributesSurviveChildCreation`
-proves this: verified to actually fail (mtime bumped to "now") when the
-fix is reverted, not just pass trivially.
-
-**The new-file case** (nothing exists yet at the destination) needs no
-special-casing: `sync.GenerateSignature` on empty/absent data naturally
-produces a `Signature` with zero blocks, which makes `sync.GenerateDelta`
-emit an all-`DataOp` delta - exactly the desired behavior, falling
-straight out of the existing SC-3 API.
-
-**A destination-only file is never touched**: `pipeline.Receiver` only
-ever acts on paths that appear in the list it received from the sender -
-there's no separate destination-side walk to reconcile against it, so
-nothing in this pipeline can delete or modify a file the sender never
-mentioned. (Full `--delete` semantics remain a separate, later ticket.)
-
-**Explicitly out of scope for this pipeline** (some pre-existing gaps,
-restated here so they're not mistaken for oversights specific to this
-ticket): compression, progress reporting, partial/append transfers,
-batch mode, pulling from a remote source (only local-source syncs are
-supported - push, not pull), and device/special files.
-`sync.ApplySpecialFile` exists and is tested, but nothing in
-`pipeline.Receiver` calls it yet - unlike hard links (see
-[File Attribute Preservation](#file-attribute-preservation) above, now
-wired in), this needs elevated privilege to test meaningfully and was
-left out rather than expanding this integration further.
+Only pushing to a remote destination is currently supported - pulling from
+a remote source is not yet implemented, for either transport.
 
 ## Dry-Run Mode
 
-`--dry-run`/`-n` is a genuine trial run, not the flag-echoing placeholder
-it used to be: `pipeline.Receiver` performs every planning step exactly
-as a real sync would - the full signature/delta exchange, hard-link
-grouping, comparing each entry against the destination's current
-state - and simply skips the eight calls that would actually touch the
-filesystem. Every other write path (`Sender`, and everything upstream of
-`Receiver`) is completely unaffected by dry-run; only the receiving
-side's own final commit step is skipped, exactly where the "no changes"
-guarantee actually needs to be enforced.
+`--dry-run`/`-n` runs the full planning process - the signature/delta
+exchange, filtering, comparing against the destination - without writing
+anything. `--itemize-changes`/`-i` output is identical between a dry run
+and the real run that would follow it.
 
-### The eight audited write calls
-
-`Receiver`'s own doc comment names them explicitly, and each one is
-individually gated behind `if !ropts.DryRun`, not a single outer branch
-that happens to skip the whole function (which would also have skipped
-the planning work the ticket requires to stay real):
-
-- Two `os.MkdirAll` calls and an `os.WriteFile` in `receiveRegularFile`.
-- An `os.MkdirAll` and `sync.ApplyAttributes` in `receiveSymlink` -
-  `ApplyAttributes` is the one that actually calls `os.Symlink` for a
-  symlink entry (see [File Attribute Preservation](#file-attribute-preservation)),
-  not just `chmod`/`chtimes`, which is exactly why skipping it alone
-  (not a separate `os.Symlink` call) is what makes a symlink entry a
-  genuine no-op in dry-run.
-- `sync.ApplyAttributes` for a directory, in the deferred
-  attribute-application pass.
-- `sync.ApplyHardLinks`, in the hard-link pass.
-
-`TestReceiver_DryRunMakesNoFilesystemChanges` in
-`internal/pipeline/pipeline_test.go` is the test built specifically to
-catch a regression here: it syncs a tree exercising every one of those
-eight paths (a top-level file, a nested directory with a file inside it,
-a symlink, and - best-effort - two hard-linked files) against a
-completely empty destination and asserts the destination is *still*
-completely empty afterward, not just that no error was returned.
-
-### What still runs, and why
-
-The full signature/delta exchange happens over the wire in dry-run mode
-exactly as it would for a real sync - **this is a deliberate divergence
-from real rsync's own documented dry-run behavior**, worth stating
-explicitly rather than glossing over. Real rsync's docs say a dry run
-"does not send the actual data for file transfers," but that's only true
-because real rsync's *default* mode has a cheap size+mtime "quick check"
-that skips the signature/delta algorithm entirely for files it can
-already tell are unchanged - grsync has no such shortcut (a pre-existing,
-deliberate architectural choice from the original delta-transfer and
-pipeline-integration work: full delta always runs, full stop). Matching
-real rsync's dry-run network behavior *by letter* would mean building a
-new quick-check mechanism that doesn't otherwise exist in this codebase,
-just to serve this one mode - worse than disclosing the honest
-divergence. The content comparison itself is genuinely free either way:
-`sync.ApplyDelta` is pure in-memory work, so computing it costs nothing
-whether or not the result is about to be written, and it's the only way
-grsync can correctly answer "did this file's content actually change"
-for itemize purposes without a `--checksum`-style flag.
-
-### `--itemize-changes`/`-i`: real rsync's actual format, not an approximation
-
-Verified against `rsync.1`'s own `--itemize-changes` section rather than
-invented: the format is `YXcstpoguax`, 11 characters - `Y` (update type:
-`>` transferred, `c` local change/creation, `h` hard link, `.` not
-updated), `X` (file type: `f`/`d`/`L`), then 9 attribute letters
-(`c` checksum/value-differs, `s` size, `t` time, `p` perms, `o` owner,
-`g` group, `u`/`n`/`b` atime/crtime, `a` ACL, `x` xattr) - `.` for
-unchanged, `+` for newly-created. A completely unchanged item is not
-printed at all with a single `-i`, matching real rsync's own default
-(a second `-i`/`-vv` would show them too; grsync doesn't implement that
-second tier). Output lines match real rsync's own default
-(`--out-format='%i %n%L'`): the code, the path, and `" -> target"` for a
-symlink.
-
-Scoped to what grsync actually tracks, each disclosed explicitly rather
-than silently approximated:
-
-- **`u`/`a`/`x` (atime/crtime, ACL, xattr) are always `.`** - grsync has
-  no `--atimes`/`--acl`/`--xattr` flags, matching real rsync's own
-  behavior when those options aren't given.
-- **Attribute-`c` (checksum) never fires for a regular file** - real
-  rsync gates it behind `--checksum`, which grsync doesn't have; only
-  `s`/`t`/`p`/`o`/`g` are ever used to describe what changed about a
-  file's content or attributes, matching this ticket's own explicit
-  scope.
-- **`h` (hard-link secondary member) is implemented even though the
-  ticket's own explicit list didn't name it** - SC-18 already computed
-  exactly this grouping information, and reporting a hard-linked file as
-  an ordinary new file (`>f+++++++++`) would be a real, easily-avoidable
-  inaccuracy.
-
-`--verbose`/`-v` alone (without `-i`) prints just the path (plus
-`" -> target"` for a symlink) per changed item - real rsync's own
-`"%n%L"` default for `-v` without `-i`; `-i` takes precedence when both
-are given.
-
-Verified against real rsync's own documented guarantee ("The output of
-`--itemize-changes` is supposed to be exactly the same on a dry run and
-a subsequent real run") by `TestReceiver_DryRunItemizeMatchesRealRunItemize`
-and its CLI-level counterpart `TestE2E_DryRunAndRealRunItemizeMatch`:
-both compare a dry run's itemize output against a real run's, on a
-*separate*, equally fresh destination - not a second real run against
-the same one, which would legitimately report nothing left to do and
-prove nothing about the dry run's accuracy.
-
-### Across transports
-
-- **Local**: `pipeline.Receiver` runs in-process; `ReceiverOptions`
-  (dry-run, itemize, verbose, and where to write it) is passed straight
-  through.
-- **SSH**: the remote `grsync --server` process is invoked with
-  `--dry-run`/`--itemize-changes`/`--verbose` as ordinary flags on its
-  own command line (see `syncToRemote` in `internal/cli/sync.go`) - no
-  new wire protocol needed, since `--server` mode already parses its own
-  real CLI flags. Itemize/verbose *output* needed one small addition:
-  `transport.Session` now passes the remote subprocess's stderr through
-  to this process's own stderr live, not just buffering it for a
-  post-mortem error message - stdout is the framed wire protocol itself
-  (see [End-to-End Sync Pipeline](#end-to-end-sync-pipeline)), so
-  `runServer` writes its reporting there, never to stdout, and that
-  passthrough is what lets it actually reach the local terminal.
-  `TestSSHLocalhost_DryRunMakesNoChanges` proves the no-write guarantee
-  over a real SSH connection to `127.0.0.1` (skipped gracefully if no
-  local `sshd` is reachable, the same as this project's other real-SSH
-  tests).
-- **`rsync://` daemon**: dry-run's no-write guarantee is fully supported
-  in both directions, verified over a real TCP connection by
-  `TestDaemon_RealTCP_DryRunPutMakesNoChanges` and
-  `TestDaemon_RealTCP_DryRunGetMakesNoChanges`. A download
-  (`DirectionGet`) needs nothing special - the client's own `Receiver`
-  runs locally, exactly like a local sync. An upload (`DirectionPut`)
-  needed a small, genuine protocol extension: the client sends
-  `"put --dry-run"` instead of `"put"` on the direction line
-  (`daemon.dryRunToken`) so the *server's* `Receiver` - the side that
-  actually decides whether to write, for this direction - knows to skip
-  its writes.
-
-  **Itemize/verbose output is not available for an `rsync://` upload**,
-  a real, disclosed gap rather than something silently half-working: once
-  the module handshake ends, the daemon connection is pure binary wire
-  protocol with no channel for arbitrary text, unlike SSH's genuinely
-  separate stderr stream - adding one would be real, separate protocol
-  work, not a small extension of this ticket. `--dry-run`'s actual
-  no-write guarantee needs no such channel and is unaffected; `grsync`
-  prints a one-time note (to stderr) when `-i`/`-v` is combined with an
-  `rsync://` destination, rather than silently producing no output and
-  leaving the user to wonder why.
+One real difference from upstream rsync: rsync's default mode has a
+"quick check" that skips the delta algorithm entirely for files that
+already look unchanged by size and timestamp, so a dry run barely touches
+the network. grsync has no such shortcut - it always runs the full delta
+comparison, dry run or not - so grsync's dry run does more work over the
+wire than real rsync's does, even though neither one writes to disk.
 
 ## Progress and Stats
 
-`--progress` prints live per-file transfer progress; `--stats` prints an
-end-of-sync summary block. Both are opt-in, both are additive to
-`-i`/`-v`, and both match real rsync's own output formats - verified
-against `rsync.1`'s own documented examples and upstream's actual
-`main.c` (`output_summary`) rather than approximated.
-
-### `--progress`
-
-Real rsync's own progress line is fundamentally a *network* measurement:
-bytes as they cross the wire, for a protocol that streams a file's data
-incrementally. grsync's wire protocol doesn't - see
-[End-to-End Sync Pipeline](#end-to-end-sync-pipeline) - it's frame-at-a-time
-(a whole signature, then a whole delta, each gob-encoded), and
-`sync.ApplyDelta` reconstructs the entire file in memory before anything
-is written to disk. There is no partial, in-flight network state to
-report progress against. `--progress` here instead measures the local
-*disk-write* phase: `receiveRegularFile` writes files larger than 256KiB
-in chunks (`writeFileWithProgress`, `internal/pipeline/receiver.go`) and
-reports after each chunk, rather than in one `os.WriteFile` call. This is
-a deliberate, disclosed scope boundary, not an attempt to fake network
-streaming - files at or under 256KiB (most real transfers) report only
-once, at completion, since chunking a handful of bytes would add syscall
-overhead for a duration too short to ever be visibly "in progress."
-
-Output format matches real rsync's own (`rsync.1`'s own shown examples),
-one line per progress update:
-
-```
-782448  63%  195.61kB/s    0:00:02
-1,238,099 100%  154.76kB/s    0:00:08  (xfr#5, to-chk=169/396)
-```
-
-The first form is a mid-transfer update: raw byte count so far, percent
-of the file's total size, current transfer rate, and estimated time
-remaining (`H:MM:SS`, hours always shown even at zero, matching the man
-page's own `"0:00:04"`-style examples). The second is the line printed
-when a file finishes: comma-grouped total bytes, `100%`, the achieved
-rate, elapsed time for that file, and `(xfr#N, to-chk=M/T)` - this file
-was the Nth one actually transferred, with M files left to check out of
-T total entries in the sync.
-
-Reporting runs on its own goroutine, fed through a buffered channel
-(`progressReporter`, `internal/pipeline/progress.go`): `report()` is a
-non-blocking send (`select`/`default`) for *every* update including the
-final one, so a slow or entirely absent consumer on the other end of
-`Output` can never stall the actual file write - an update is dropped
-rather than the transfer blocking on it. `stop()` (deferred immediately
-after the reporter is constructed in `Receiver`, so it always runs even
-on an early-error return) closes the update channel and waits for the
-goroutine's own `run` loop to drain and exit, so no goroutine outlives a
-sync. Verified by dedicated concurrency tests
-(`TestProgressReporter_ReportDoesNotBlockOnSlowConsumer`,
-`TestProgressReporter_StopDoesNotLeakTheGoroutine`) rather than assumed
-safe.
-
-`--progress` never fires during `--dry-run`: it specifically measures
-bytes committed to disk, and dry-run skips that write entirely, so there
-is nothing to report (`TestReceiver_ProgressDoesNotFireDuringDryRun`).
-`--stats`, below, has no such restriction.
-
-### `--stats`
-
-Printed once, after the whole sync completes, matching real rsync's own
-field names and structure:
-
-```
-Number of files: 4 (reg: 3, dir: 1)
-Number of created files: 3 (reg: 2, dir: 1)
-Number of regular files transferred: 2
-Total file size: 1,416 bytes
-Total transferred file size: 16 bytes
-Literal data: 16 bytes
-Matched data: 1,400 bytes
-Total bytes sent: 612
-Total bytes received: 1,498
-
-sent 612 bytes  received 1,498 bytes  4,220.00 bytes/sec
-total size is 1,416  speedup is 0.67
-```
-
-- **Number of files / created files**: every entry in the sender's file
-  list, broken down by type (`reg`/`dir`/`link`); "created" counts only
-  those that did not already exist at the destination. The type
-  breakdown omits any type with a zero count (e.g. a sync with no
-  symlinks omits `link:` entirely), and the "created files" line itself
-  is omitted when nothing was newly created.
-- **Number of regular files transferred**: files whose content actually
-  changed, *or* were newly created - a brand-new empty file counts here
-  even though it has no bytes to compare, which needed a real fix (see
-  below); a pre-existing byte-identical file does not.
-- **Total file size / Total transferred file size**: sums of `entry.Size`
-  across all regular files, and across only the transferred ones.
-- **Literal data / Matched data**: bytes coming from the delta as new
-  data (`DataOp`) versus copied from the existing destination file
-  (`CopyOp`), summed with the same block-boundary math `sync.ApplyDelta`
-  itself uses (`deltaByteCounts`, `internal/pipeline/receiver.go`).
-- **Total bytes sent / received**: actual wire traffic for this
-  connection, measured by wrapping the `io.ReadWriter` passed to
-  `Receiver` in a byte-counting decorator (`countingReadWriter`,
-  `internal/pipeline/stats.go`) rather than threading a counter through
-  every individual send/recv call in `messages.go` - chosen specifically
-  so neither `Sender` nor its own tests needed any changes for this
-  ticket.
-- **speedup ratio**: `total_size / (bytes_sent + bytes_received)`,
-  verified against upstream rsync's own `main.c` (`output_summary`)
-  rather than guessed, and 0 (not NaN/Inf) when nothing was sent or
-  received at all. `(DRY RUN)` is appended to the speedup line under
-  `--dry-run`, reusing the same suffix real rsync itself prints.
-- **Not present**: no "Number of deleted files" line - grsync has no
-  `--delete` (see [Status](#status)) - and no file-list build-time
-  fields, since grsync doesn't separately time that phase the way
-  upstream rsync's own stats block does.
-
-Unlike `--progress`, `--stats` is fully compatible with `--dry-run`:
-every field it reports is derived from planning data (the signature/delta
-exchange, which dry-run still performs in full - see
-[Dry-Run Mode](#dry-run-mode)) or from wire bytes actually exchanged,
-neither of which dry-run skips - only the final disk write is, and stats
-doesn't depend on that (`TestReceiver_StatsWorksInDryRun`).
-
-### A real bug this ticket's self-review caught
-
-A brand-new *empty* file has `oldData == nil` (nothing existed before)
-and `newData == nil` too - `sync.ApplyDelta`'s accumulator is never
-appended to when there are zero delta ops, which is exactly what happens
-for a zero-byte file. `bytes.Equal(nil, nil)` is `true`, so a naive
-"did the content change" check alone would call a genuinely new empty
-file unchanged, undercounting both "files transferred" and the progress
-reporter's own `xfr#` counter. Fixed with a separate `transferred :=
-!existed || contentChanged` check used specifically for stats/xfer
-accounting (`receiveRegularFile`, `internal/pipeline/receiver.go`);
-`contentChanged` alone is still what itemize output uses, since
-`itemizeFile` already handles the `!existed` case as its own first,
-higher-priority branch. Locked in by
-`TestReceiver_StatsCountsNewEmptyFileAsTransferred`.
-
-### Across transports
-
-- **Local**: threaded straight through `ReceiverOptions`, same as
-  itemize/verbose.
-- **SSH**: `--progress`/`--stats` are appended to the remote
-  `grsync --server` command line exactly like `--dry-run`/
-  `--itemize-changes`/`--verbose` already are (see
-  [Dry-Run Mode](#dry-run-mode)'s own "Across transports" section) - no
-  new wire protocol needed, and output reaches the local terminal through
-  the same live stderr passthrough already established there.
-  `TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer` proves this
-  over a real SSH connection to `127.0.0.1` (skipped gracefully without a
-  local `sshd`).
-- **`rsync://` daemon, download (`DirectionGet`)**: works exactly like a
-  local sync - the client's own `Receiver` runs locally, with a real
-  channel (this process's own stdout/wherever `Output` points) to print
-  to. Verified over a real TCP connection by `TestDaemon_RealTCP_StatsWorkForGet`.
-- **`rsync://` daemon, upload (`DirectionPut`)**: **the same disclosed gap
-  `--itemize-changes`/`--verbose` already have, not a new one.** Once the
-  module handshake ends, the daemon connection is pure binary wire
-  protocol with no channel for arbitrary text (see
-  [Dry-Run Mode](#dry-run-mode)'s own explanation of why) - the *server's*
-  `Receiver`, which is the side actually applying the upload, has no way
-  to get progress or stats text back to the uploading client. `grsync`'s
-  existing one-time stderr note for this case already covers
-  `--progress`/`--stats` alongside `-i`/`-v`
-  (`internal/cli/sync.go`'s daemon-PUT warning). Confirmed harmless by
-  `TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks`: the
-  client's own `ReceiverOptions{Progress: true, Stats: true}` is silently
-  inert for this direction (`Sender` never even looks at
-  `ReceiverOptions`), and the upload itself still completes correctly.
+`--progress` prints a live line per file as it's written to disk, and
+`--stats` prints an end-of-sync summary - both formatted to match real
+rsync's own output. One thing to note: grsync transfers each file as a
+single unit rather than streaming it, so `--progress` reports disk-write
+progress rather than network progress the way real rsync's does. It
+doesn't fire during `--dry-run` for the same reason; `--stats` isn't
+affected, since all its numbers come from planning data that a dry run
+still computes.
 
 ## Compression
 
-`--compress`/`-z` compresses a file's literal delta data with zlib
-before it crosses the wire; `--compress-level` controls how hard, and
-`--skip-compress` excludes already-compressed file types. All three
-match real rsync's own semantics, verified against upstream's actual
-source (`token.c`, `RsyncProject/rsync`) and `rsync.1`'s own documented
-wording rather than assumed.
-
-### What gets compressed, and what doesn't
-
-Only a delta's literal data - the bytes a `DataOp` carries because they
-didn't match anything in the receiver's signature - is ever compressed.
-`CopyOp`s (plain block-index references, not data) and every
-`FrameSignature` (checksums) are never touched, matching the ticket's
-own scope exactly.
-
-Rather than compressing each `DataOp` independently, `Sender` (via
-`toWireDeltaOps`, `internal/pipeline/messages.go`) concatenates *all* of
-one file's literal data into a single buffer and zlib-compresses that as
-one unit per `FrameDelta` message, with a single `Compressed bool`
-marker on the message itself; each `DataOp`'s own wire form then carries
-only how many of the decompressed stream's bytes are its
-(`wireDeltaOp.Length`), so the receiver can re-slice it back apart after
-one decompression. This amortizes zlib's fixed ~8-byte header/trailer
-overhead across a whole file instead of paying it again for every
-separate literal run a scattered-changes file can produce - closer to
-real rsync's own `zlibx` compression choice (one persistent per-file
-deflate stream with matched data excluded from it) than compressing
-op-by-op would have been. If the compressed result isn't actually
-smaller than the raw literal data - realistic for a file whose total
-changed content is tiny, exactly the case delta transfer exists for, or
-for already-incompressible data that slipped past `--skip-compress` -
-the file is sent uncompressed instead; `Compressed` is a real, checked
-outcome, not just a request.
-
-Compression is entirely a **sending-side** decision. `Receiver` takes no
-compression-related options of its own at all: it simply decompresses
-whatever each `deltaMessage.Compressed` marker says, on every transport,
-which is possible because grsync only ever pushes (see
-[Status](#status)) - `Sender` always runs on the local, requesting
-process, never remotely, for every path currently wired into the CLI.
-
-### `--compress-level`
-
-Verified against real rsync's own source (`token.c`'s
-`init_compression_level`) and `rsync.1`'s own documented wording: for
-zlib compression, valid levels are **1 (fastest) to 9 (smallest), with 6
-as the default**. `--compress-level=0` explicitly turns compression off
-- overriding a `-z` given alongside it - and `--compress-level=-1` means
-"use the default." Giving `--compress-level` alone, without `-z`,
-implies compression (unless the resulting level is 0), matching real
-rsync's own documented "the `--compress` option is implied" rule. An
-out-of-range value is silently clamped into `[1, 9]`, matching
-`rsync.1`'s own "too-large or too-small value" wording. All of this is
-`ClampCompressLevel` (`internal/pipeline/compress.go`) and
-`effectiveCompressOptions` (`internal/cli/sync.go`).
-
-### `--skip-compress`
-
-Overrides the built-in list of already-compressed file suffixes
-(`gz`, `zip`, `jpg`, `mp3`, `mp4`, and 91 others) that are sent
-uncompressed even with `--compress` on, since running zlib over an
-already-compressed format wastes CPU for no size benefit. The full
-default list is real rsync's own, copied verbatim from `rsync.1`'s own
-documented default (`DefaultSkipCompressSuffixes`,
-`internal/pipeline/compress.go`) rather than invented. An explicit
-`--skip-compress=""` is a meaningful override in its own right ("skip
-nothing"), matching real rsync's own documented meaning for it - grsync
-tells that apart from "the flag was never given at all" via
-`cmd.Flags().Changed`, not `opts.skipCompress`'s zero value, since an
-empty string is both.
-
-Matching is a plain, case-insensitive suffix list
-(`--skip-compress=gz/jpg/mp3`); real rsync's own `--skip-compress`
-grammar additionally supports bracketed character classes inside a
-suffix (e.g. `mp[34]`), which grsync's version does not - a deliberate,
-disclosed scope reduction, since plain suffixes cover the default list
-and the overwhelming majority of real-world uses.
-
-**Worth disclosing**: real rsync's own current documentation (as of this
-writing) admits `--skip-compress` "has no effect" in its own latest
-implementation, because none of its currently-supported compression
-algorithms allow changing level mid-stream - its per-file persistent
-deflate context, once opened, keeps compressing everything at the same
-level regardless of what the suffix list says. grsync's frame-per-file
-design has no such persistent stream to be stuck with: `toWireDeltaOps`
-makes a fresh, genuine "compress this file's literal data or don't" call
-for every file, so `--skip-compress` actually works here - a real
-improvement made possible by the architectural difference, not a silent
-divergence from upstream's documented behavior.
-
-### Interaction with `--stats` and `--dry-run`
-
-`--stats`' "Total bytes sent"/"Total bytes received" (see
-[Progress and Stats](#progress-and-stats)) already measure genuine wire
-traffic via `countingReadWriter`, which wraps the connection itself - so
-compressed bytes are reflected automatically, no changes needed for this
-ticket. Since `Stats` is computed on the *receiving* side, it's
-specifically **"Total bytes received"** that shrinks with compression
-for an upload (`Sender` on the far end sends compressed data, this side
-receives it) - "Total bytes sent" reflects this side's own small
-signature/ack traffic back to the sender, which compression doesn't
-touch. `Total file size` is unaffected either way, since it describes
-the files themselves, not what crossed the wire.
-
-`--dry-run` and `--compress` compose cleanly: the full signature/delta
-exchange - including compressing the delta's literal data - still runs
-during a dry run exactly as it would for a real sync (see
-[Dry-Run Mode](#dry-run-mode)'s own explanation of why), so itemize
-output stays accurate; only the final disk write is skipped, and
-compression has nothing to do with that.
-
-### Across transports
-
-- **Local**: `Sender` runs in-process with the `CompressOptions`
-  `effectiveCompressOptions` computed from the CLI flags - no different
-  from any other in-process call.
-- **SSH**: unlike `--dry-run`/`--itemize-changes`/`--verbose`/
-  `--progress`/`--stats` (see [Dry-Run Mode](#dry-run-mode)'s own
-  "Across transports" section), `--compress` needs **no remote argv
-  change at all**: `Sender` runs locally for this transport too, and the
-  remote `--server` process's `Receiver` just reacts to each
-  `deltaMessage`'s own `Compressed` marker, exactly like every other
-  transport. Verified over a real SSH connection to `127.0.0.1` by
-  `TestSSHLocalhost_CompressDoesNotBreakTheTransfer` (skipped gracefully
-  without a local `sshd`).
-- **`rsync://` daemon, upload (`DirectionPut`)**: `Sender` runs on the
-  *client* side for this direction (see
-  [rsync Daemon Mode](#rsync-daemon-mode)), exactly where `--compress`'s
-  decision belongs - no daemon-protocol extension needed, the same way
-  SSH needs none. Verified over a real TCP connection by
-  `TestDaemon_RealTCP_PutWithCompressUploadsCorrectly`.
-- **`rsync://` daemon, download (`DirectionGet`)**: the daemon's own
-  `Sender` call for a module download has no CLI wiring at all yet - see
-  [Status](#status)'s "push only" scope boundary, already established
-  before this ticket - so it always runs with compression disabled
-  (`pipeline.CompressOptions{}`), consistent with that existing
-  boundary, not a new gap introduced here.
-
-### Hard links
-
-A hard-link group's secondary members never go through the
-signature/delta exchange at all - `Sender` and `Receiver` both skip them
-outright, recreating the link directly instead (see
-[File Attribute Preservation](#file-attribute-preservation)) - so
-`--compress` is moot for them by construction, with nothing to compress
-in the first place. `TestSenderReceiver_CompressWorksWithHardLinks`
-confirms that skip still holds correctly with compression enabled.
+`--compress`/`-z` compresses a file's changed data with zlib before
+sending it; `--compress-level` (1-9, default 6) and `--skip-compress`
+(a suffix list of already-compressed formats to leave alone) match real
+rsync's own documented behavior. If compressing wouldn't actually shrink
+the data, grsync sends it uncompressed instead.
 
 ## Partial and Append Transfers
 
-`--partial`/`--partial-dir` keep (and can resume from) a file whose
-transfer didn't finish; `--append`/`--append-verify` extend a
-destination file that's shorter than the source without re-sending the
-part that's already there. All four are implemented against real
-rsync's own documented behavior (`rsync.1`) and, where the docs were
-ambiguous, its actual source (`generator.c`, `sender.c`) - verified
-rather than assumed.
+`--partial`/`--partial-dir` keep a file that didn't finish transferring so
+a later run can pick up from it; `--append`/`--append-verify` extend a
+destination file that's shorter than the source instead of re-sending it
+whole.
 
-### A real prerequisite this ticket needed, not just added
+Because grsync transfers each file as one complete unit rather than
+streaming it, "partial" here works at whole-file granularity: if a sync
+of several files is interrupted, files already finished stay finished,
+and the one in progress is either fully absent or kept/discarded per
+`--partial`, but there's no true byte-level resume of a file mid-transfer
+the way real rsync supports.
 
-Before this ticket, `Receiver` wrote a regular file's new content
-straight to its final destination path (`os.WriteFile`, or a chunked
-`os.OpenFile` loop for `--progress`). That meant a process killed
-mid-write left a genuinely truncated file sitting at the real
-destination, with no flag able to prevent or recover from it - `--partial`
-literally cannot mean anything sensible without a separate temp file to
-keep or discard in the first place. Every regular file is now written to
-a fresh temp file next to its destination (`.name.RANDOM.grsync-tmp`,
-created via `os.CreateTemp` for safe unique naming, `0644` by default to
-match `os.WriteFile`'s own prior behavior) and only renamed into place
-once it's completely written - unconditionally, not just when `--partial`
-is given. `--partial`/`--partial-dir` control only what happens to that
-temp file if the transfer aborts before the rename.
-
-### What "partial" means in grsync's architecture (a real, disclosed scope boundary)
-
-grsync's wire protocol has no streaming I/O: one regular file's delta
-arrives as a single, atomic gob-encoded frame, fully decoded into memory
-before a single byte of it is written to disk (the same finding SC-10
-already made for `--progress`). There is no such thing as "half of this
-file's delta arrived" - a dropped connection mid-frame just means that
-file's transfer never started at all, while everything already written
-for *earlier* files in the same sync stays exactly as complete as it
-already was.
-
-**`--partial` in grsync is therefore file-granularity, not real rsync's
-true byte-level mid-file resumption.** It describes which *whole files*
-survive an interrupted multi-file sync, not a partially-written single
-file left in a recoverable half-complete state on the wire. Concretely:
-if file 3 of 5 is the one in flight when a connection drops, files 1-2
-are already complete and untouched by `--partial` either way; file 3 is
-either fully absent (if the drop happened while its delta was still in
-transit - the common case) or has its temp file kept/discarded per
-`--partial`/`--partial-dir` (if the drop happened during the local write
-itself); files 4-5 are never attempted at all.
-`TestReceiver_InterruptedMultiFileSyncKeepsCompletedFilesRegardlessOfPartial`
-is the direct proof of this, run with and without `--partial` to confirm
-the flag genuinely doesn't change that particular outcome.
-
-### `--partial`
-
-Without it, a temp file left behind by an aborted transfer is deleted -
-the destination is left exactly as it was before the sync started (or
-absent, for a new file). With it, the temp file is instead renamed onto
-the real destination path, matching real rsync's own default "keep it
-where the real file goes" behavior - a subsequent run's normal
-signature/delta exchange against that destination file then picks up
-whatever prefix happens to still be correct, for free, with no
-additional resume-lookup mechanism needed.
-
-### `--partial-dir DIR`
-
-Implies `--partial` (matching real rsync's own documented "also implying
-that [`--partial`] be enabled"). Instead of overwriting the real
-destination with the partial result, the temp file is moved into DIR,
-leaving the real destination completely untouched. A relative DIR is
-created inside *each file's own destination directory* (real rsync's own
-documented placement, so a `--partial-dir=.rsync-partial` can be reused
-across an entire tree without files colliding); an absolute DIR is a
-single shared directory, so grsync mirrors each file's full relative
-path underneath it instead of just its basename - real rsync's own docs
-don't spell out this exact scheme for the absolute case, but mirroring
-the relative path is the only one that can't collide between two files
-sharing a basename in different subdirectories.
-
-**Real content-level resumption, not just retention**: on a later run,
-if a file has a leftover partial-dir file, it's used as the delta
-comparison basis *instead of* the (possibly nonexistent) real
-destination file - `sync.GenerateDelta` then naturally produces `CopyOp`s
-for whatever prefix still matches and literal data only for the
-genuinely new tail, exactly like a resumed transfer should.
-`TestSenderReceiver_PartialDirUsedAsResumeBasisOnRetry` measures this
-directly: a resumed transfer with a genuine partial-dir prefix writes
-meaningfully fewer bytes to the wire than an identical transfer starting
-from nothing. The partial-dir file is removed once it's successfully
-folded into a completed transfer, matching real rsync's own documented
-"delete it after it has served its purpose."
-
-**Self-review: could a partial file leak outside `--partial-dir`?**
-No - verified both by re-reading `abandonOrKeep` (`internal/pipeline/partial.go`)
-and by dedicated tests
-(`TestAbandonOrKeep_PartialDirNeverOverwritesExistingDestContent`,
-`TestAbandonOrKeep_NeverLeavesATempFileNextToDestPath`): whenever
-`--partial-dir` is set, an aborted temp file's only two possible
-destinations are the partial-dir path itself or deletion - the real
-destination path is never touched by that code path at all.
-
-### `--append` vs `--append-verify`: the real, verified distinction
-
-Both share the same two eligibility rules, verified against real
-rsync's own source (`generator.c`) rather than assumed: a destination
-file that doesn't exist yet is transferred completely normally (append
-semantics only ever apply to an *existing*, shorter file - "new files
-are transferred," per `rsync.1`); a destination that's already at least
-as long as the source is skipped **entirely and unconditionally** - not
-compared, not touched at all, even if its content genuinely differs.
-
-For a genuinely shorter destination, the two diverge exactly where real
-rsync's own source diverges (`generate_and_send_sums`: plain `--append`
-returns after writing only a header, sending zero real block checksums
-at all; `--append-verify` falls through to the completely normal
-per-block signature loop):
-
-- **`--append`** blindly trusts the existing prefix - grsync's receiver
-  never reads or hashes it at all, just its length. The sender is told
-  (via a wire-level `Append` marker on the signature message) to send
-  only the literal tail past that offset, represented as a single
-  `CopyOp` ("take the receiver's word for these bytes, unverified")
-  followed by a `DataOp` for the new data - reusing `sync.ApplyDelta`
-  completely unchanged, since `CopyOp`'s own contract only ever claims to
-  copy a block, never that it was checksum-verified.
-- **`--append-verify`** runs the exact same `sync.GenerateSignature`/
-  `GenerateDelta`/`ApplyDelta` pipeline as an entirely normal sync -
-  needing no new algorithm at all. The eligibility rules above are the
-  only thing it actually adds on top of a vanilla transfer.
-
-**Self-review: does `--append` risk silent corruption?** Yes - and this
-is real rsync's own documented risk (`rsync.1`: "**can be dangerous** if
-you aren't 100% sure... existing content... is also known to be the
-same"), reproduced faithfully here, not worsened and not silently fixed.
-`TestReceiver_AppendDoesNotVerifyCorruptedPrefix` locks this in
-explicitly: a destination with a wrong existing prefix ends up with that
-wrong prefix preserved verbatim, plus the correct new tail appended after
-it - exactly real rsync's own documented behavior.
-`TestReceiver_AppendVerifyDetectsCorruptedPrefix` proves the same
-scenario is fully corrected under `--append-verify`. **Use `--append`
-only when you are certain the existing destination content is already
-correct** (e.g. a log file only this sync ever writes to) - exactly real
-rsync's own guidance.
-
-A source file that shrinks below what the receiver already trusts
-between the receiver's own check and the sender's actual read (real
-rsync's own "diminished file" race, normally handled with a warning and
-a per-file skip) is treated as a hard error here instead: grsync's
-`Receiver` has no general "skip this one file, keep going" mechanism
-anywhere else in the codebase, and building one solely for this narrow
-race was judged a bigger change than this ticket's own scope - a
-disclosed simplification, not a silent gap.
-
-`--append` and `--append-verify` are mutually exclusive (a clear CLI
-error, matching the same "reject the ambiguous combination outright"
-philosophy `--ipv4`/`--ipv6` already established).
-
-### Interaction with dry-run and hard links
-
-Both flags fully respect `--dry-run`: the append-aware signature/delta
-exchange (and, for `--partial-dir`, the partial-file basis lookup) still
-runs for accurate itemize planning, but the temp-file/rename/cleanup
-code all lives inside the same `if !DryRun` guard every other write in
-`Receiver` does, so nothing is ever created, modified, or deleted on
-disk. `TestReceiver_AppendWorksWithDryRun` and
-`TestReceiver_PartialDirCreatesNoFilesAndDeletesNothingDuringDryRun`
-both confirm this directly, the latter specifically checking that a
-leftover partial-dir file survives a dry run completely untouched
-(neither consumed nor deleted).
-
-A hard-link group's secondary members never reach the signature/delta
-exchange at all (see [Compression](#compression)'s own identical note) -
-so `--partial`/`--append` are structurally moot for them, not specially
-excluded by any append- or partial-specific code.
-`TestReceiver_AppendExcludesHardLinkSecondaryMembers` confirms that
-structural fact still holds with `--append` enabled.
-
-### Across transports
-
-- **Local and SSH**: fully supported. For SSH, `--partial`/
-  `--partial-dir`/`--append`/`--append-verify` are forwarded to the
-  remote `--server` process as ordinary argv flags - the same mechanism
-  SC-11 established for `--dry-run`/`--itemize-changes` - parsed there
-  through the server's own normal flag handling, no wire-protocol change
-  needed. Verified over a real SSH connection by
-  `TestSSHLocalhost_AppendAndPartialDoNotBreakTheTransfer`.
-- **`rsync://` daemon**: **not available**, a real, disclosed gap rather
-  than a silent one. An upload's module `Receiver` runs on the daemon
-  server (see [rsync Daemon Mode](#rsync-daemon-mode)), and
-  `syncToRsyncDaemon` only ever forwards `DryRun` to it via a dedicated
-  wire token - extending that protocol to also carry these four flags is
-  real, separate work outside this ticket's own scope. `grsync` prints a
-  one-time note when any of them is combined with an `rsync://`
-  destination, the same pattern already established for
-  itemize/verbose/progress/stats.
+`--append` trusts the destination's existing bytes without checking them -
+**this can silently preserve corrupted data if that trust turns out to be
+wrong**, exactly as real rsync's own docs warn. Use `--append-verify`
+unless you're certain the existing content is already correct (for
+example, a log file only this sync ever writes to).
 
 ## Batch Mode
 
-> **Format decision, stated as plainly as possible up front**:
-> `--write-batch=FILE`/`--read-batch=FILE` use **grsync's own batch
-> format - not real rsync's, and not byte-compatible with it.** A batch
-> file `grsync --write-batch` produces can only be read back by
-> `grsync --read-batch`; it is not a substitute for, and cannot be mixed
-> with, a real `rsync --write-batch`/`--read-batch` file in either
-> direction. If what you actually need is a batch file usable by (or
-> produced by) the real `rsync` binary, this feature does not provide
-> that, and nothing described below changes that fact.
+`--write-batch=FILE` saves a sync's transfer data to a file, and
+`--read-batch=FILE` replays it later - useful for applying the same update
+to several identical destinations without re-computing the delta each
+time.
 
-### Why: the same tension SC-6/SC-9/SC-16 already disclosed, made explicit
+**This is grsync's own file format, not real rsync's.** A file written by
+`grsync --write-batch` can only be read by `grsync --read-batch`; it is
+not interchangeable with a real `rsync --write-batch`/`--read-batch` file
+in either direction. (Real rsync's batch files are a raw capture of its
+binary wire protocol, tied to a specific protocol version - reproducing
+that exactly would mean reimplementing rsync's wire protocol, which is
+out of scope for this project, same as the daemon and SSH transfer
+formats.)
 
-This ticket's own brief asked for something genuinely different in kind
-from every other wire-touching ticket so far: not just "grsync talking
-to grsync" (already the disclosed scope of the gob-based protocol SC-16
-introduced, SC-6's daemon mode and SC-9's compression both built on top
-of), but literal byte-format interoperability with the real C
-implementation. Verified against real rsync's own source
-(`batch.c`) before writing any code, not assumed: a real `--write-batch`
-file is not a separate serialization format at all - `batch_fd` is
-wired directly into the exact same low-level protocol I/O functions
-(`write_int`, `write_sum_head`, ...) the live network connection uses.
-Concretely, a real batch file:
+`--only-write-batch` (skip the initial destination update) and the
+companion shell-script replay file real rsync also produces are not
+implemented.
 
-- Is the literal multiplexed rsync wire-protocol byte stream, tied to a
-  specific negotiated protocol version (rsync refuses to read a batch
-  written by an incompatible one - "batch files changed format in
-  version 2.6.3")
-- Forces old-school MD4/MD5 checksums and classic zlib compression
-  regardless of what a modern rsync would otherwise negotiate ("not
-  compatible with newer compression choices such as zstd or lz4")
-- Encodes a bitmap of which data-stream-affecting flags were in effect
-  when it was written, since the reader must reconstruct the exact same
-  interpretation context
+## Daemon Mode
 
-Genuine byte-compatibility, in other words, **is** reimplementing real
-rsync's actual wire protocol - the exact effort SC-6, SC-9, and SC-16
-each separately, deliberately declined to take on. Presented as an
-explicit decision point (not defaulted into) and resolved in favor of
-grsync's own format: reusing the existing gob-based delta
-representation, consistent with every other wire-format decision this
-project has made, rather than a large, separate undertaking that would
-arguably deserve its own dedicated ticket(s) if ever pursued.
-
-### What a batch file actually is
-
-A pleasant consequence of grsync's existing architecture: `Sender` only
-ever *writes* two message types to its connection - `FrameFileList`
-once, then `FrameDelta` per regular file (everything else on that
-connection flows the other way, from `Receiver`'s own signature
-requests). A grsync batch file is exactly a byte-for-byte copy of that
-one-directional stream, captured with the exact same
-`transport.WriteFrame`/`ReadFrame` functions already used for the live
-wire - not a new, separate format needing its own codec at all.
-
-- **`--write-batch=FILE`** performs a real sync (matching real rsync's
-  own plain `--write-batch`, which also updates its own destination -
-  unlike `--only-write-batch`, not implemented here, see below) *and*
-  tees `Sender`'s output into FILE via `io.MultiWriter`, installed after
-  any transport handshake completes so the batch never contains
-  handshake bytes. Requires exactly one source (a batch file's single
-  `FrameFileList` corresponds to exactly one `Sender`/`Receiver`
-  session; concatenating more would leave `--read-batch`'s single
-  `recvFileList` call unable to replay anything past the first).
-- **`--read-batch=FILE`** reuses `pipeline.Receiver` **completely
-  unchanged** - exactly what the ticket asked for. `Receiver` has no
-  idea, and no need to know, whether its `io.ReadWriter` is a live
-  connection or a replayed file: its own signature writes go to
-  `io.Discard` (there is no live sender to read them, and none is
-  needed - the recorded deltas were already computed against a real
-  signature at write-batch time), and its delta reads come from FILE
-  instead of a socket, in exactly the order `Sender` originally wrote
-  them. `FILE` may be `-` to read from stdin, matching real rsync's own
-  `--read-batch=-` convention (a CLI ergonomics choice, not a format
-  compatibility claim).
-
-### Verified interactions, not assumed
-
-- **Multiple receivers** (the ticket's own stated purpose - "applied
-  offline to multiple identical receivers"): one `--write-batch` run's
-  output file can be replayed via `--read-batch` against any number of
-  separate destinations independently.
-  `TestE2E_BatchUsableAgainstMultipleReceivers` proves this against
-  three.
-- **`--dry-run` + `--write-batch`**: verified against real rsync's own
-  source (`options.c`: `else if (dry_run) write_batch = 0`) rather than
-  assumed - real rsync **silently disables** batch writing entirely
-  under `--dry-run`, since a dry run never computes a real delta to
-  capture. grsync replicates that exact behavior, but - consistent with
-  this project's own preference for disclosure over silence - prints an
-  explicit one-time note rather than leaving it fully silent.
-- **`--dry-run` + `--read-batch`**: needed no special-casing at all and
-  received none - `Receiver` already treats planning and writing as
-  separate concerns regardless of where its bytes came from, so this is
-  just an ordinary dry-run receive: full itemize planning, zero
-  destination writes.
-- **A sync that fails partway through `--write-batch`**: the batch file
-  is removed entirely, not left behind truncated - a self-review finding
-  fixed before this shipped, since a half-written batch file would look
-  like a real deliverable but could only ever fail (or silently
-  under-apply) on a later replay.
-  `TestE2E_WriteBatchRemovedWhenSyncFailsPartway` locks this in.
-- **A malformed or foreign `--read-batch` file** (garbage bytes, a
-  truncated genuine batch, or a real-rsync-produced one) fails with a
-  clear, ordinary error from the same frame-decoding machinery a live
-  sync already relies on to reject a corrupted connection - there is no
-  separate batch-format validator to bypass, because there is no
-  separate batch format at all.
-  `TestE2E_ReadBatchOfMalformedFileFailsClearly` and
-  `TestE2E_ReadBatchOfTruncatedFileFailsClearly` both confirm a clean
-  error, not a panic or silent misbehavior.
-- **`--compress`** composes transparently: the batch file is a capture
-  of the same `deltaMessage` frames `Sender` always produces, which
-  already carry their own `Compressed` marker (see
-  [Compression](#compression)) - `Receiver` decompresses identically
-  regardless of whether those bytes came from a live connection or a
-  replayed file.
-
-### Across transports, and explicit scope reductions
-
-- **Local and SSH**: fully supported, via the same tap mechanism in
-  both cases (`io.MultiWriter` around whichever `io.Writer` `Sender`
-  would otherwise write to). Verified over a real SSH connection to
-  `127.0.0.1` by `TestE2E_WriteBatchOverRealSSH` (skipped gracefully
-  without a local `sshd`).
-- **`rsync://` daemon destinations**: **rejected outright** with a clear
-  error, not silently producing an empty or corrupt batch. Unlike SSH,
-  there is no clean tap point: `Sender`'s writes to a daemon connection
-  share the same `net.Conn` the greeting/auth handshake already used
-  (see `daemon.DialClient`), so isolating only the batch-worthy frames
-  would need real `internal/daemon` changes, not just a wrapped
-  `io.Writer` at the `internal/cli` call site the way the local/SSH
-  cases use.
-- **`--only-write-batch`** (skip updating the initial destination,
-  batch-only) and the companion `FILE.sh` replay script real rsync's own
-  `--write-batch` also produces are both **not implemented** - genuine,
-  disclosed scope reductions rather than silent gaps: this ticket's own
-  brief asked for `--write-batch`/`--read-batch` specifically, and a
-  Bourne-shell companion script doesn't map cleanly onto a tool that
-  also runs natively on Windows.
-
-## rsync Daemon Mode
-
-`internal/daemon` implements grsync's `--daemon` server mode: a second way
-to *reach* a grsync instance, over a plain TCP port instead of SSH,
-speaking a real subset of upstream rsync's own daemon protocol rather
-than an invented one. Every wire-format detail below (the `rsyncd.conf`
-syntax, the `@RSYNCD` greeting, the MD4 authentication algorithm) was
-checked against upstream rsync's actual source (`authenticate.c`,
-`clientserver.c`) while building this, not reconstructed from memory or
-the man page alone.
+`grsync --daemon` runs a server that speaks a real subset of rsync's
+daemon protocol - the `rsyncd.conf` format, the connection handshake, and
+MD4 challenge-response authentication all match upstream rsync's actual
+behavior.
 
 ```sh
 grsync --daemon --config rsyncd.conf --port 8730
 ```
 
-### `rsyncd.conf`
-
-`daemon.ParseConfig` reads real `rsyncd.conf` syntax: `[module]` sections,
-`name = value` parameters, `#` comments, blank lines, and trailing-`\`
-line continuation. Parameters that appear before any `[module]` header
-become that module's starting defaults, matching real rsync's own global
-section.
-
-Supported parameters:
+### rsyncd.conf
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `path` | *(required)* | directory the module exposes |
 | `comment` | *(empty)* | shown next to the module name in a listing |
-| `read only` | `true` | rejects uploads (`put`) to this module |
-| `list` | `true` | hides the module from a `#list` request - it is *not* made unreachable; a client who already knows its name can still select it directly, matching real rsync's own documented behavior |
-| `exclude` | *(none)* | space-separated patterns hidden from downloads, compiled via the same `sync.CompileRules`/`sync.Included` machinery `--exclude` uses |
-| `auth users` | *(none)* | comma/space-separated usernames; a non-empty list means the module requires authentication |
-| `secrets file` | *(none)* | path to a `name:password` per-line file |
-| `max connections` | `0` (unlimited) | **parsed but not yet enforced** - see Scope boundaries below |
+| `read only` | `true` | rejects uploads to this module |
+| `list` | `true` | hides the module from a listing request (it's still reachable by name if `false`) |
+| `exclude` | *(none)* | patterns hidden from downloads |
+| `auth users` | *(none)* | usernames allowed to connect; non-empty requires authentication |
+| `secrets file` | *(none)* | path to a `name:password` file |
+| `max connections` | `0` | parsed but not currently enforced |
 
-An unrecognized parameter (real rsyncd.conf has dozens grsync doesn't
-implement - `uid`, `hosts allow`, `log file`, `timeout`, and more) is
-silently accepted, not an error: rejecting an otherwise-valid config file
-over one unimplemented option would be worse than ignoring that line. A
-line that isn't valid `name = value` or `[section]` syntax at all, or a
-recognized parameter with a malformed value, is a hard parse error.
+Any other real `rsyncd.conf` parameter is accepted but ignored, rather than
+causing a parse error.
 
-### `rsync://` URLs
+### Connecting
 
-`daemon.ParseURL` parses `rsync://[user@]host[:port]/module[/path]`,
-including the bare `rsync://host` and `rsync://host/` forms real rsync
-uses to mean "list this daemon's modules" rather than selecting one, and
-IPv6 literals.
+`grsync -a src rsync://host/module` uploads to a daemon module, resolving
+credentials the same way real rsync does: username from the URL, else
+`$USER`/`$LOGNAME`, else `nobody`; password from `--password-file`, else
+`$RSYNC_PASSWORD`, else an interactive prompt. There's deliberately no
+`--password` flag - a password on the command line would be visible to
+other users on the same machine, same reasoning as upstream. Only pushing
+to an entire module is supported; syncing a sub-path within a module, or
+pulling from one, isn't yet implemented.
 
-**`rsync://host/module` is a real destination argument to the main
-`grsync SRC... DEST` command**: `grsync -a src rsync://host/module`
-dials the daemon over plain TCP, runs the real handshake/auth below, then
-uploads through the same `pipeline.Sender` every other destination uses.
-`internal/cli`'s `isRsyncURL` distinguishes this from a local path or an
-SSH `user@host:path` by its `rsync://` prefix, checked before either of
-those is - `transport.ParseRemotePath` itself now also refuses anything
-containing `"://"`, so an `rsync://` URL is never valid SSH syntax by
-construction (a real ambiguity found and fixed while wiring this up: it
-used to parse as host `"rsync"`, path `"//host/module"`).
+The password itself is never sent over the wire, only an MD4 hash of it
+combined with a random server-issued challenge, matching real rsync's
+authentication exactly.
 
-Only pushing to a module (`grsync SRC rsync://host/module`) is supported,
-matching the existing SSH-transport restriction rather than introducing a
-new asymmetry - pulling *from* an `rsync://` source is rejected with a
-clear error, the same as pulling from an SSH source already is. A
-destination URL also can't yet target a sub-path within a module
-(`rsync://host/module/subdir`) - the daemon protocol itself (see below)
-only supports syncing an entire module, and that's explicitly out of
-scope to change here; grsync rejects this case with a clear error rather
-than silently ignoring the sub-path.
+Some things real rsyncd.conf supports aren't implemented: wildcard/group
+entries in `auth users`, digest negotiation (grsync always uses MD4), and
+checking the secrets file's own permissions.
 
-**Credentials**: verified against real rsync's actual documented
-behavior (`rsync.1`'s "RSYNC_PASSWORD" and "--password-file" sections)
-rather than invented. The username is the URL's own `user@` part, else
-`USER`, else `LOGNAME` (`USER` wins if both are set), else `"nobody"` -
-real rsync's exact resolution order. The password comes from
-`--password-file FILE` (or stdin, if `FILE` is `-`) if given, else the
-`RSYNC_PASSWORD` environment variable, else an interactive,
-non-echoing terminal prompt - also real rsync's exact precedence.
-**There is deliberately no `--password` flag**: real rsync has never had
-one either, precisely because a password given directly as a
-command-line argument is visible to any other user on the same machine
-via the process list (`ps`), and an environment variable can leak the
-same way on some systems - which is exactly why `--password-file` exists
-and why grsync (matching real rsync) refuses a world-readable
-`--password-file` (POSIX only; see `checkPasswordFilePermissions`, split
-`_unix.go`/`_windows.go` the same way `internal/sync`'s ownership and
-hard-link handling already is).
-
-None of this is resolved eagerly: `daemon.PasswordFunc` is only ever
-called if the daemon actually sends `AUTHREQD`, exactly matching real
-rsync's own `auth_client()`, which is only ever invoked in response to
-that same line. Connecting to a module that turns out not to require
-authentication never prompts, never reads `--password-file`, and never
-consults `RSYNC_PASSWORD` - `TestDialClient_PasswordFuncNotCalledForAnonymousModule`
-in `internal/daemon/client_test.go` proves this directly, not just by
-absence of a prompt in a passing test. A multi-source sync against the
-same daemon destination resolves (and, if it comes to it, prompts) at
-most once for the whole invocation, not once per source, even though
-each source still gets its own connection (see `DialClient` below).
-
-### Handshake and authentication
-
-The connection sequence matches real rsync: the daemon speaks first
-(`@RSYNCD: 31.0`), the client replies with its own greeting, then sends
-either `#list` (module listing) or a module name. An unknown module gets
-an `@ERROR` line; a `list = false` module is skipped by `#list` but still
-selectable by name.
-
-If the selected module has `auth users` configured, the daemon sends
-`@RSYNCD: AUTHREQD <challenge>` with a fresh random challenge; the client
-answers `<user> <response>` where
-`response = base64_no_padding(MD4(secret + challenge))` - secret hashed
-first, then challenge, no seed byte, exactly matching real rsync's
-`generate_hash()`. **The password itself never crosses the wire, only
-this one-way hash of it** - `TestAuth_NoPlaintextPasswordOnWire` in
-`internal/daemon/auth_test.go` proves this by capturing and inspecting
-the actual bytes each side sends, not just checking the outcome.
-Comparison on the server side uses `crypto/subtle` for constant-time
-comparison, and every authentication failure (unknown user, wrong
-password, unreadable secrets file) returns the same generic
-`@ERROR: auth failed on module <name>`, matching real rsync's refusal to
-let a client distinguish those cases.
-
-**Scoped down from real rsync, deliberately:**
-- **Classic MD4 only** - real rsync protocol 30+ negotiates MD4 vs MD5
-  via a digest list in the greeting line; grsync always uses MD4 and
-  ignores any digest list it receives. Digest negotiation is real,
-  unimplemented scope, not a bug.
-- **Exact-match `auth users` only** - real rsync supports wildcards and
-  `@group` entries in this list; grsync matches usernames literally.
-- **The secrets file's own permissions are never checked** - real rsync's
-  default "strict modes" refuses a world- or group-readable secrets file.
-  grsync reads whatever `secrets file` points to regardless of its
-  permissions. Given this project's cross-platform (including Windows)
-  scope, where POSIX permission bits don't map cleanly, this was left
-  out rather than half-implemented; worth a follow-up on POSIX platforms.
-
-### Access control and transfer
-
-Once authenticated, the client sends `get` (download) or `put` (upload).
-`put` against a `read only` module is refused - with an `@ERROR` line and
-without either side ever committing to the transfer protocol - before any
-file ever moves. `get` walks and filters the module's `path` through the
-module's `exclude` patterns before sending, exactly like `--exclude`
-elsewhere in grsync.
-
-**`exclude` is enforced on downloads only.** That's where the daemon
-itself walks and filters the directory it's about to send from, the same
-mechanism `--exclude` already uses; `pipeline.Receiver` has no per-entry
-filtering hook, so an upload to a non-read-only module is not currently
-filtered against the module's `exclude` list. A deliberate, documented
-boundary, not an oversight.
-
-After a module is selected (and authenticated, if required), this package
-hands the connection straight to `pipeline.Sender`/`pipeline.Receiver` -
-the same functions the SSH transport uses. **The handshake and
-authentication above are real-rsync-protocol-shaped; the transfer that
-follows is not.** Like the SSH transport (see
-[End-to-End Sync Pipeline](#end-to-end-sync-pipeline)), it's
-`encoding/gob`, not upstream rsync's actual binary wire format - so a
-grsync daemon interoperates with another grsync client, not with a real
-`rsync` binary, exactly the same boundary that already exists for SSH.
-
-Server and client sides are each a single `net.Conn`-in/`error`-out entry
-point: `daemon.ServeConn` (accepted connections, used by `Serve`'s accept
-loop) and `daemon.DialClient` (outbound connections, used by
-`internal/cli`'s `syncToRsyncDaemon`). `DialClient` exists specifically
-because `DialGreeting`/`DialAuth`/`DialModule` are built around this
-package's own unexported connection type - before `DialClient`, nothing
-outside `internal/daemon` could actually call them, a gap found while
-wiring the CLI up to this package rather than one planned in advance.
-
-**Other scope boundaries:**
-- **`max connections` is parsed but not enforced** - nothing currently
-  caps concurrent connections to a module at that number.
-- One connection's panic can't take the daemon process down: `Serve`
-  recovers per-connection, so a bug anywhere in the handshake/auth/
-  transfer chain stays scoped to that one client instead of killing every
-  other in-flight connection.
-- Every line read before a transfer begins (greeting, module selection,
-  auth response) is capped at 8 KiB, so an unauthenticated client can't
-  force unbounded memory growth by sending data with no newline.
-
-Tested with `TestDaemon_RealTCP_*` and `TestDialClient_*` in
-`internal/daemon`, and end to end through the real CLI command with
-`TestE2E_LocalToRsyncDaemon_*` in `internal/cli/rsync_url_test.go` - all
-over an actual loopback TCP connection (listen, dial, full handshake,
-auth, and transfer), not just in-memory pipes standing in for a
-connection, since (unlike the SSH tests) nothing external is needed to
-exercise this end to end. `internal/cli`'s tests drive the real
-`NewRootCmd()` command, the same way `TestE2E_LocalToLocal` does for a
-local sync, against a real daemon started in-process - not
-`internal/pipeline` or `internal/daemon` called directly.
+Once a module session starts, the transfer itself hands off to the same
+non-wire-compatible protocol the SSH transport uses (see
+[Status](#status)) - the handshake and authentication above are real, but
+the file data that follows isn't.
 
 ## IPv4/IPv6 Support
 
-`--ipv4`/`-4` and `--ipv6`/`-6` constrain which address family a
-connection uses; `--address` binds to a specific local IP or hostname.
-Both are implemented per real rsync's own actual, verified scope for
-each - not a uniform "add a flag everywhere" treatment - because that
-scope genuinely differs by transport, and pretending otherwise would
-either silently no-op somewhere or invent behavior real rsync itself
-doesn't have.
+`--ipv4`/`-4` and `--ipv6`/`-6` restrict which address family a connection
+uses; `--address` binds to a specific local address. Both apply to the
+daemon listener and to dialing an `rsync://` daemon. For SSH, grsync
+doesn't dial the connection itself, so instead it forwards `-4`/`-6` onto
+the `ssh` command it spawns - but only when the remote-shell command is
+actually `ssh` (matching real rsync's own documented behavior); for any
+other `--rsh` override, pass the flag directly, e.g. `--rsh "ssh -4"`.
+Giving both `--ipv4` and `--ipv6` is a clear error.
 
-### Every `net.Dial`/`net.Listen`/subprocess-network call site (the full audit)
+## Limitations
 
-- `internal/cli/daemon.go` - the `--daemon` listener. **Fully honors
-  `--ipv4`/`--ipv6`/`--address`.**
-- `internal/cli/rsync_url.go` - dialing an `rsync://` daemon as a client
-  (`syncToRsyncDaemon`). **Fully honors all three.**
-- `internal/transport/rsh.go`/`session.go` - spawning `ssh` (or whatever
-  `--rsh` overrides it to). **Honors `--ipv4`/`--ipv6` by forwarding a
-  real `-4`/`-6` onto the spawned command's own argv - but only when that
-  command is genuinely `ssh` (see below). `--address` never applies
-  here at all** - grsync doesn't dial this connection itself, `ssh` does,
-  and controlling its own local bind address isn't part of what any
-  remote-shell transport lets a wrapping tool like rsync (or grsync)
-  control.
-- `internal/daemon/server.go`'s `Serve`, `session.go`, `client.go` -
-  all operate on an already-built `net.Listener`/`net.Conn` handed to
-  them from `internal/cli`; none call `net.Dial`/`net.Listen`
-  themselves, so there was nothing here to change.
+A summary of the scope boundaries mentioned throughout this doc, gathered
+in one place:
 
-### `--ipv4`/`-4`, `--ipv6`/`-6`
-
-For the daemon listener and the `rsync://` client dial, these select
-`"tcp4"`/`"tcp6"` over the default dual-stack `"tcp"` passed to
-`net.Listen`/a `net.Dialer` - `tcpNetwork` (`internal/cli/netopts.go`).
-
-For the SSH transport, grsync never dials the connection itself, so
-there is no network string to pick - real rsync solves this by
-forwarding `-4`/`-6` onto the spawned remote-shell command's own argv,
-but **only when it can tell that command is genuinely `ssh`**, verified
-against upstream's actual source (`main.c`'s `do_cmd()`:
-`if (default_af_hint == AF_INET && strcmp(t, "ssh") == 0) args[argc++] = "-4";`,
-where `t` is the resolved command's basename) rather than assumed.
-`rsync.1`'s own wording confirms the scope explicitly: "the forwarding
-of the `-4` or `-6` option to ssh when rsync can deduce that ssh is
-being used as the remote shell. For other remote shells you'll need to
-specify `--rsh SHELL -4` directly." grsync's `sshAddressFamilyFlag`
-(`internal/transport/rsh.go`) replicates this exactly: a real `-4`/`-6`
-is inserted into the spawned argv, right before the target host, if and
-only if the resolved remote-shell program's basename is `ssh` (or
-`ssh.exe` - a Windows-specific addition real rsync's own Unix-only C
-code never needed). Any other `--rsh`/`-e` override (`rsh`, `mosh`, a
-custom wrapper script, ...) gets nothing forwarded - the same documented
-limit real rsync itself has, not a gap grsync introduces. Use
-`--rsh "SHELL -4"` directly for those, exactly as real rsync's own docs
-say to.
-
-**Mutual exclusion**: giving both `--ipv4` and `--ipv6` is a clear,
-immediate error (`tcpNetwork`), validated once up front regardless of
-destination type - even for a local sync, where neither flag does
-anything at all, for predictable, uniform behavior rather than a
-destination-dependent one. This is a deliberate departure from real
-rsync's own actual behavior: upstream's `-4`/`-6` popt registration
-writes both flags into the very same C variable
-(`default_af_hint`), so whichever one is parsed last on the command line
-silently wins if both are given - not a designed behavior, just an
-artifact of shared storage. An explicit error is a better user
-experience than a silently arbitrary "whichever came last" outcome.
-
-### `--address`
-
-Verified against `rsync.1`'s own documented scope rather than assumed:
-client-side, `--address` is "the wildcard address when connecting to an
-rsync daemon" - i.e. the *local/source* address of that outbound
-connection; daemon-side, it's the listen address. Neither mention applies
-to the rsh/ssh transport at all - matching the audit above.
-
-- **Daemon listen** (`internal/cli/daemon.go`): `opts.address` (`""` by
-  default, meaning the wildcard address - every interface, unchanged
-  from before this ticket) is joined with the port and passed straight to
-  `net.Listen`, which resolves a hostname itself if given one.
-- **`rsync://` client dial** (`internal/cli/rsync_url.go`): resolved once
-  via `resolveLocalAddr` (`internal/cli/netopts.go`) into a `*net.TCPAddr`
-  and set as a `net.Dialer`'s `LocalAddr` - `net.ResolveTCPAddr` accepts
-  either a literal IP or a hostname, matching real rsync's own documented
-  "(or hostname)" scope, and is given the same `"tcp4"`/`"tcp6"`/`"tcp"`
-  network hint the actual dial will use, so `--address host.example
-  --ipv6` resolves to that host's IPv6 address specifically, not
-  whichever family a plain lookup happens to return first.
-
-  A subtle Go correctness point worth calling out explicitly:
-  `resolveLocalAddr` returns a nil `*net.TCPAddr` for an empty
-  `--address`, and the caller only assigns it into `net.Dialer.LocalAddr`
-  when it's genuinely non-nil - assigning a nil `*net.TCPAddr` directly
-  into that `net.Addr` interface field would otherwise produce a
-  non-nil interface wrapping a nil pointer (Go's classic typed-nil
-  gotcha), which the dialer would then try to actually use as a local
-  address instead of correctly treating it as "no preference."
-
-An `--address` that's the wrong family for the network in use (e.g.
-`--ipv4` combined with an IPv6 literal `--address`) fails with a clear
-error from `net.Listen`/`net.ResolveTCPAddr` themselves - inherent to how
-sockets work, not something grsync adds special-case handling for.
-
-### Testing
-
-Real loopback listen+dial round trips for both `127.0.0.1` and `::1`
-(the ticket's own explicit requirement), not mocks: `TestE2E_DaemonListensOnIPv4LoopbackWithAddressFlag`/
-`_IPv6_...` drive the actual `--daemon` CLI command bound to each address
-and sync a real file to it; `TestE2E_ClientDialsOverIPv6` proves the
-client-dial side against a real IPv6 socket independently.
-`TestE2E_ForcingIPv4AgainstIPv6OnlyDaemonFails` is the address-family
-*constraint* proof the ticket asked for specifically: a daemon bound only
-to `::1`, dialed with `--ipv4` forced against a hostname that resolves to
-both families, fails with a real `dial tcp4 ... refused` error - proving
-`--ipv4` genuinely restricts which family gets tried, not just that the
-flag is silently accepted. `TestBuildRSHCommand_IPv4ForwardedToDefaultSSH`
-and its siblings (`internal/transport/rsh_test.go`) cover the ssh-argv
-forwarding logic directly, including the exact non-forwarding case for a
-non-ssh `--rsh` override. IPv6-dependent tests call `requireIPv6Loopback`
-first and skip gracefully (not fail) in an environment without a working
-IPv6 loopback, the same established pattern `requireLocalSSHServer`
-already uses for the SSH tests.
+- **No real rsync wire-protocol compatibility** - the network transfer
+  format, daemon transfer format, and batch file format are all grsync's
+  own. grsync only interoperates with itself. (The daemon's handshake and
+  authentication *are* real-protocol-compatible; only the transfer that
+  follows is not.)
+- **No `--delete`** - grsync never removes files from the destination.
+- **No trailing-slash distinction** - real rsync treats `src` and `src/`
+  differently (copy the directory itself vs. its contents); grsync always
+  copies contents, regardless of a trailing slash.
+- **Pulling from a remote source isn't supported** - only pushing to a
+  local, SSH, or daemon destination.
+- **Fixed block size** for the delta algorithm, rather than scaling with
+  file size.
+- **`--partial` is whole-file, not byte-level** - see
+  [Partial and Append Transfers](#partial-and-append-transfers).
+- **Device and special files** beyond FIFOs aren't recreated (see
+  [What's preserved](#whats-preserved)).
+- **Daemon `exclude` only applies to downloads**, not uploads to a
+  non-read-only module.
+- **`max connections` in rsyncd.conf isn't enforced.**
 
 ## Testing
 
-Beyond each section's own `### Testing` subsection above (which covers that
-feature's specific tests), the project as a whole has four further layers:
-real-rsync comparison integration tests, fuzz targets, throughput
-benchmarks, and CI hardening (`-race`, `govulncheck`).
+Unit tests cover each package individually. Beyond that:
 
-### Real-rsync comparison tests
+- **Real-rsync comparison tests** run grsync and a real `rsync` binary
+  independently against the same files and compare the results -
+  confirming grsync produces equivalent *output*, not that the two tools
+  can talk to each other over the network (see [Limitations](#limitations)).
+  These skip automatically if no `rsync` binary is available.
+- **Fuzz tests** target the checksum code, filter pattern matching, and
+  daemon/frame parsing of untrusted input, checking each one never panics
+  or misbehaves on malformed data.
+- **Benchmarks** measure delta-generation throughput across different file
+  sizes and change amounts.
+- **CI** runs the full test suite on Linux and Windows, with Go's race
+  detector on the Linux leg and `govulncheck` for known vulnerabilities.
 
-`internal/cli/rsync_compare_test.go` runs grsync and a real `rsync` binary
-independently against the same source tree and diffs the resulting
-destination trees for equivalence. **This checks behavioral equivalence,
-not wire-protocol interoperability** - the same distinction already
-disclosed for batch mode, compression, and daemon mode above: grsync's
-own sync protocol is gob-based, not a reimplementation of rsync's actual
-wire format, so the two tools are never talking to each other here, only
-being pointed at the same input and compared on output. If no `rsync`
-binary is found on `PATH`, these tests skip (not fail), the same
-established pattern the SSH tests already use for `requireLocalSSHServer`.
+## Project Layout
 
-Three scenarios are covered: a basic recursive sync, a filtered sync
-(`--exclude`), and attribute preservation (permissions and mtime, with a
-tolerance for filesystem timestamp-precision differences between temp
-directories - a real, deliberate design choice to avoid false failures
-from test-environment noise rather than a genuine correctness gap). Both
-tools are invoked with plain `-r`/`-rpt`, never `-a`, specifically to
-avoid owner/group comparisons that would be flaky or require root in CI.
-
-Building these tests surfaced a genuine, previously-undisclosed scope
-boundary: **grsync has no trailing-slash sensitivity on source paths.**
-Real rsync famously treats `src` (copy the directory itself into `dest`)
-and `src/` (copy `src`'s contents into `dest`) differently; grsync's
-`Walk` (`internal/sync/walk.go`) always excludes the root path from its
-own output, i.e. it unconditionally behaves as if a trailing slash were
-given, regardless of whether the CLI argument actually has one. The
-comparison tests account for this by invoking real rsync with an explicit
-trailing slash to match; anyone relying on grsync as an rsync CLI
-substitute should be aware `src` and `src/` behave identically here,
-unlike real rsync.
-
-### Fuzzing
-
-Six `testing.F` fuzz targets, each checking one explicit invariant rather
-than fuzzing without a clear property in mind:
-
-- `FuzzWeakChecksumRoll` (`internal/sync`) - the rolling checksum's
-  incrementally-updated value always matches recomputing from scratch on
-  the same window, for any data and window size. If this ever broke, the
-  delta algorithm would silently miss or misidentify block matches.
-- `FuzzRoundTripDelta` (`internal/sync`) - `ApplyDelta(old, GenerateDelta(sig, new), sig)`
-  always reproduces `new` exactly, for arbitrary (old, new) byte pairs.
-- `FuzzCompileAndMatch` (`internal/sync`) - the filter pattern compiler
-  and matcher never panic on any pattern/path string, however malformed.
-- `FuzzReadGreeting` and `FuzzReadLine` (`internal/daemon`) - the daemon's
-  greeting-line and shared line-reading code never panic on untrusted
-  network input, and `readLine` never returns a line longer than
-  `maxLineLength` regardless of how much unterminated data a peer sends
-  (the anti-DoS memory bound the code documents).
-- `FuzzReadFrame` (`internal/transport`) - frame decoding never panics and
-  never attempts an oversized allocation on a corrupted or hostile
-  stream, the same protection that
-  `TestE2E_ReadBatchOfMalformedFileFailsClearly` (see
-  [Batch Mode](#batch-mode) above) already found catching one hand-picked
-  garbage file cleanly; this target explores far beyond that single case.
-
-`go test ./...` alone only replays each target's seed corpus as ordinary
-subtests - it does not actually fuzz. CI runs each target through a real,
-bounded `-fuzz -fuzztime 15s` burst in its own dedicated job step.
-
-### Benchmarks
-
-`internal/sync/delta_bench_test.go` benchmarks `GenerateDelta` (block
-matching, the most performance-sensitive code in the project, run once
-per file on every sync) and `GenerateSignature` across three file sizes
-(10KB, 100KB, 1MB) and, for `GenerateDelta`, four change percentages (0%,
-10%, 50%, 100%) - unmatched content falls back to an expensive
-byte-by-byte incremental scan, so a file's similarity to its old version
-matters as much as its size for real throughput.
-
-### CI
-
-`.github/workflows/ci.yaml` runs `go build`/`go vet`, `golangci-lint`,
-`govulncheck`, the fuzz targets above, and `go test` on both Linux and
-Windows runners. `-race` runs on the Linux leg only: it requires cgo and
-a C toolchain, reliably available on `ubuntu-latest` but not something
-this project can verify for `windows-latest` without a real runner to
-test against. This isn't theoretical - the first real CI run of this leg
-caught a genuine deadlock in `syncLocal` (`internal/cli/sync.go`): a
-receiver failure partway through a sync left the sender goroutine parked
-forever reading a reply that would never come, timing out the whole test
-binary after 10 minutes. The same test passed instantly, every time, on
-Windows without `-race` - the race window only opened under `-race`'s own
-added scheduling overhead - which is exactly why local, non-race runs
-alone would never have caught it. (Fixed by having both `syncLocal`
-goroutines close the pipe halves they own, with `CloseWithError`, once
-they're done - see the function's own comments for the full
-explanation.) The Linux leg also installs a real `rsync` binary so the
-comparison tests above get a genuine execution somewhere in CI, not just
-a proof they can skip; the Windows leg has no equivalent easy install and
-instead exercises the graceful-skip path, matching a real Windows dev
-machine without rsync.
-
-## Architecture
-
-- `cmd/grsync` - CLI entrypoint.
-- `internal/cli` - flag/argument parsing (built on cobra) and the real
-  sync entry point (`sync.go`): local-to-local runs the pipeline
-  in-process over an `io.Pipe`, local-to-remote (SSH) spawns and drives it
-  over an SSH `Session`, and local-to-`rsync://` (`rsync_url.go`) dials
-  the daemon over TCP and drives it through `internal/daemon`'s
-  `DialClient`; `credentials.go` resolves the username/password for the
-  latter, matching real rsync's own precedence (see
-  [rsync Daemon Mode](#rsync-daemon-mode) above).
-- `internal/pipeline` - wires `internal/sync` and `internal/transport`
-  together into an actual sync; see
-  [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) above.
-- `internal/sync` - file-list generation, filter matching, the
-  delta-transfer algorithm, and attribute preservation.
-- `internal/transport` - remote endpoint parsing, RSH command
-  construction, frame protocol, subprocess session management, and the
-  `--server` handshake.
-- `internal/daemon` - the rsync daemon protocol, both sides: `rsyncd.conf`
-  and `rsync://` URL parsing, the `@RSYNCD` greeting/handshake and module
-  listing, MD4 challenge-response authentication, and per-module access
-  control, handing off to `internal/pipeline` for the actual transfer via
-  `ServeConn` (server) and `DialClient` (client). See
-  [rsync Daemon Mode](#rsync-daemon-mode) above.
-
-Goal: full feature parity with upstream rsync, including protocol/format
-interoperability where specified (e.g. batch mode's file format).
+- `cmd/grsync` - CLI entrypoint
+- `internal/cli` - flag parsing and the sync entry point
+- `internal/pipeline` - wires the sync algorithm and transport together
+  into an actual transfer
+- `internal/sync` - file enumeration, filtering, the delta algorithm, and
+  attribute preservation
+- `internal/transport` - SSH/subprocess connections and the wire framing
+  protocol
+- `internal/daemon` - the rsync daemon protocol, both server and client
+  sides
 
 ## License
 
