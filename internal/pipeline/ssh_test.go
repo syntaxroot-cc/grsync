@@ -80,7 +80,7 @@ func TestSSHLocalhost_SyncRoundTrip(t *testing.T) {
 
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
 	}()
 
 	select {
@@ -128,7 +128,7 @@ func TestSSHLocalhost_DryRunMakesNoChanges(t *testing.T) {
 
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
 	}()
 
 	select {
@@ -185,7 +185,7 @@ func TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer(t *testing.T) {
 
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false)
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
 	}()
 
 	select {
@@ -202,4 +202,53 @@ func TestSSHLocalhost_ProgressAndStatsDoNotBreakTheTransfer(t *testing.T) {
 	}
 
 	assertSameContent(t, filepath.Join(src, "big.bin"), filepath.Join(dest, "big.bin"))
+}
+
+// TestSSHLocalhost_CompressDoesNotBreakTheTransfer is the real,
+// over-the-wire proof that --compress/-z's client-side decision (see
+// pipeline.CompressOptions' own doc comment - Sender runs locally here,
+// so no remote --server argv change is needed at all, unlike --dry-run/
+// --itemize-changes/--verbose/--progress/--stats) doesn't corrupt or
+// interfere with an actual transfer over real SSH: the remote --server
+// process needs no compression-related flag on its own command line,
+// since its Receiver just reacts to each deltaMessage's own Compressed
+// marker.
+func TestSSHLocalhost_CompressDoesNotBreakTheTransfer(t *testing.T) {
+	requireLocalSSHServer(t)
+	grsyncPath := buildGrsyncBinary(t)
+
+	src := t.TempDir()
+	dest := t.TempDir()
+	content := strings.Repeat("compressible ssh transfer content ", 2000)
+	mustWriteFile(t, filepath.Join(src, "big.txt"), content)
+
+	session, err := transport.Dial("", "", "127.0.0.1", []string{grsyncPath, "--server", dest})
+	if err != nil {
+		t.Fatalf("Dial returned error: %v", err)
+	}
+
+	if err := transport.Handshake(session); err != nil {
+		t.Fatalf("Handshake returned error: %v", err)
+	}
+
+	copts := CompressOptions{Enabled: true, Level: DefaultCompressLevel}
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- Sender(session, src, sync.WalkOptions{Recursive: true}, nil, false, copts)
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Sender did not complete within 20s")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Errorf("Session.Close returned error: %v", err)
+	}
+
+	assertSameContent(t, filepath.Join(src, "big.txt"), filepath.Join(dest, "big.txt"))
 }

@@ -33,7 +33,12 @@ import (
 // -rlptgoD, no H) - detecting hard links means an extra Lstat per entry,
 // a cost real rsync doesn't spend unless asked to, so grsync doesn't
 // either.
-func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool) error {
+//
+// copts governs --compress/-z: entirely a sending-side decision (see
+// CompressOptions' own doc comment) - Receiver needs no counterpart
+// parameter at all, since decompression is driven purely by what each
+// deltaMessage's own Compressed marker says, on every transport.
+func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, copts CompressOptions) error {
 	entries, err := sync.Walk(src, walkOpts)
 	if err != nil {
 		return fmt.Errorf("walking %q: %w", src, err)
@@ -88,7 +93,7 @@ func Sender(rw io.ReadWriter, src string, walkOpts sync.WalkOptions, rules []syn
 		}
 
 		ops := sync.GenerateDelta(sigMsg.Sig, data)
-		if err := sendDelta(rw, entry.Path, ops); err != nil {
+		if err := sendDelta(rw, entry.Path, ops, copts); err != nil {
 			return fmt.Errorf("sending delta for %q: %w", entry.Path, err)
 		}
 	}

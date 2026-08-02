@@ -41,7 +41,7 @@ func TestServeModule_GetDownloadsFiles(t *testing.T) {
 	go func() { serverErrCh <- ServeModule(server, m) }()
 
 	dest := t.TempDir()
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{Perms: true}, pipeline.ReceiverOptions{}); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{Perms: true}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule returned error: %v", err)
 	}
 	if err := <-serverErrCh; err != nil {
@@ -76,7 +76,7 @@ func TestServeModule_GetHonorsModuleExclude(t *testing.T) {
 	go func() { serverErrCh <- ServeModule(server, m) }()
 
 	dest := t.TempDir()
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule returned error: %v", err)
 	}
 	if err := <-serverErrCh; err != nil {
@@ -102,7 +102,7 @@ func TestServeModule_PutToReadOnlyModuleFails(t *testing.T) {
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "upload.txt"), "trying to push this up")
 
-	dialErr := DialModule(client, DirectionPut, src, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{})
+	dialErr := DialModule(client, DirectionPut, src, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{})
 	if dialErr == nil {
 		t.Fatalf("DialModule against a read-only module returned nil error, want an error")
 	}
@@ -129,7 +129,7 @@ func TestServeModule_PutToWritableModuleSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
-	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule returned error: %v", err)
 	}
 	if err := <-serverErrCh; err != nil {

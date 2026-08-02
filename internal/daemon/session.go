@@ -134,7 +134,13 @@ func ServeModule(c *conn, m Module) error {
 		if err != nil {
 			return fmt.Errorf("compiling module %q exclude rules: %w", m.Name, err)
 		}
-		if err := pipeline.Sender(c, m.Path, sync.WalkOptions{Recursive: true}, rules, moduleAttrOptions().HardLinks); err != nil {
+		// pipeline.CompressOptions{} (disabled): a module download has no
+		// CLI wiring at all yet (see runSync's own "pulling... is not yet
+		// supported" restriction), so there is no client-facing --compress
+		// flag that could reach this server-side Sender call in the first
+		// place - consistent with that existing scope boundary, not a new
+		// gap. See the README's Compression section.
+		if err := pipeline.Sender(c, m.Path, sync.WalkOptions{Recursive: true}, rules, moduleAttrOptions().HardLinks, pipeline.CompressOptions{}); err != nil {
 			return err
 		}
 		return waitForTransferDone(c)
@@ -181,7 +187,14 @@ func ServeModule(c *conn, m Module) error {
 // silently unusable for a DirectionPut, since the daemon protocol has no
 // channel to carry that reporting text back from the server - see
 // ServeModule's own comment on the same limitation.
-func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions) error {
+//
+// copts is the DirectionPut mirror image of that same asymmetry: it only
+// matters for that direction's client-side Sender call (--compress/-z is
+// entirely a sending-side decision, see pipeline.CompressOptions' own
+// doc comment) and is simply unused for DirectionGet, where the
+// server-side Sender that would consult it has no CLI wiring at all yet
+// (see ServeModule's own comment on that same boundary).
+func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
 	directionLine := string(direction)
 	if direction == DirectionPut && ropts.DryRun {
 		directionLine += " " + dryRunToken
@@ -205,7 +218,7 @@ func DialModule(c *conn, direction Direction, localPath string, rules []sync.Rul
 		}
 		return writeLine(c.w, transferDone)
 	case DirectionPut:
-		if err := pipeline.Sender(c, localPath, walkOpts, rules, attrOpts.HardLinks); err != nil {
+		if err := pipeline.Sender(c, localPath, walkOpts, rules, attrOpts.HardLinks, copts); err != nil {
 			return err
 		}
 		return waitForTransferDone(c)

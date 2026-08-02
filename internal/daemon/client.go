@@ -21,9 +21,9 @@ import (
 // module must be non-empty: DialClient runs a transfer, not a listing -
 // callers that want to list a daemon's modules should use DialGreeting
 // directly with an empty module instead. See DialModule's own doc
-// comment for exactly what ropts does and doesn't reach on each
+// comment for exactly what ropts and copts do and don't reach on each
 // direction.
-func DialClient(nc net.Conn, module, user string, password PasswordFunc, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions) error {
+func DialClient(nc net.Conn, module, user string, password PasswordFunc, direction Direction, localPath string, rules []sync.Rule, walkOpts sync.WalkOptions, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
 	if module == "" {
 		return fmt.Errorf("DialClient requires a module name")
 	}
@@ -36,5 +36,5 @@ func DialClient(nc net.Conn, module, user string, password PasswordFunc, directi
 	if err := DialAuth(c, user, password); err != nil {
 		return err
 	}
-	return DialModule(c, direction, localPath, rules, walkOpts, attrOpts, ropts)
+	return DialModule(c, direction, localPath, rules, walkOpts, attrOpts, ropts, copts)
 }

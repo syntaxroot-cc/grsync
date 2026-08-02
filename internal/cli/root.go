@@ -41,29 +41,31 @@ type FilterRule struct {
 // in one struct (rather than loose variables) makes it straightforward to
 // pass a single value into internal/sync once that package exists.
 type options struct {
-	archive      bool
-	verbose      bool
-	compress     bool
-	recursive    bool
-	dirs         bool
-	dryRun       bool
-	delete       bool
-	progress     bool
-	perms        bool
-	times        bool
-	owner        bool
-	group        bool
-	links        bool
-	hardLinks    bool
-	itemize      bool
-	stats        bool
-	filterRules  []FilterRule
-	rsh          string
-	server       bool
-	daemon       bool
-	config       string
-	port         int
-	passwordFile string
+	archive       bool
+	verbose       bool
+	compress      bool
+	compressLevel int
+	skipCompress  string
+	recursive     bool
+	dirs          bool
+	dryRun        bool
+	delete        bool
+	progress      bool
+	perms         bool
+	times         bool
+	owner         bool
+	group         bool
+	links         bool
+	hardLinks     bool
+	itemize       bool
+	stats         bool
+	filterRules   []FilterRule
+	rsh           string
+	server        bool
+	daemon        bool
+	config        string
+	port          int
+	passwordFile  string
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -106,7 +108,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
 			"Local-to-local and local-to-remote (SSH) syncs are supported, including --dry-run, " +
-			"--itemize-changes, --progress, and --stats; compression and full --delete are not yet.",
+			"--itemize-changes, --progress, --stats, and --compress; full --delete is not yet.",
 		// --server takes exactly one positional arg (the destination path)
 		// rather than the normal <source>...<destination> shape: it is how
 		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
@@ -141,7 +143,18 @@ func NewRootCmd() *cobra.Command {
 	flags.BoolVarP(&opts.verbose, "verbose", "v", false,
 		"mention each updated item's path (superseded by --itemize-changes when both are given, "+
 			"matching real rsync's own -v/-i relationship)")
-	flags.BoolVarP(&opts.compress, "compress", "z", false, "compress file data during transfer")
+	flags.BoolVarP(&opts.compress, "compress", "z", false,
+		"compress a file's literal delta data with zlib before sending it (checksums/signatures are never "+
+			"compressed); see the README's Compression section")
+	flags.IntVar(&opts.compressLevel, "compress-level", 0,
+		"explicitly set the zlib compression level (1-9, default 6) instead of --compress's implicit "+
+			"default; implies --compress even without -z, unless set to 0 (\"off\", which disables "+
+			"compression even if -z was also given) - matches real rsync's own --compress-level/--zl "+
+			"range, default, and off-semantics, verified against upstream source")
+	flags.StringVar(&opts.skipCompress, "skip-compress", "",
+		"override the default list of already-compressed file suffixes (slash-separated, e.g. gz/jpg/mp3) "+
+			"that --compress/-z sends uncompressed; an empty string means \"skip nothing\" - matches real "+
+			"rsync's own --skip-compress (see the README's Compression section for the full built-in default list)")
 	flags.BoolVarP(&opts.recursive, "recursive", "r", false, "recurse into directories")
 	flags.BoolVarP(&opts.dirs, "dirs", "d", false, "include directories themselves without recursing into their contents (implied by --recursive)")
 	flags.BoolVarP(&opts.dryRun, "dry-run", "n", false, "perform a trial run: full planning (file list, filters, deltas) with no filesystem changes")

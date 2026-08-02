@@ -28,7 +28,7 @@ func runSenderReceiver(t *testing.T, src, dest string, walkOpts sync.WalkOptions
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
-	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks, CompressOptions{}) }()
 
 	receiverErrCh := make(chan error, 1)
 	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ReceiverOptions{}) }()
@@ -363,7 +363,7 @@ func runSenderReceiverWithOptions(t *testing.T, src, dest string, walkOpts sync.
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
-	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks, CompressOptions{}) }()
 
 	receiverErrCh := make(chan error, 1)
 	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ropts) }()
@@ -384,6 +384,303 @@ func runSenderReceiverWithOptions(t *testing.T, src, dest string, walkOpts sync.
 	case <-time.After(10 * time.Second):
 		t.Fatal("Sender did not complete within 10s")
 	}
+}
+
+// runSenderReceiverWithCompressOptions is runSenderReceiverWithOptions's
+// counterpart for tests that need control over the sender's compression
+// behavior - kept separate for the same reason runSenderReceiverWithOptions
+// itself was (see its own doc comment): none of the many existing
+// runSenderReceiver/runSenderReceiverWithOptions callers care about
+// compression, so Sender's CompressOptions parameter stays defaulted to
+// CompressOptions{} (disabled) in those two instead of forcing every
+// existing call site to pass one.
+//
+// Returns the number of bytes Sender actually wrote to the connection
+// (via the same countingReadWriter Stats itself uses - see stats.go), so
+// callers can compare compressed vs. uncompressed wire size against real
+// bytes sent, not just trust that the flag was read.
+func runSenderReceiverWithCompressOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions, copts CompressOptions) (bytesWritten int64) {
+	t.Helper()
+
+	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
+	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
+
+	sender := &countingReadWriter{rw: pipeReadWriter{Reader: senderReadsFromReceiver, Writer: senderWritesToReceiver}}
+	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
+
+	senderErrCh := make(chan error, 1)
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks, copts) }()
+
+	receiverErrCh := make(chan error, 1)
+	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ropts) }()
+
+	select {
+	case err := <-receiverErrCh:
+		if err != nil {
+			t.Fatalf("Receiver returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Receiver did not complete within 10s")
+	}
+	select {
+	case err := <-senderErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Sender did not complete within 10s")
+	}
+
+	return sender.written
+}
+
+// TestSenderReceiver_CompressReducesWireBytesForCompressibleContent is
+// SC-9's core end-to-end proof: syncing the exact same highly-compressible
+// file with --compress enabled must write genuinely fewer bytes to the
+// wire than syncing it uncompressed, and the destination content must
+// still come out byte-identical to the source either way - compression
+// must never be observable in the result, only in the traffic.
+func TestSenderReceiver_CompressReducesWireBytesForCompressibleContent(t *testing.T) {
+	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000) // ~90KB, highly compressible
+
+	uncompressedSrc, uncompressedDest := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(uncompressedSrc, "big.txt"), content)
+	uncompressedBytes := runSenderReceiverWithCompressOptions(t, uncompressedSrc, uncompressedDest,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{}, CompressOptions{})
+
+	compressedSrc, compressedDest := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(compressedSrc, "big.txt"), content)
+	compressedBytes := runSenderReceiverWithCompressOptions(t, compressedSrc, compressedDest,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{},
+		CompressOptions{Enabled: true, Level: DefaultCompressLevel})
+
+	if compressedBytes >= uncompressedBytes {
+		t.Errorf("compressed transfer wrote %d bytes, uncompressed wrote %d bytes, want compressed meaningfully smaller", compressedBytes, uncompressedBytes)
+	}
+
+	assertSameContent(t, filepath.Join(uncompressedSrc, "big.txt"), filepath.Join(uncompressedDest, "big.txt"))
+	assertSameContent(t, filepath.Join(compressedSrc, "big.txt"), filepath.Join(compressedDest, "big.txt"))
+}
+
+// TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed proves
+// --skip-compress end to end, not just at the wire-message level
+// (TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed already
+// covers that): a highly-compressible file whose suffix is skip-listed
+// must write essentially the same number of bytes as a fully-disabled
+// compression run, while an identical file whose suffix is NOT
+// skip-listed, synced in the same run, still compresses.
+func TestSenderReceiver_SkipCompressLeavesMatchingSuffixUncompressed(t *testing.T) {
+	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000)
+
+	src, dest := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "skip.bin"), content)
+
+	uncompressedRun := t.TempDir()
+	mustWriteFile(t, filepath.Join(uncompressedRun, "skip.bin"), content)
+	baselineBytes := runSenderReceiverWithCompressOptions(t, uncompressedRun, t.TempDir(),
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{}, CompressOptions{})
+
+	skipBytes := runSenderReceiverWithCompressOptions(t, src, dest,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{},
+		CompressOptions{Enabled: true, Level: DefaultCompressLevel, SkipSuffixes: []string{"bin"}})
+
+	// Not asserting exact equality - gob framing overhead can vary by a
+	// handful of bytes for unrelated reasons - but a skipped file must be
+	// nowhere near as small as a genuinely compressed one would be; the
+	// compressible-content test above already shows compression more than
+	// halving a similarly-sized file, so any close-to-baseline result here
+	// is conclusive that skip-compress actually took effect.
+	if skipBytes < baselineBytes*9/10 {
+		t.Errorf("skip-listed file wrote %d bytes, baseline (uncompressed) wrote %d bytes, want them close - skip-compress should have left this file uncompressed", skipBytes, baselineBytes)
+	}
+
+	assertSameContent(t, filepath.Join(src, "skip.bin"), filepath.Join(dest, "skip.bin"))
+}
+
+// TestReceiver_StatsBytesReceivedReflectCompressedSize confirms Step 5's
+// stats convention: real rsync's own "Total bytes sent"/"Total bytes
+// received" measure what actually crossed the wire, which - once
+// --compress is in play - genuinely is the compressed size, not the
+// original file size. stats.go's countingReadWriter already wraps the
+// raw connection needing no changes for this (see its own doc comment);
+// this test is the proof that holds end to end, not just an inspection
+// of the code.
+//
+// It's specifically "Total bytes received" (not "sent") that carries the
+// file's compressible data here: Stats is computed on the Receiver side
+// (SC-10's own design - see stats.go), and Receiver receives the file
+// list and delta payloads from Sender while only ever sending small
+// signature/ack messages back - so the large, compression-sensitive
+// traffic flows in the "received" direction from this side's own point
+// of view, not "sent".
+func TestReceiver_StatsBytesReceivedReflectCompressedSize(t *testing.T) {
+	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000)
+
+	uncompressedSrc, uncompressedDest := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(uncompressedSrc, "big.txt"), content)
+	var uncompressedOut bytes.Buffer
+	runSenderReceiverWithCompressAndReceiverOptions(t, uncompressedSrc, uncompressedDest,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{},
+		ReceiverOptions{Stats: true, Output: &uncompressedOut}, CompressOptions{})
+
+	compressedSrc, compressedDest := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(compressedSrc, "big.txt"), content)
+	var compressedOut bytes.Buffer
+	runSenderReceiverWithCompressAndReceiverOptions(t, compressedSrc, compressedDest,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{},
+		ReceiverOptions{Stats: true, Output: &compressedOut},
+		CompressOptions{Enabled: true, Level: DefaultCompressLevel})
+
+	uncompressedReceived := statsField(t, uncompressedOut.String(), "Total bytes received")
+	compressedReceived := statsField(t, compressedOut.String(), "Total bytes received")
+
+	if compressedReceived >= uncompressedReceived {
+		t.Errorf("--stats reported compressed run received %d bytes, uncompressed run received %d bytes, want compressed smaller - "+
+			"stats must reflect actual wire bytes, not original file size", compressedReceived, uncompressedReceived)
+	}
+
+	// Total file size is a property of the files themselves, unaffected by
+	// compression - the two runs synced byte-identical content, so this
+	// field specifically must match despite bytes sent differing.
+	if got, want := statsField(t, compressedOut.String(), "Total file size"), statsField(t, uncompressedOut.String(), "Total file size"); got != want {
+		t.Errorf("Total file size = %d with compression, %d without, want equal - compression must not affect this field", got, want)
+	}
+}
+
+// runSenderReceiverWithCompressAndReceiverOptions combines
+// runSenderReceiverWithCompressOptions and runSenderReceiverWithOptions'
+// separate concerns (compression behavior and receiver-side reporting)
+// for the one test above that needs both at once, rather than growing
+// either of those two into a shared do-everything helper every other
+// caller would need to pass zero values through.
+func runSenderReceiverWithCompressAndReceiverOptions(t *testing.T, src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts ReceiverOptions, copts CompressOptions) {
+	t.Helper()
+
+	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
+	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
+
+	sender := pipeReadWriter{Reader: senderReadsFromReceiver, Writer: senderWritesToReceiver}
+	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
+
+	senderErrCh := make(chan error, 1)
+	go func() { senderErrCh <- Sender(sender, src, walkOpts, rules, attrOpts.HardLinks, copts) }()
+
+	receiverErrCh := make(chan error, 1)
+	go func() { receiverErrCh <- Receiver(receiver, dest, attrOpts, ropts) }()
+
+	select {
+	case err := <-receiverErrCh:
+		if err != nil {
+			t.Fatalf("Receiver returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Receiver did not complete within 10s")
+	}
+	select {
+	case err := <-senderErrCh:
+		if err != nil {
+			t.Fatalf("Sender returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Sender did not complete within 10s")
+	}
+}
+
+// TestSenderReceiver_CompressWorksWithDryRun confirms Step 5's dry-run
+// interaction: the signature/delta exchange (including compression of
+// the delta's literal data) still needs to run byte-correct for accurate
+// itemize output even though nothing is written - compression must not
+// break that, and the dry-run destination must still end up completely
+// empty.
+func TestSenderReceiver_CompressWorksWithDryRun(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+	content := strings.Repeat("compressible dry-run content ", 500)
+	mustWriteFile(t, filepath.Join(srcRoot, "file.txt"), content)
+
+	var out bytes.Buffer
+	runSenderReceiverWithCompressAndReceiverOptions(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{},
+		ReceiverOptions{DryRun: true, Itemize: true, Output: &out},
+		CompressOptions{Enabled: true, Level: DefaultCompressLevel})
+
+	if !strings.Contains(out.String(), "file.txt") {
+		t.Errorf("dry-run itemize output = %q, want it to mention file.txt", out.String())
+	}
+
+	entries, err := os.ReadDir(destRoot)
+	if err != nil {
+		t.Fatalf("ReadDir(destRoot): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destRoot is not empty after a dry run with --compress: %v", entries)
+	}
+}
+
+// TestSenderReceiver_CompressWorksWithHardLinks confirms Step 5's
+// hard-link interaction: a hard-link group's secondary members never go
+// through the signature/delta exchange at all (Sender/Receiver both skip
+// them outright), so --compress is moot for them by construction: this
+// test's only job is to confirm that skip still holds correctly with
+// --compress enabled, i.e. compression didn't somehow reintroduce a
+// signature/delta round trip for a secondary member.
+func TestSenderReceiver_CompressWorksWithHardLinks(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+
+	content := strings.Repeat("shared hard-linked content ", 500)
+	mustWriteFile(t, filepath.Join(srcRoot, "original.txt"), content)
+	if err := os.Link(filepath.Join(srcRoot, "original.txt"), filepath.Join(srcRoot, "linked.txt")); err != nil {
+		t.Skipf("hard link creation unsupported in this environment: %v", err)
+	}
+
+	runSenderReceiverWithCompressAndReceiverOptions(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{Perms: true, Times: true, HardLinks: true},
+		ReceiverOptions{}, CompressOptions{Enabled: true, Level: DefaultCompressLevel})
+
+	assertSameContent(t, filepath.Join(srcRoot, "original.txt"), filepath.Join(destRoot, "original.txt"))
+	assertSameContent(t, filepath.Join(srcRoot, "linked.txt"), filepath.Join(destRoot, "linked.txt"))
+
+	if !sync.HardLinksSupported() {
+		return
+	}
+	originalInfo, err := os.Stat(filepath.Join(destRoot, "original.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	linkedInfo, err := os.Stat(filepath.Join(destRoot, "linked.txt"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if !os.SameFile(originalInfo, linkedInfo) {
+		t.Errorf("original.txt and linked.txt are independent files at the destination with --compress enabled, want them still hard-linked")
+	}
+}
+
+// TestSenderReceiver_CompressWorksWithEmptyAndUnchangedFiles is a
+// self-review edge case: toWireDeltaOps only attempts compression when a
+// file's concatenated literal data is non-empty (see its own doc
+// comment), so a brand-new empty file (zero DataOps, per SC-10's own
+// investigation into ApplyDelta's accumulator) and a byte-identical
+// unchanged file (all CopyOps, zero DataOps) both take the "nothing to
+// compress" path through that same function - this confirms both still
+// sync correctly with --compress enabled, not just that compressible
+// content does.
+func TestSenderReceiver_CompressWorksWithEmptyAndUnchangedFiles(t *testing.T) {
+	srcRoot := t.TempDir()
+	destRoot := t.TempDir()
+
+	const unchanged = "byte-identical at both ends, all copy ops"
+	mustWriteFile(t, filepath.Join(srcRoot, "empty.txt"), "")
+	mustWriteFile(t, filepath.Join(srcRoot, "unchanged.txt"), unchanged)
+	mustWriteFile(t, filepath.Join(destRoot, "unchanged.txt"), unchanged)
+
+	runSenderReceiverWithCompressAndReceiverOptions(t, srcRoot, destRoot,
+		sync.WalkOptions{Recursive: true}, nil, sync.AttrOptions{}, ReceiverOptions{},
+		CompressOptions{Enabled: true, Level: DefaultCompressLevel})
+
+	assertSameContent(t, filepath.Join(srcRoot, "empty.txt"), filepath.Join(destRoot, "empty.txt"))
+	assertSameContent(t, filepath.Join(srcRoot, "unchanged.txt"), filepath.Join(destRoot, "unchanged.txt"))
 }
 
 // buildRichTree creates a source tree exercising every write path
@@ -536,7 +833,7 @@ func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 			return
 		}
 		ops := sync.GenerateDelta(sigMsg.Sig, []byte(content))
-		if err := sendDelta(peerWritesToReceiver, "aaa-primary.txt", ops); err != nil {
+		if err := sendDelta(peerWritesToReceiver, "aaa-primary.txt", ops, CompressOptions{}); err != nil {
 			peerErrCh <- fmt.Errorf("sending delta: %w", err)
 			return
 		}
@@ -551,7 +848,7 @@ func TestReceiver_AppliesHardLinksFromReceivedGroups(t *testing.T) {
 			return
 		}
 		ops = sync.GenerateDelta(sigMsg.Sig, []byte("xxxxx"))
-		if err := sendDelta(peerWritesToReceiver, "unrelated.txt", ops); err != nil {
+		if err := sendDelta(peerWritesToReceiver, "unrelated.txt", ops, CompressOptions{}); err != nil {
 			peerErrCh <- fmt.Errorf("sending delta: %w", err)
 			return
 		}
@@ -631,7 +928,9 @@ func TestSender_ConnectionDropsMidTransfer(t *testing.T) {
 	}()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- Sender(sender, srcRoot, sync.WalkOptions{Recursive: true}, nil, false) }()
+	go func() {
+		errCh <- Sender(sender, srcRoot, sync.WalkOptions{Recursive: true}, nil, false, CompressOptions{})
+	}()
 
 	select {
 	case err := <-errCh:

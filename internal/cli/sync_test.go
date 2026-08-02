@@ -5,12 +5,127 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
+	"github.com/syntaxroot-cc/grsync/internal/pipeline"
 	"github.com/syntaxroot-cc/grsync/internal/sync"
 )
+
+// buildCompressTestCmd registers only the three --compress-related flags
+// (not NewRootCmd's full set) on a bare *cobra.Command and parses args
+// against them, giving effectiveCompressOptions_test.go's table test
+// direct control over cmd.Flags().Changed - the thing that actually
+// distinguishes "--compress-level was never given" from "--compress-level=0
+// was given explicitly," which opts.compressLevel's own zero value can't
+// do alone (see effectiveCompressOptions' own doc comment).
+func buildCompressTestCmd(t *testing.T, args []string) (*cobra.Command, *options) {
+	t.Helper()
+	opts := &options{}
+	cmd := &cobra.Command{}
+	flags := cmd.Flags()
+	flags.BoolVarP(&opts.compress, "compress", "z", false, "")
+	flags.IntVar(&opts.compressLevel, "compress-level", 0, "")
+	flags.StringVar(&opts.skipCompress, "skip-compress", "", "")
+	if err := flags.Parse(args); err != nil {
+		t.Fatalf("Parse(%v) returned error: %v", args, err)
+	}
+	return cmd, opts
+}
+
+func TestEffectiveCompressOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want pipeline.CompressOptions
+	}{
+		{
+			name: "nothing given",
+			args: nil,
+			want: pipeline.CompressOptions{},
+		},
+		{
+			name: "-z alone uses the real-rsync-verified default level and default suffix list",
+			args: []string{"-z"},
+			want: pipeline.CompressOptions{Enabled: true, Level: pipeline.DefaultCompressLevel, SkipSuffixes: pipeline.DefaultSkipCompressSuffixes},
+		},
+		{
+			name: "--compress-level alone implies --compress, matching real rsync",
+			args: []string{"--compress-level=9"},
+			want: pipeline.CompressOptions{Enabled: true, Level: 9, SkipSuffixes: pipeline.DefaultSkipCompressSuffixes},
+		},
+		{
+			name: "--compress-level=0 alone does not enable compression",
+			args: []string{"--compress-level=0"},
+			want: pipeline.CompressOptions{},
+		},
+		{
+			name: "--compress-level=0 overrides an explicit -z, matching real rsync's own documented behavior",
+			args: []string{"-z", "--compress-level=0"},
+			want: pipeline.CompressOptions{},
+		},
+		{
+			name: "--compress-level=-1 means \"use the default\"",
+			args: []string{"-z", "--compress-level=-1"},
+			want: pipeline.CompressOptions{Enabled: true, Level: pipeline.DefaultCompressLevel, SkipSuffixes: pipeline.DefaultSkipCompressSuffixes},
+		},
+		{
+			name: "an out-of-range level is silently clamped, matching real rsync's own documented behavior",
+			args: []string{"-z", "--compress-level=15"},
+			want: pipeline.CompressOptions{Enabled: true, Level: 9, SkipSuffixes: pipeline.DefaultSkipCompressSuffixes},
+		},
+		{
+			name: "--skip-compress overrides the default suffix list",
+			args: []string{"-z", "--skip-compress=foo/bar"},
+			want: pipeline.CompressOptions{Enabled: true, Level: pipeline.DefaultCompressLevel, SkipSuffixes: []string{"foo", "bar"}},
+		},
+		{
+			name: "--skip-compress=\"\" explicitly means skip nothing, not \"unset\"",
+			args: []string{"-z", "--skip-compress="},
+			want: pipeline.CompressOptions{Enabled: true, Level: pipeline.DefaultCompressLevel, SkipSuffixes: nil},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, opts := buildCompressTestCmd(t, tt.args)
+			got := effectiveCompressOptions(cmd, opts)
+			if got.Enabled != tt.want.Enabled || got.Level != tt.want.Level || len(got.SkipSuffixes) != len(tt.want.SkipSuffixes) {
+				t.Fatalf("effectiveCompressOptions(%v) = %+v, want %+v", tt.args, got, tt.want)
+			}
+			for i := range tt.want.SkipSuffixes {
+				if got.SkipSuffixes[i] != tt.want.SkipSuffixes[i] {
+					t.Errorf("effectiveCompressOptions(%v).SkipSuffixes = %v, want %v", tt.args, got.SkipSuffixes, tt.want.SkipSuffixes)
+					break
+				}
+			}
+		})
+	}
+}
+
+// statsFieldForTest extracts the integer following "label: " from a
+// --stats output block, e.g. statsFieldForTest(t, out, "Total file size")
+// on a line "Total file size: 1,416 bytes" returns 1416 - the CLI
+// package's own counterpart to internal/pipeline's statsField, duplicated
+// rather than exported across packages for a single test-only helper.
+func statsFieldForTest(t *testing.T, output, label string) int64 {
+	t.Helper()
+	re := regexp.MustCompile(regexp.QuoteMeta(label) + `: ([\d,]+)`)
+	m := re.FindStringSubmatch(output)
+	if m == nil {
+		t.Fatalf("field %q not found in stats output:\n%s", label, output)
+	}
+	n, err := strconv.ParseInt(strings.ReplaceAll(m[1], ",", ""), 10, 64)
+	if err != nil {
+		t.Fatalf("parsing field %q value %q: %v", label, m[1], err)
+	}
+	return n
+}
 
 // TestE2E_LocalToLocal drives the real CLI command - the same code path
 // an actual user invocation goes through, not just the internal
@@ -221,6 +336,104 @@ func TestE2E_ProgressOutput(t *testing.T) {
 	}
 	if string(got) != content {
 		t.Errorf("synced content differs from source (len got=%d, want=%d)", len(got), len(content))
+	}
+}
+
+// TestE2E_CompressReducesBytesSent drives the real CLI command twice
+// against the same highly-compressible content - once with --compress,
+// once without - and confirms via --stats' own "Total bytes received"
+// field (see internal/pipeline's TestReceiver_StatsBytesReceivedReflectCompressedSize
+// for why that field, not "sent," carries the file data here) that
+// --compress genuinely reduces wire traffic end to end through the real
+// command, not just at the internal Sender/Receiver level.
+func TestE2E_CompressReducesBytesSent(t *testing.T) {
+	content := strings.Repeat("the quick brown fox jumps over the lazy dog ", 2000)
+
+	runOnce := func(extraArgs ...string) string {
+		src, dst := t.TempDir(), t.TempDir()
+		mustWriteFile(t, filepath.Join(src, "big.txt"), content)
+
+		cmd := NewRootCmd()
+		var out strings.Builder
+		cmd.SetArgs(append([]string{"-a", "--stats"}, append(extraArgs, src, dst)...))
+		cmd.SetOut(&out)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute returned error: %v", err)
+		}
+
+		got, err := os.ReadFile(filepath.Join(dst, "big.txt"))
+		if err != nil {
+			t.Fatalf("reading synced file: %v", err)
+		}
+		if string(got) != content {
+			t.Fatalf("synced content differs from source (len got=%d, want=%d)", len(got), len(content))
+		}
+		return out.String()
+	}
+
+	uncompressedOut := runOnce()
+	compressedOut := runOnce("--compress")
+
+	uncompressedReceived := statsFieldForTest(t, uncompressedOut, "Total bytes received")
+	compressedReceived := statsFieldForTest(t, compressedOut, "Total bytes received")
+	if compressedReceived >= uncompressedReceived {
+		t.Errorf("--compress run received %d bytes, plain run received %d bytes, want --compress meaningfully smaller", compressedReceived, uncompressedReceived)
+	}
+}
+
+// TestE2E_CompressLevelAndSkipCompressFlagsDoNotBreakTransfer drives the
+// real CLI command with --compress-level and --skip-compress together
+// and confirms the transfer still completes correctly - these flags must
+// never affect correctness, only wire size.
+func TestE2E_CompressLevelAndSkipCompressFlagsDoNotBreakTransfer(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	content := strings.Repeat("compressible content ", 1000)
+	mustWriteFile(t, filepath.Join(src, "file.bin"), content)
+
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"-a", "--compress", "--compress-level=9", "--skip-compress=bin", src, dst})
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "file.bin"))
+	if err != nil {
+		t.Fatalf("reading synced file: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("synced content differs from source (len got=%d, want=%d)", len(got), len(content))
+	}
+}
+
+// TestE2E_CompressLevelZeroDisablesCompressionEvenWithDashZ drives the
+// real CLI command with -z --compress-level=0 together and confirms the
+// transfer still completes correctly - real rsync's own documented
+// behavior is that an explicit level of 0 turns compression off even
+// when -z was also given (see effectiveCompressOptions' own doc
+// comment); this only proves the combination doesn't break anything
+// observable from the outside (--stats' "Total bytes received" isn't a
+// reliable enough signal at this small a scale to assert "definitely
+// uncompressed" against, unlike the bigger-content tests above -
+// effectiveCompressOptions_test.go asserts the actual returned
+// CompressOptions directly instead).
+func TestE2E_CompressLevelZeroDisablesCompressionEvenWithDashZ(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "file.txt"), "some content")
+
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"-a", "-z", "--compress-level=0", src, dst})
+	cmd.SetOut(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	if err != nil {
+		t.Fatalf("reading synced file: %v", err)
+	}
+	if string(got) != "some content" {
+		t.Errorf("synced content = %q, want %q", got, "some content")
 	}
 }
 

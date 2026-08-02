@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"io/fs"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +111,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := sendDelta(&buf, "some/file.txt", ops); err != nil {
+	if err := sendDelta(&buf, "some/file.txt", ops, CompressOptions{}); err != nil {
 		t.Fatalf("sendDelta returned error: %v", err)
 	}
 	gotPath, gotOps, err := recvDelta(&buf)
@@ -137,6 +138,127 @@ func TestDeltaRoundTrip(t *testing.T) {
 				t.Errorf("op %d = %+v, want %+v", i, gotOps[i], want)
 			}
 		}
+	}
+}
+
+// TestDeltaRoundTrip_Compressed is SC-9's core wire-format proof: sending
+// a delta with compression enabled must produce a smaller frame than the
+// same ops sent uncompressed, and recvDelta on the compressed side must
+// still reconstruct byte-identical ops - proving toWireDeltaOps/
+// fromWireDeltaOps' compress-once-per-file, re-slice-by-Length design
+// (see deltaMessage's own doc comment) round-trips correctly, not just
+// that compression was attempted.
+func TestDeltaRoundTrip_Compressed(t *testing.T) {
+	literal := []byte(strings.Repeat("compressible literal data ", 200))
+	ops := []sync.DeltaOp{
+		sync.CopyOp{BlockIndex: 3},
+		sync.DataOp{Bytes: literal[:len(literal)/2]},
+		sync.CopyOp{BlockIndex: 1},
+		sync.DataOp{Bytes: literal[len(literal)/2:]},
+	}
+
+	var uncompressed bytes.Buffer
+	if err := sendDelta(&uncompressed, "file.txt", ops, CompressOptions{}); err != nil {
+		t.Fatalf("sendDelta (uncompressed) returned error: %v", err)
+	}
+
+	var compressed bytes.Buffer
+	copts := CompressOptions{Enabled: true, Level: DefaultCompressLevel}
+	if err := sendDelta(&compressed, "file.txt", ops, copts); err != nil {
+		t.Fatalf("sendDelta (compressed) returned error: %v", err)
+	}
+
+	if compressed.Len() >= uncompressed.Len() {
+		t.Errorf("compressed frame = %d bytes, uncompressed = %d bytes, want compressed smaller", compressed.Len(), uncompressed.Len())
+	}
+
+	gotPath, gotOps, err := recvDelta(&compressed)
+	if err != nil {
+		t.Fatalf("recvDelta returned error: %v", err)
+	}
+	if gotPath != "file.txt" {
+		t.Errorf("path = %q, want %q", gotPath, "file.txt")
+	}
+	if len(gotOps) != len(ops) {
+		t.Fatalf("got %d ops, want %d", len(gotOps), len(ops))
+	}
+	for i := range ops {
+		switch want := ops[i].(type) {
+		case sync.CopyOp:
+			got, ok := gotOps[i].(sync.CopyOp)
+			if !ok || got != want {
+				t.Errorf("op %d = %+v, want %+v", i, gotOps[i], want)
+			}
+		case sync.DataOp:
+			got, ok := gotOps[i].(sync.DataOp)
+			if !ok || !bytes.Equal(got.Bytes, want.Bytes) {
+				t.Errorf("op %d length = %d, want %d, equal=%v", i, len(got.Bytes), len(want.Bytes), ok && bytes.Equal(got.Bytes, want.Bytes))
+			}
+		}
+	}
+}
+
+// TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed is the
+// ticket's explicit "inspect actual bytes sent, not just trust the flag
+// was read" requirement: it decodes the raw gob frame directly (the same
+// way recvDelta itself does internally) and asserts deltaMessage.Compressed
+// is false and every op still carries its own literal Bytes, for a path
+// whose suffix is in copts.SkipSuffixes - even though copts.Enabled is
+// true and the literal data is highly compressible.
+func TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed(t *testing.T) {
+	literal := []byte(strings.Repeat("z", 5000)) // trivially compressible
+	ops := []sync.DeltaOp{sync.DataOp{Bytes: literal}}
+	copts := CompressOptions{Enabled: true, Level: DefaultCompressLevel, SkipSuffixes: []string{"bin"}}
+
+	var buf bytes.Buffer
+	if err := sendDelta(&buf, "archive.bin", ops, copts); err != nil {
+		t.Fatalf("sendDelta returned error: %v", err)
+	}
+
+	f, err := transport.ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame returned error: %v", err)
+	}
+	var msg deltaMessage
+	if err := decodeGob(f.Payload, &msg); err != nil {
+		t.Fatalf("decodeGob returned error: %v", err)
+	}
+
+	if msg.Compressed {
+		t.Errorf("deltaMessage.Compressed = true for a .bin path in SkipSuffixes, want false")
+	}
+	if msg.Literal != nil {
+		t.Errorf("deltaMessage.Literal = %d bytes, want nil (unused) when not compressed", len(msg.Literal))
+	}
+	if len(msg.Ops) != 1 || !bytes.Equal(msg.Ops[0].Bytes, literal) {
+		t.Errorf("op 0 did not carry its own literal Bytes directly despite Compressed being false")
+	}
+}
+
+// TestDeltaRoundTrip_DisabledIsGenuinelyUncompressed is
+// TestDeltaRoundTrip_SkipCompressSuffixIsGenuinelyUncompressed's
+// counterpart for CompressOptions{} (the zero value, --compress not
+// given at all): the wire frame must be byte-identical in shape to the
+// pre-SC-9 format, not merely "the same size by coincidence."
+func TestDeltaRoundTrip_DisabledIsGenuinelyUncompressed(t *testing.T) {
+	ops := []sync.DeltaOp{sync.DataOp{Bytes: []byte(strings.Repeat("y", 5000))}}
+
+	var buf bytes.Buffer
+	if err := sendDelta(&buf, "file.dat", ops, CompressOptions{}); err != nil {
+		t.Fatalf("sendDelta returned error: %v", err)
+	}
+
+	f, err := transport.ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame returned error: %v", err)
+	}
+	var msg deltaMessage
+	if err := decodeGob(f.Payload, &msg); err != nil {
+		t.Fatalf("decodeGob returned error: %v", err)
+	}
+
+	if msg.Compressed {
+		t.Errorf("deltaMessage.Compressed = true with CompressOptions{}, want false")
 	}
 }
 
