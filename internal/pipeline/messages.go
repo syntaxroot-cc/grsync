@@ -41,32 +41,84 @@ const (
 type wireDeltaOp struct {
 	Kind       deltaOpKind
 	BlockIndex int    // valid when Kind == deltaOpKindCopy
-	Bytes      []byte // valid when Kind == deltaOpKindData
+	Bytes      []byte // valid when Kind == deltaOpKindData and the enclosing deltaMessage is NOT compressed
+	Length     int    // valid when Kind == deltaOpKindData and the enclosing deltaMessage IS compressed: how many bytes of its decompressed Literal stream belong to this op
 }
 
-func toWireDeltaOps(ops []sync.DeltaOp) ([]wireDeltaOp, error) {
-	wire := make([]wireDeltaOp, len(ops))
+// toWireDeltaOps converts ops to their wire form, compressing this
+// file's entire literal-data stream as a single zlib unit when copts
+// calls for it (see deltaMessage's own doc comment for why whole-file,
+// not per-op) - path is only used to check copts.SkipSuffixes, never
+// otherwise. CopyOp block indices are never touched: they're plain
+// integers, not data, and compressing them would only add overhead for
+// nothing.
+func toWireDeltaOps(ops []sync.DeltaOp, path string, copts CompressOptions) (wire []wireDeltaOp, compressed bool, literal []byte, err error) {
+	wire = make([]wireDeltaOp, len(ops))
+
+	tryCompress := copts.Enabled && !skipCompressSuffix(path, copts.SkipSuffixes)
+	var concatenated []byte
+	if tryCompress {
+		for _, op := range ops {
+			if d, ok := op.(sync.DataOp); ok {
+				concatenated = append(concatenated, d.Bytes...)
+			}
+		}
+		if len(concatenated) > 0 {
+			if c, ok := compressLiteral(concatenated, copts.Level); ok {
+				literal = c
+				compressed = true
+			}
+		}
+	}
+
 	for i, op := range ops {
 		switch o := op.(type) {
 		case sync.CopyOp:
 			wire[i] = wireDeltaOp{Kind: deltaOpKindCopy, BlockIndex: o.BlockIndex}
 		case sync.DataOp:
-			wire[i] = wireDeltaOp{Kind: deltaOpKindData, Bytes: o.Bytes}
+			if compressed {
+				wire[i] = wireDeltaOp{Kind: deltaOpKindData, Length: len(o.Bytes)}
+			} else {
+				wire[i] = wireDeltaOp{Kind: deltaOpKindData, Bytes: o.Bytes}
+			}
 		default:
-			return nil, fmt.Errorf("op %d: unknown DeltaOp type %T", i, op)
+			return nil, false, nil, fmt.Errorf("op %d: unknown DeltaOp type %T", i, op)
 		}
 	}
-	return wire, nil
+	return wire, compressed, literal, nil
 }
 
-func fromWireDeltaOps(wire []wireDeltaOp) ([]sync.DeltaOp, error) {
+// fromWireDeltaOps reverses toWireDeltaOps: when compressed is true, it
+// decompresses literal once and re-slices it back into each op's own
+// bytes using the Length each wireDeltaOp carried; otherwise each op's
+// Bytes is used directly, exactly as before compression existed.
+func fromWireDeltaOps(wire []wireDeltaOp, compressed bool, literal []byte) ([]sync.DeltaOp, error) {
+	var decompressed []byte
+	if compressed {
+		var err error
+		decompressed, err = decompressLiteral(literal)
+		if err != nil {
+			return nil, fmt.Errorf("decompressing literal data: %w", err)
+		}
+	}
+
 	ops := make([]sync.DeltaOp, len(wire))
+	pos := 0
 	for i, w := range wire {
 		switch w.Kind {
 		case deltaOpKindCopy:
 			ops[i] = sync.CopyOp{BlockIndex: w.BlockIndex}
 		case deltaOpKindData:
-			ops[i] = sync.DataOp{Bytes: w.Bytes}
+			if !compressed {
+				ops[i] = sync.DataOp{Bytes: w.Bytes}
+				continue
+			}
+			end := pos + w.Length
+			if w.Length < 0 || end > len(decompressed) {
+				return nil, fmt.Errorf("op %d: decompressed literal stream too short (want %d more bytes at offset %d, have %d total)", i, w.Length, pos, len(decompressed))
+			}
+			ops[i] = sync.DataOp{Bytes: decompressed[pos:end]}
+			pos = end
 		default:
 			return nil, fmt.Errorf("op %d: unknown wire delta op kind %d", i, w.Kind)
 		}
@@ -88,9 +140,24 @@ type signatureMessage struct {
 
 // deltaMessage is FrameDelta's payload: one regular file's delta ops,
 // tagged with its Path for the same reason as signatureMessage.
+//
+// Literal holds every DataOp's bytes for this file, zlib-compressed
+// together as a single stream when Compressed is true - each op's own
+// wireDeltaOp.Bytes is left empty in that case, and its Length instead
+// says how many of Literal's decompressed bytes are its (see
+// toWireDeltaOps/fromWireDeltaOps). Compressing the whole file's literal
+// data as one unit, rather than op-by-op, amortizes zlib's fixed ~8-byte
+// header/trailer overhead across the entire file instead of paying it
+// again for every small literal run a scattered-changes file can
+// produce - see compressLiteral's own doc comment. When Compressed is
+// false, Literal is unused (nil) and every op carries its own Bytes
+// directly, exactly the wire shape this type had before --compress
+// existed.
 type deltaMessage struct {
-	Path string
-	Ops  []wireDeltaOp
+	Path       string
+	Ops        []wireDeltaOp
+	Compressed bool
+	Literal    []byte
 }
 
 func encodeGob(v any) ([]byte, error) {
@@ -178,12 +245,12 @@ func recvSignature(r io.Reader) (signatureMessage, error) {
 	return msg, nil
 }
 
-func sendDelta(w io.Writer, path string, ops []sync.DeltaOp) error {
-	wire, err := toWireDeltaOps(ops)
+func sendDelta(w io.Writer, path string, ops []sync.DeltaOp, copts CompressOptions) error {
+	wire, compressed, literal, err := toWireDeltaOps(ops, path, copts)
 	if err != nil {
 		return fmt.Errorf("converting delta for %q: %w", path, err)
 	}
-	payload, err := encodeGob(deltaMessage{Path: path, Ops: wire})
+	payload, err := encodeGob(deltaMessage{Path: path, Ops: wire, Compressed: compressed, Literal: literal})
 	if err != nil {
 		return fmt.Errorf("encoding delta for %q: %w", path, err)
 	}
@@ -199,7 +266,7 @@ func recvDelta(r io.Reader) (path string, ops []sync.DeltaOp, err error) {
 	if err := decodeGob(f.Payload, &msg); err != nil {
 		return "", nil, fmt.Errorf("decoding delta: %w", err)
 	}
-	ops, err = fromWireDeltaOps(msg.Ops)
+	ops, err = fromWireDeltaOps(msg.Ops, msg.Compressed, msg.Literal)
 	if err != nil {
 		return "", nil, fmt.Errorf("converting delta for %q: %w", msg.Path, err)
 	}

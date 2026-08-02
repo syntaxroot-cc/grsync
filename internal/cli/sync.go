@@ -63,6 +63,43 @@ func effectiveReceiverOptions(opts *options, output io.Writer) pipeline.Receiver
 	}
 }
 
+// effectiveCompressOptions computes pipeline.CompressOptions from opts,
+// mirroring real rsync's own --compress-level implication rule ("The
+// --compress option is implied as long as the level chosen is not a
+// 'don't compress' level" - rsync.1): compression is enabled whenever
+// either -z or --compress-level was given at all, at whatever level
+// --compress-level requested (clamped) or the real-rsync-verified
+// default of 6 if only -z was given, UNLESS that level clamps to 0
+// ("off"), which disables compression outright even if -z was also
+// given - matching real rsync's own documented "--zl=0 turns compression
+// off" behavior exactly, including its override of -z.
+//
+// cmd.Flags().Changed, not opts.compressLevel's zero value, is what
+// distinguishes "--compress-level was never given" from "--compress-level=0
+// was given explicitly" - those two cases mean different things (default
+// level 6 vs. explicitly off) and pflag's own IntVar can't tell them
+// apart by value alone, since 0 is also its unset zero value.
+func effectiveCompressOptions(cmd *cobra.Command, opts *options) pipeline.CompressOptions {
+	levelGiven := cmd.Flags().Changed("compress-level")
+	if !opts.compress && !levelGiven {
+		return pipeline.CompressOptions{}
+	}
+
+	level := pipeline.DefaultCompressLevel
+	if levelGiven {
+		level = pipeline.ClampCompressLevel(opts.compressLevel)
+	}
+	if level == 0 {
+		return pipeline.CompressOptions{}
+	}
+
+	suffixes := pipeline.DefaultSkipCompressSuffixes
+	if cmd.Flags().Changed("skip-compress") {
+		suffixes = pipeline.ParseSkipCompressList(opts.skipCompress)
+	}
+	return pipeline.CompressOptions{Enabled: true, Level: level, SkipSuffixes: suffixes}
+}
+
 // toSyncRawRules converts the CLI's FilterRule list to sync.RawRule.
 // FilterRuleType's string values were chosen to exactly match
 // sync.RuleKind's ("include", "exclude", "filter", "exclude-from",
@@ -102,6 +139,7 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 
 	walkOpts := effectiveWalkOptions(opts)
 	attrOpts := effectiveAttrOptions(opts)
+	copts := effectiveCompressOptions(cmd, opts)
 	rules, err := sync.CompileRules(toSyncRawRules(opts.filterRules))
 	if err != nil {
 		return fmt.Errorf("compiling filter rules: %w", err)
@@ -161,15 +199,15 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 	for _, src := range sources {
 		switch {
 		case isRsyncDaemon:
-			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks, opts.dryRun); err != nil {
+			if err := syncToRsyncDaemon(src, rsyncURL, password, walkOpts, rules, attrOpts.HardLinks, opts.dryRun, copts); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		case isRemote:
-			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts); err != nil {
+			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts, copts); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		default:
-			if err := syncLocal(src, destination, walkOpts, rules, attrOpts, ropts); err != nil {
+			if err := syncLocal(src, destination, walkOpts, rules, attrOpts, ropts, copts); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		}
@@ -188,7 +226,7 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 // way, the exact same pipeline.Sender/pipeline.Receiver functions that
 // carry out a remote sync are what a local sync exercises too, instead of
 // a second, independently-trusted implementation of the same logic.
-func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions) error {
+func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
 	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
 	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
 
@@ -196,7 +234,7 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
-	go func() { senderErrCh <- pipeline.Sender(sender, src, walkOpts, rules, attrOpts.HardLinks) }()
+	go func() { senderErrCh <- pipeline.Sender(sender, src, walkOpts, rules, attrOpts.HardLinks, copts) }()
 
 	receiverErr := pipeline.Receiver(receiver, dest, attrOpts, ropts)
 	senderErr := <-senderErrCh
@@ -221,7 +259,14 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // here at all. This is the same mechanism SC-11 established for
 // DryRun/Itemize/Verbose; Progress/Stats just reuse it rather than
 // inventing a second one.
-func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions) error {
+//
+// copts needs none of that: --compress/-z is a Sender-side decision (see
+// pipeline.CompressOptions' own doc comment), and Sender runs right here,
+// locally, for this transport - there is nothing for the remote
+// --server process to be told via argv at all. The remote Receiver just
+// decompresses whatever each deltaMessage's own Compressed marker says,
+// exactly like every other transport.
+func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
 	remoteArgs := []string{"grsync", "--server"}
 	if ropts.DryRun {
 		remoteArgs = append(remoteArgs, "--dry-run")
@@ -250,7 +295,7 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 		return fmt.Errorf("handshake with %s failed: %w", remote.Host, err)
 	}
 
-	sendErr := pipeline.Sender(session, src, walkOpts, rules, hardLinks)
+	sendErr := pipeline.Sender(session, src, walkOpts, rules, hardLinks, copts)
 	closeErr := session.Close()
 
 	if sendErr != nil {

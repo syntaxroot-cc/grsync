@@ -11,16 +11,19 @@ really walks, filters, diffs, transfers, and reconstructs files, applying
 requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
-out of scope (compression, partial/append transfers, batch mode, full
-`--delete`, and device/special files) - this is real, working sync, not
-yet full feature parity. Hard links *are* now preserved, opt-in via
-`-H`/`--hard-links` exactly like real rsync's own flag (see
+out of scope (partial/append transfers, batch mode, full `--delete`, and
+device/special files) - this is real, working sync, not yet full feature
+parity. Hard links *are* now preserved, opt-in via `-H`/`--hard-links`
+exactly like real rsync's own flag (see
 [File Attribute Preservation](#file-attribute-preservation) below), and
 `--dry-run`/`-n` is a genuine trial run - full planning, zero filesystem
 changes - with real `--itemize-changes`/`-i` output matching rsync's own
 format (see [Dry-Run Mode](#dry-run-mode) below). `--progress` and
 `--stats` are now implemented too, both matching real rsync's own output
 formats (see [Progress and Stats](#progress-and-stats) below).
+`--compress`/`-z` now genuinely compresses a file's literal delta data
+with zlib, including real rsync's own `--compress-level` and
+`--skip-compress` (see [Compression](#compression) below).
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -670,6 +673,156 @@ higher-priority branch. Locked in by
   client's own `ReceiverOptions{Progress: true, Stats: true}` is silently
   inert for this direction (`Sender` never even looks at
   `ReceiverOptions`), and the upload itself still completes correctly.
+
+## Compression
+
+`--compress`/`-z` compresses a file's literal delta data with zlib
+before it crosses the wire; `--compress-level` controls how hard, and
+`--skip-compress` excludes already-compressed file types. All three
+match real rsync's own semantics, verified against upstream's actual
+source (`token.c`, `RsyncProject/rsync`) and `rsync.1`'s own documented
+wording rather than assumed.
+
+### What gets compressed, and what doesn't
+
+Only a delta's literal data - the bytes a `DataOp` carries because they
+didn't match anything in the receiver's signature - is ever compressed.
+`CopyOp`s (plain block-index references, not data) and every
+`FrameSignature` (checksums) are never touched, matching the ticket's
+own scope exactly.
+
+Rather than compressing each `DataOp` independently, `Sender` (via
+`toWireDeltaOps`, `internal/pipeline/messages.go`) concatenates *all* of
+one file's literal data into a single buffer and zlib-compresses that as
+one unit per `FrameDelta` message, with a single `Compressed bool`
+marker on the message itself; each `DataOp`'s own wire form then carries
+only how many of the decompressed stream's bytes are its
+(`wireDeltaOp.Length`), so the receiver can re-slice it back apart after
+one decompression. This amortizes zlib's fixed ~8-byte header/trailer
+overhead across a whole file instead of paying it again for every
+separate literal run a scattered-changes file can produce - closer to
+real rsync's own `zlibx` compression choice (one persistent per-file
+deflate stream with matched data excluded from it) than compressing
+op-by-op would have been. If the compressed result isn't actually
+smaller than the raw literal data - realistic for a file whose total
+changed content is tiny, exactly the case delta transfer exists for, or
+for already-incompressible data that slipped past `--skip-compress` -
+the file is sent uncompressed instead; `Compressed` is a real, checked
+outcome, not just a request.
+
+Compression is entirely a **sending-side** decision. `Receiver` takes no
+compression-related options of its own at all: it simply decompresses
+whatever each `deltaMessage.Compressed` marker says, on every transport,
+which is possible because grsync only ever pushes (see
+[Status](#status)) - `Sender` always runs on the local, requesting
+process, never remotely, for every path currently wired into the CLI.
+
+### `--compress-level`
+
+Verified against real rsync's own source (`token.c`'s
+`init_compression_level`) and `rsync.1`'s own documented wording: for
+zlib compression, valid levels are **1 (fastest) to 9 (smallest), with 6
+as the default**. `--compress-level=0` explicitly turns compression off
+- overriding a `-z` given alongside it - and `--compress-level=-1` means
+"use the default." Giving `--compress-level` alone, without `-z`,
+implies compression (unless the resulting level is 0), matching real
+rsync's own documented "the `--compress` option is implied" rule. An
+out-of-range value is silently clamped into `[1, 9]`, matching
+`rsync.1`'s own "too-large or too-small value" wording. All of this is
+`ClampCompressLevel` (`internal/pipeline/compress.go`) and
+`effectiveCompressOptions` (`internal/cli/sync.go`).
+
+### `--skip-compress`
+
+Overrides the built-in list of already-compressed file suffixes
+(`gz`, `zip`, `jpg`, `mp3`, `mp4`, and 91 others) that are sent
+uncompressed even with `--compress` on, since running zlib over an
+already-compressed format wastes CPU for no size benefit. The full
+default list is real rsync's own, copied verbatim from `rsync.1`'s own
+documented default (`DefaultSkipCompressSuffixes`,
+`internal/pipeline/compress.go`) rather than invented. An explicit
+`--skip-compress=""` is a meaningful override in its own right ("skip
+nothing"), matching real rsync's own documented meaning for it - grsync
+tells that apart from "the flag was never given at all" via
+`cmd.Flags().Changed`, not `opts.skipCompress`'s zero value, since an
+empty string is both.
+
+Matching is a plain, case-insensitive suffix list
+(`--skip-compress=gz/jpg/mp3`); real rsync's own `--skip-compress`
+grammar additionally supports bracketed character classes inside a
+suffix (e.g. `mp[34]`), which grsync's version does not - a deliberate,
+disclosed scope reduction, since plain suffixes cover the default list
+and the overwhelming majority of real-world uses.
+
+**Worth disclosing**: real rsync's own current documentation (as of this
+writing) admits `--skip-compress` "has no effect" in its own latest
+implementation, because none of its currently-supported compression
+algorithms allow changing level mid-stream - its per-file persistent
+deflate context, once opened, keeps compressing everything at the same
+level regardless of what the suffix list says. grsync's frame-per-file
+design has no such persistent stream to be stuck with: `toWireDeltaOps`
+makes a fresh, genuine "compress this file's literal data or don't" call
+for every file, so `--skip-compress` actually works here - a real
+improvement made possible by the architectural difference, not a silent
+divergence from upstream's documented behavior.
+
+### Interaction with `--stats` and `--dry-run`
+
+`--stats`' "Total bytes sent"/"Total bytes received" (see
+[Progress and Stats](#progress-and-stats)) already measure genuine wire
+traffic via `countingReadWriter`, which wraps the connection itself - so
+compressed bytes are reflected automatically, no changes needed for this
+ticket. Since `Stats` is computed on the *receiving* side, it's
+specifically **"Total bytes received"** that shrinks with compression
+for an upload (`Sender` on the far end sends compressed data, this side
+receives it) - "Total bytes sent" reflects this side's own small
+signature/ack traffic back to the sender, which compression doesn't
+touch. `Total file size` is unaffected either way, since it describes
+the files themselves, not what crossed the wire.
+
+`--dry-run` and `--compress` compose cleanly: the full signature/delta
+exchange - including compressing the delta's literal data - still runs
+during a dry run exactly as it would for a real sync (see
+[Dry-Run Mode](#dry-run-mode)'s own explanation of why), so itemize
+output stays accurate; only the final disk write is skipped, and
+compression has nothing to do with that.
+
+### Across transports
+
+- **Local**: `Sender` runs in-process with the `CompressOptions`
+  `effectiveCompressOptions` computed from the CLI flags - no different
+  from any other in-process call.
+- **SSH**: unlike `--dry-run`/`--itemize-changes`/`--verbose`/
+  `--progress`/`--stats` (see [Dry-Run Mode](#dry-run-mode)'s own
+  "Across transports" section), `--compress` needs **no remote argv
+  change at all**: `Sender` runs locally for this transport too, and the
+  remote `--server` process's `Receiver` just reacts to each
+  `deltaMessage`'s own `Compressed` marker, exactly like every other
+  transport. Verified over a real SSH connection to `127.0.0.1` by
+  `TestSSHLocalhost_CompressDoesNotBreakTheTransfer` (skipped gracefully
+  without a local `sshd`).
+- **`rsync://` daemon, upload (`DirectionPut`)**: `Sender` runs on the
+  *client* side for this direction (see
+  [rsync Daemon Mode](#rsync-daemon-mode)), exactly where `--compress`'s
+  decision belongs - no daemon-protocol extension needed, the same way
+  SSH needs none. Verified over a real TCP connection by
+  `TestDaemon_RealTCP_PutWithCompressUploadsCorrectly`.
+- **`rsync://` daemon, download (`DirectionGet`)**: the daemon's own
+  `Sender` call for a module download has no CLI wiring at all yet - see
+  [Status](#status)'s "push only" scope boundary, already established
+  before this ticket - so it always runs with compression disabled
+  (`pipeline.CompressOptions{}`), consistent with that existing
+  boundary, not a new gap introduced here.
+
+### Hard links
+
+A hard-link group's secondary members never go through the
+signature/delta exchange at all - `Sender` and `Receiver` both skip them
+outright, recreating the link directly instead (see
+[File Attribute Preservation](#file-attribute-preservation)) - so
+`--compress` is moot for them by construction, with nothing to compress
+in the first place. `TestSenderReceiver_CompressWorksWithHardLinks`
+confirms that skip still holds correctly with compression enabled.
 
 ## rsync Daemon Mode
 

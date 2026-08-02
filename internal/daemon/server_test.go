@@ -60,7 +60,7 @@ func TestDaemon_RealTCP_AnonymousDownload(t *testing.T) {
 		t.Fatalf("DialAuth: %v", err)
 	}
 	dest := t.TempDir()
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestDaemon_RealTCP_AuthenticatedUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
-	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}); err != nil {
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -193,7 +193,7 @@ func TestDaemon_RealTCP_DryRunPutMakesNoChanges(t *testing.T) {
 		t.Fatalf("compiling empty rule set: %v", err)
 	}
 	ropts := pipeline.ReceiverOptions{DryRun: true}
-	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -234,7 +234,7 @@ func TestDaemon_RealTCP_DryRunGetMakesNoChanges(t *testing.T) {
 
 	dest := t.TempDir()
 	ropts := pipeline.ReceiverOptions{DryRun: true}
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -275,7 +275,7 @@ func TestDaemon_RealTCP_StatsWorkForGet(t *testing.T) {
 	dest := t.TempDir()
 	var out bytes.Buffer
 	ropts := pipeline.ReceiverOptions{Stats: true, Output: &out}
-	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+	if err := DialModule(client, DirectionGet, dest, nil, sync.WalkOptions{}, sync.AttrOptions{}, ropts, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -323,7 +323,7 @@ func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 	// ignored for this direction rather than causing an error.
 	var clientSideOutput bytes.Buffer
 	ropts := pipeline.ReceiverOptions{Progress: true, Stats: true, Output: &clientSideOutput}
-	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts); err != nil {
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, ropts, pipeline.CompressOptions{}); err != nil {
 		t.Fatalf("DialModule: %v", err)
 	}
 
@@ -341,6 +341,56 @@ func TestDaemon_RealTCP_PutIgnoresProgressAndStatsButStillWorks(t *testing.T) {
 	// of transport.
 	if clientSideOutput.Len() != 0 {
 		t.Errorf("client-side output = %q, want empty (Sender never reports progress/stats)", clientSideOutput.String())
+	}
+	if errLog.Len() != 0 {
+		t.Errorf("daemon error log = %q, want empty", errLog.String())
+	}
+}
+
+// TestDaemon_RealTCP_PutWithCompressUploadsCorrectly is SC-9's real,
+// over-the-wire proof for the daemon transport: DirectionPut runs
+// pipeline.Sender on the client side (see DialModule's own doc comment),
+// exactly where --compress/-z's decision belongs, so this drives that
+// same client-side Sender with CompressOptions.Enabled against a real
+// TCP daemon connection and confirms the upload still arrives byte-
+// correct - the server's Receiver only ever reacts to each deltaMessage's
+// own Compressed marker, needing no daemon-protocol change at all.
+func TestDaemon_RealTCP_PutWithCompressUploadsCorrectly(t *testing.T) {
+	modRoot := t.TempDir()
+	cfg := &Config{Modules: map[string]Module{
+		"incoming": {Name: "incoming", Path: modRoot, ReadOnly: false},
+	}}
+	addr, errLog := startTestDaemon(t, cfg)
+
+	client := dialTestDaemon(t, addr)
+	if _, err := DialGreeting(client, "incoming"); err != nil {
+		t.Fatalf("DialGreeting: %v", err)
+	}
+	if err := DialAuth(client, "", StaticPassword("")); err != nil {
+		t.Fatalf("DialAuth: %v", err)
+	}
+
+	src := t.TempDir()
+	content := "compressible daemon upload content, repeated. " +
+		"compressible daemon upload content, repeated. " +
+		"compressible daemon upload content, repeated."
+	mustWriteFile(t, filepath.Join(src, "upload.txt"), content)
+	rules, err := sync.CompileRules(nil)
+	if err != nil {
+		t.Fatalf("compiling empty rule set: %v", err)
+	}
+
+	copts := pipeline.CompressOptions{Enabled: true, Level: pipeline.DefaultCompressLevel}
+	if err := DialModule(client, DirectionPut, src, rules, sync.WalkOptions{}, sync.AttrOptions{}, pipeline.ReceiverOptions{}, copts); err != nil {
+		t.Fatalf("DialModule: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(modRoot, "upload.txt"))
+	if err != nil {
+		t.Fatalf("reading uploaded file from module: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("uploaded content = %q, want %q", got, content)
 	}
 	if errLog.Len() != 0 {
 		t.Errorf("daemon error log = %q, want empty", errLog.String())

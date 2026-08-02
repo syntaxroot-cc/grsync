@@ -44,7 +44,14 @@ const dialDaemonTimeout = 10 * time.Second
 // Itemize/Verbose/Progress/Stats are all deliberately left unset - see
 // runSync's own one-time note about why none of daemon-PUT's reporting
 // output is available, printed before this function is ever called.
-func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool) error {
+//
+// copts, in contrast, is fully honored here: DirectionPut runs Sender on
+// this (the client) side (see DialModule's own doc comment), exactly
+// where --compress/-z's decision actually belongs - no wire extension
+// like dryRunToken is needed for it at all, since the server's Receiver
+// only ever reacts to what each deltaMessage's own Compressed marker
+// says.
+func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, dryRun bool, copts pipeline.CompressOptions) error {
 	port := u.Port
 	if port == 0 {
 		port = daemon.DefaultPort
@@ -59,5 +66,5 @@ func syncToRsyncDaemon(src string, u daemon.URL, password daemon.PasswordFunc, w
 
 	user := resolveUser(u.User)
 	ropts := pipeline.ReceiverOptions{DryRun: dryRun}
-	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{HardLinks: hardLinks}, ropts)
+	return daemon.DialClient(nc, u.Module, user, password, daemon.DirectionPut, src, rules, walkOpts, sync.AttrOptions{HardLinks: hardLinks}, ropts, copts)
 }
