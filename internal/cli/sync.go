@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -176,6 +177,39 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		return fmt.Errorf("--append and --append-verify are mutually exclusive")
 	}
 
+	// --write-batch and --read-batch can never both reach here at once -
+	// root.go's own Args validator rejects that combination before RunE
+	// ever dispatches to runSync or runReadBatch - so only --write-batch
+	// needs handling in this function at all.
+	//
+	// writingBatch, not opts.writeBatch != "" directly, is what the rest
+	// of this function actually consults: real rsync's own source
+	// (options.c) silently disables --write-batch entirely when --dry-run
+	// is set ("else if (dry_run) write_batch = 0") rather than treating
+	// the combination as an error - a dry run never computes a real delta
+	// to capture in the first place, so there is nothing genuine to write.
+	// grsync replicates that exact behavior (not an invented one) but,
+	// consistent with this project's own established preference for
+	// disclosure over silence (see e.g. --compress-level=0's own note),
+	// prints an explicit one-time note rather than leaving it fully
+	// silent the way real rsync does.
+	writingBatch := opts.writeBatch != ""
+	if writingBatch && opts.dryRun {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "note: --write-batch has no effect combined with --dry-run "+
+			"(matching real rsync's own behavior - a dry run never computes a real delta to capture) - no batch file will be written")
+		writingBatch = false
+	}
+	// A batch file's own file-list frame corresponds to exactly one
+	// Sender/Receiver session; concatenating more than one source's worth
+	// of sessions into a single file would leave pipeline.Receiver's
+	// single recvFileList call (see runReadBatch) unable to correctly
+	// replay anything past the first - so, unlike an ordinary sync,
+	// --write-batch requires exactly one source, checked explicitly
+	// rather than silently only capturing the first.
+	if writingBatch && len(sources) != 1 {
+		return fmt.Errorf("--write-batch requires exactly one source, got %d", len(sources))
+	}
+
 	// isRsyncURL is checked, and rsyncURL parsed, before
 	// transport.ParseRemotePath ever looks at destination: an rsync://
 	// URL is never valid [user@]host:path syntax (ParseRemotePath itself
@@ -198,6 +232,52 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 		}
 	}
 	remote, isRemote := transport.ParseRemotePath(destination)
+
+	if writingBatch && isRsyncDaemon {
+		// Unlike the local and SSH cases, there is no clean tap point
+		// here: pipeline.Sender's writes to an rsync:// daemon connection
+		// share the same net.Conn the greeting/auth handshake already
+		// used (see daemon.DialClient), so capturing only the
+		// batch-worthy frames (not the handshake bytes ahead of them)
+		// would need real daemon-package changes, not just a wrapped
+		// io.Writer at the call site the way syncLocal/syncToRemote use
+		// below. Rejecting outright is more honest than silently
+		// producing an empty or corrupt batch file.
+		return fmt.Errorf("--write-batch is not supported for an rsync:// daemon destination")
+	}
+
+	// Opened once, before the (now guaranteed-single) source's own sync
+	// runs, and closed explicitly once it succeeds - see the deferred
+	// cleanup below for the early-return safety net. batchFile is nil
+	// whenever writingBatch is false, and every call site downstream
+	// checks that explicitly rather than passing a possibly-nil
+	// *os.File where an io.Writer is expected, avoiding the same
+	// typed-nil-interface gotcha SC-14's own resolveLocalAddr caller had
+	// to guard against.
+	//
+	// Self-review finding: if the sync itself fails partway (the loop
+	// below returns an error), batchFile is still non-nil when this
+	// deferred cleanup runs - on top of closing it, it also removes the
+	// file entirely, rather than leaving a truncated, half-written batch
+	// file on disk that looks like a real deliverable but would only
+	// ever fail (or silently under-apply) on a later --read-batch. The
+	// success path below sets batchFile back to nil once it has already
+	// closed the file cleanly, which is what turns this into a no-op for
+	// a genuinely completed batch.
+	var batchFile *os.File
+	if writingBatch {
+		f, err := os.Create(opts.writeBatch)
+		if err != nil {
+			return fmt.Errorf("creating batch file %q: %w", opts.writeBatch, err)
+		}
+		batchFile = f
+		defer func() {
+			if batchFile != nil {
+				_ = batchFile.Close()
+				_ = os.Remove(opts.writeBatch)
+			}
+		}()
+	}
 
 	// Resolved once, outside the per-source loop below, so a multi-source
 	// sync against the same daemon destination only ever prompts for (or
@@ -242,6 +322,16 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 			"for an rsync:// daemon destination (the module's receiver runs on the server, which has no way to learn these were requested)")
 	}
 
+	// batchFile is nil unless writingBatch - every branch below passes it
+	// straight through as the io.Writer syncLocal/syncToRemote tee the
+	// sender's own output into (see their own doc comments); syncToRsyncDaemon
+	// is never reached when writingBatch, since that combination already
+	// returned an error above.
+	var batchWriter io.Writer
+	if batchFile != nil {
+		batchWriter = batchFile
+	}
+
 	for _, src := range sources {
 		switch {
 		case isRsyncDaemon:
@@ -249,14 +339,23 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		case isRemote:
-			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts, copts, opts.ipv4, opts.ipv6); err != nil {
+			if err := syncToRemote(opts.rsh, src, remote, walkOpts, rules, attrOpts.HardLinks, ropts, copts, opts.ipv4, opts.ipv6, batchWriter); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		default:
-			if err := syncLocal(src, destination, walkOpts, rules, attrOpts, ropts, copts); err != nil {
+			if err := syncLocal(src, destination, walkOpts, rules, attrOpts, ropts, copts, batchWriter); err != nil {
 				return fmt.Errorf("syncing %q to %q: %w", src, destination, err)
 			}
 		}
+	}
+
+	if batchFile != nil {
+		closeErr := batchFile.Close()
+		batchFile = nil // the deferred cleanup above becomes a no-op now that this succeeded
+		if closeErr != nil {
+			return fmt.Errorf("closing batch file %q: %w", opts.writeBatch, closeErr)
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "wrote batch file %q (grsync's own format - see the README's Batch Mode section)\n", opts.writeBatch)
 	}
 
 	verb := "synced"
@@ -272,11 +371,26 @@ func runSync(cmd *cobra.Command, sources []string, destination string, opts *opt
 // way, the exact same pipeline.Sender/pipeline.Receiver functions that
 // carry out a remote sync are what a local sync exercises too, instead of
 // a second, independently-trusted implementation of the same logic.
-func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions) error {
+//
+// batchWriter, when non-nil (--write-batch), receives a byte-for-byte
+// copy of everything Sender writes to the receiver - Sender only ever
+// writes FrameFileList once and FrameDelta per regular file on this
+// particular pipe (every other message on this connection flows the
+// other way, from Receiver to Sender), so that copy is already exactly
+// the batch file's own content, with no filtering needed. See
+// runReadBatch for the other half of this: replaying that same byte
+// stream back into a fresh pipeline.Receiver call with no live Sender at
+// all.
+func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, attrOpts sync.AttrOptions, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions, batchWriter io.Writer) error {
 	senderReadsFromReceiver, receiverWritesToSender := io.Pipe()
 	receiverReadsFromSender, senderWritesToReceiver := io.Pipe()
 
-	sender := pipeReadWriter{Reader: senderReadsFromReceiver, Writer: senderWritesToReceiver}
+	senderWriter := io.Writer(senderWritesToReceiver)
+	if batchWriter != nil {
+		senderWriter = io.MultiWriter(senderWritesToReceiver, batchWriter)
+	}
+
+	sender := pipeReadWriter{Reader: senderReadsFromReceiver, Writer: senderWriter}
 	receiver := pipeReadWriter{Reader: receiverReadsFromSender, Writer: receiverWritesToSender}
 
 	senderErrCh := make(chan error, 1)
@@ -327,7 +441,15 @@ func syncLocal(src, dest string, walkOpts sync.WalkOptions, rules []sync.Rule, a
 // no equivalent here at all: real rsync's own documented --address scope
 // never includes the rsh/ssh transport (see resolveLocalAddr's own doc
 // comment), so it isn't threaded through to this function.
-func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions, ipv4, ipv6 bool) error {
+//
+// batchWriter is syncLocal's own SC-13 contribution, applying here too:
+// once the handshake completes, session's own Write calls carry exactly
+// the same FrameFileList/FrameDelta bytes a local sync's sender-to-
+// receiver pipe does (session.Read is where the receiver's own signature
+// traffic and any live stderr passthrough arrive - never mixed into
+// Write), so tapping it after the handshake captures precisely the
+// batch-worthy bytes and nothing from the handshake itself.
+func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.WalkOptions, rules []sync.Rule, hardLinks bool, ropts pipeline.ReceiverOptions, copts pipeline.CompressOptions, ipv4, ipv6 bool, batchWriter io.Writer) error {
 	remoteArgs := []string{"grsync", "--server"}
 	if ropts.DryRun {
 		remoteArgs = append(remoteArgs, "--dry-run")
@@ -373,7 +495,12 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 		return fmt.Errorf("handshake with %s failed: %w", remote.Host, err)
 	}
 
-	sendErr := pipeline.Sender(session, src, walkOpts, rules, hardLinks, copts)
+	var senderConn io.ReadWriter = session
+	if batchWriter != nil {
+		senderConn = pipeReadWriter{Reader: session, Writer: io.MultiWriter(session, batchWriter)}
+	}
+
+	sendErr := pipeline.Sender(senderConn, src, walkOpts, rules, hardLinks, copts)
 	closeErr := session.Close()
 
 	if sendErr != nil {
@@ -408,4 +535,59 @@ func runServer(cmd *cobra.Command, dest string, opts *options) error {
 	rw := pipeReadWriter{Reader: stdin, Writer: stdout}
 	ropts := effectiveReceiverOptions(opts, cmd.ErrOrStderr())
 	return pipeline.Receiver(rw, dest, effectiveAttrOptions(opts), ropts)
+}
+
+// runReadBatch implements --read-batch=FILE: applies the file list and
+// per-file deltas previously captured by --write-batch (see syncLocal/
+// syncToRemote's own batchWriter doc comments) directly to dest, with no
+// source argument, source walk, or live sender connection of any kind -
+// FILE already carries everything pipeline.Receiver needs.
+//
+// This reuses Receiver completely unchanged, exactly as the ticket
+// asked for: Receiver has no idea, and no need to know, whether the
+// io.ReadWriter it was given is a live connection or a replayed file.
+// Its own signature writes (sendSignature, receiver.go) go to
+// io.Discard - there is no live sender left to read them, and none is
+// needed, since the recorded deltas were already computed against a
+// real signature at write-batch time, not against whatever Receiver's
+// own fresh signature-generation happens to produce here. Its delta
+// reads (recvDelta) come from FILE instead of a socket, in exactly the
+// order Sender originally wrote them, which recvFileList/recvDelta's
+// own framing (transport.ReadFrame) requires nothing special to handle.
+//
+// A malformed or foreign (e.g. real-rsync-produced) FILE fails here with
+// a clear, ordinary decode/frame-type error from the same
+// recvFileList/recvDelta machinery a live sync already relies on to
+// reject a corrupted or out-of-order connection - there is no dedicated
+// batch-format validation to bypass, because there is no separate batch
+// format at all: it's the same gob-framed messages either way (see the
+// README's Batch Mode section for why that's a deliberate scope
+// decision, not an oversight).
+func runReadBatch(cmd *cobra.Command, dest string, opts *options) error {
+	var r io.Reader
+	if opts.readBatch == "-" {
+		r = cmd.InOrStdin()
+	} else {
+		f, err := os.Open(opts.readBatch)
+		if err != nil {
+			return fmt.Errorf("opening batch file %q: %w", opts.readBatch, err)
+		}
+		defer func() { _ = f.Close() }()
+		r = f
+	}
+
+	rw := pipeReadWriter{Reader: r, Writer: io.Discard}
+	attrOpts := effectiveAttrOptions(opts)
+	ropts := effectiveReceiverOptions(opts, cmd.OutOrStdout())
+
+	if err := pipeline.Receiver(rw, dest, attrOpts, ropts); err != nil {
+		return fmt.Errorf("applying batch %q to %q: %w", opts.readBatch, dest, err)
+	}
+
+	verb := "applied"
+	if opts.dryRun {
+		verb = "would apply"
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s batch %q to %s\n", verb, opts.readBatch, dest)
+	return err
 }

@@ -6,6 +6,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/syntaxroot-cc/grsync/internal/daemon"
@@ -73,6 +75,8 @@ type options struct {
 	partialDir    string
 	appendMode    bool
 	appendVerify  bool
+	writeBatch    string
+	readBatch     string
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -115,7 +119,9 @@ func NewRootCmd() *cobra.Command {
 		Short: "grsync synchronizes files between one or more sources and a destination",
 		Long: "grsync is an rsync-inspired file synchronization tool.\n" +
 			"Local-to-local and local-to-remote (SSH) syncs are supported, including --dry-run, " +
-			"--itemize-changes, --progress, --stats, and --compress; full --delete is not yet.",
+			"--itemize-changes, --progress, --stats, --compress, --partial/--append, and " +
+			"--write-batch/--read-batch (grsync's own batch format, NOT byte-compatible with real " +
+			"rsync's - see the README's Batch Mode section); full --delete is not yet.",
 		// --server takes exactly one positional arg (the destination path)
 		// rather than the normal <source>...<destination> shape: it is how
 		// a remote-invoked grsync (e.g. `ssh host grsync --server /dest`)
@@ -123,12 +129,34 @@ func NewRootCmd() *cobra.Command {
 		// stdin/stdout against that destination, instead of a normal sync.
 		// --daemon takes none at all: everything it needs (which modules
 		// exist, where they live) comes from --config's rsyncd.conf, not
-		// from positional args.
+		// from positional args. --read-batch takes exactly one positional
+		// arg too - the destination tree to apply the batch to - since the
+		// batch file itself already carries the file list a normal sync
+		// would otherwise build by walking a source (see runReadBatch's own
+		// doc comment); --write-batch does not change the normal
+		// <source>...<destination> shape at all, it only adds a side effect
+		// to an otherwise-ordinary sync, so it needs no Args case of its
+		// own (its own "exactly one source" requirement is checked in
+		// runSync instead, once destination/sources are already split).
 		Args: func(cmd *cobra.Command, args []string) error {
+			// Checked before any other dispatch decision, regardless of
+			// which of the two RunE would otherwise "win": without this,
+			// giving both flags together would silently run whichever
+			// check happens to come first below and ignore the other
+			// entirely - matching real rsync's own explicit
+			// "--write-batch and --read-batch can not be used together"
+			// rejection (options.c), verified against source rather than
+			// assumed.
+			if opts.writeBatch != "" && opts.readBatch != "" {
+				return fmt.Errorf("--write-batch and --read-batch cannot be used together")
+			}
 			if opts.daemon {
 				return cobra.NoArgs(cmd, args)
 			}
 			if opts.server {
+				return cobra.ExactArgs(1)(cmd, args)
+			}
+			if opts.readBatch != "" {
 				return cobra.ExactArgs(1)(cmd, args)
 			}
 			return cobra.MinimumNArgs(2)(cmd, args)
@@ -139,6 +167,9 @@ func NewRootCmd() *cobra.Command {
 			}
 			if opts.server {
 				return runServer(cmd, args[0], opts)
+			}
+			if opts.readBatch != "" {
+				return runReadBatch(cmd, args[0], opts)
 			}
 			sources, destination := args[:len(args)-1], args[len(args)-1]
 			return runSync(cmd, sources, destination, opts)
@@ -240,6 +271,19 @@ func NewRootCmd() *cobra.Command {
 	flags.BoolVar(&opts.appendVerify, "append-verify", false,
 		"like --append, but verifies the existing prefix against the source instead of blindly trusting it "+
 			"(safer, at the cost of re-comparing that data); mutually exclusive with --append")
+	flags.StringVar(&opts.writeBatch, "write-batch", "",
+		"in addition to performing a real sync, capture the file list and per-file deltas sent to the "+
+			"destination into FILE, so the identical update can later be replayed against other identical "+
+			"destinations with --read-batch, without needing another live connection or delta computation. "+
+			"Requires exactly one source; not available for an rsync:// daemon destination; has no effect "+
+			"combined with --dry-run (matching real rsync's own behavior - see the README's Batch Mode "+
+			"section, including its own prominent note on FILE's format)")
+	flags.StringVar(&opts.readBatch, "read-batch", "",
+		"apply the file list and deltas previously captured by --write-batch in FILE (or, if FILE is \"-\", "+
+			"read from stdin) to the destination tree given as the sole positional argument, without any "+
+			"source or live sender connection at all; the destination tree must be in the same state it was "+
+			"in when the batch was written - mutually exclusive with --write-batch (see the README's Batch "+
+			"Mode section)")
 
 	return cmd
 }
