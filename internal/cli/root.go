@@ -69,6 +69,10 @@ type options struct {
 	ipv4          bool
 	ipv6          bool
 	address       string
+	partial       bool
+	partialDir    string
+	appendMode    bool
+	appendVerify  bool
 }
 
 // filterRuleFlag implements pflag.Value. Each of --exclude/--include/
@@ -220,6 +224,22 @@ func NewRootCmd() *cobra.Command {
 			"local/source address of the outbound connection when dialing an rsync:// daemon; matches real "+
 			"rsync's own --address scope exactly - has no effect on the SSH transport or a local sync "+
 			"(see the README's IPv4/IPv6 Support section)")
+	flags.BoolVar(&opts.partial, "partial", false,
+		"keep a partially transferred file (instead of deleting it) if the transfer is interrupted before "+
+			"that file completes, so a later run can resume from it - file granularity, not true mid-file "+
+			"resumption (see the README's Partial and Append Transfers section for grsync's exact scope here)")
+	flags.StringVar(&opts.partialDir, "partial-dir", "",
+		"put a partially transferred file into DIR instead of leaving it at the destination path; implies "+
+			"--partial, and a file found here is used to speed up a later resumed transfer, then removed once "+
+			"it's no longer needed - matches real rsync's own --partial-dir")
+	flags.BoolVar(&opts.appendMode, "append", false,
+		"for a destination file shorter than the source, blindly trust the existing bytes (never verified) "+
+			"and transfer only the new tail - dangerous if that assumption is wrong; see --append-verify and "+
+			"the README's Partial and Append Transfers section. A destination that is not shorter than the "+
+			"source is left untouched entirely; a destination that doesn't exist yet is transferred normally")
+	flags.BoolVar(&opts.appendVerify, "append-verify", false,
+		"like --append, but verifies the existing prefix against the source instead of blindly trusting it "+
+			"(safer, at the cost of re-comparing that data); mutually exclusive with --append")
 
 	return cmd
 }

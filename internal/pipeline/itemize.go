@@ -41,6 +41,53 @@ type ReceiverOptions struct {
 	// A nil Output is treated as io.Discard, so a caller that wants none
 	// of this doesn't need to construct a discard writer itself.
 	Output io.Writer
+
+	// Partial, when true, keeps a regular file's temp file (rather than
+	// deleting it) if the transfer aborts before that file's rename into
+	// place - see partial.go's own doc comment for exactly what "partial"
+	// means in grsync's frame-per-file architecture (file granularity,
+	// not true mid-file resumption). Implied by a non-empty PartialDir,
+	// matching real rsync's own documented "--partial-dir... also
+	// implying that [--partial] be enabled."
+	Partial bool
+	// PartialDir, when non-empty, is where an abandoned temp file goes
+	// instead of being renamed onto the destination path directly - see
+	// partial.go's partialFilePath for the relative-vs-absolute placement
+	// rule. A file found here is also used as a resume basis (the
+	// signature comparison source) on a later run, then deleted once its
+	// transfer completes successfully.
+	PartialDir string
+	// Append, when true, blindly trusts a shorter destination file's
+	// existing bytes and transfers only the new tail - see
+	// messages.go's appendTail and receiver.go's own doc comment for the
+	// real, verified-against-source distinction from AppendVerify.
+	// Mutually exclusive with AppendVerify (internal/cli validates this).
+	Append bool
+	// AppendVerify is like Append, but runs the completely normal
+	// signature/delta comparison over the existing prefix instead of
+	// trusting it blindly - see receiver.go's own doc comment for why
+	// this needs no new algorithm at all, just an eligibility gate on
+	// top of the pre-existing flow.
+	AppendVerify bool
+}
+
+// AppendMode reports whether either append flag is set - Append and
+// AppendVerify share the same file-eligibility rules (see receiver.go),
+// differing only in whether the existing prefix is trusted or verified.
+// Exported since internal/cli needs it too, to warn when combined with
+// an rsync:// daemon upload destination (see runSync's own comment on
+// why that direction can't honor either flag, the same disclosed
+// daemon-PUT limitation SC-10/SC-11 already established for reporting).
+func (o ReceiverOptions) AppendMode() bool {
+	return o.Append || o.AppendVerify
+}
+
+// KeepPartial reports whether an aborted temp file should be kept at
+// all - PartialDir implies Partial, matching real rsync's own
+// documented "--partial-dir... also implying that [--partial] be
+// enabled." Exported for the same reason AppendMode is.
+func (o ReceiverOptions) KeepPartial() bool {
+	return o.Partial || o.PartialDir != ""
 }
 
 func (o ReceiverOptions) output() io.Writer {

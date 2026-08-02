@@ -32,10 +32,34 @@ func TestApplyDelta_OutOfRangeBlockIndexErrors(t *testing.T) {
 	}
 }
 
-func TestApplyDelta_InvalidBlockSizeErrors(t *testing.T) {
-	_, err := ApplyDelta([]byte("data"), nil, Signature{BlockSize: 0})
-	if err == nil {
-		t.Fatalf("ApplyDelta with a zero block size returned nil error, want an error")
+// TestApplyDelta_InvalidBlockSizeErrorsOnlyWhenACopyOpNeedsIt is SC-12's
+// own relaxation of ApplyDelta's block-size validation, made concrete: a
+// zero/negative BlockSize is only ever actually consulted when
+// translating a CopyOp's BlockIndex into a byte range, so it must only
+// be rejected when ops genuinely contains a CopyOp - not unconditionally
+// up front, which would reject SC-12's own append-mode construction for
+// a brand-new (zero-length existing) destination file, where a
+// Signature with BlockSize == 0 and no CopyOp at all is entirely valid
+// (there is no prefix block to describe).
+func TestApplyDelta_InvalidBlockSizeErrorsOnlyWhenACopyOpNeedsIt(t *testing.T) {
+	if _, err := ApplyDelta([]byte("data"), []DeltaOp{CopyOp{BlockIndex: 0}}, Signature{BlockSize: 0}); err == nil {
+		t.Errorf("ApplyDelta with a zero block size and a CopyOp returned nil error, want an error")
+	}
+
+	got, err := ApplyDelta(nil, []DeltaOp{DataOp{Bytes: []byte("new content")}}, Signature{BlockSize: 0})
+	if err != nil {
+		t.Fatalf("ApplyDelta with a zero block size and no CopyOp returned error: %v", err)
+	}
+	if string(got) != "new content" {
+		t.Errorf("ApplyDelta result = %q, want %q", got, "new content")
+	}
+
+	got, err = ApplyDelta(nil, nil, Signature{BlockSize: 0})
+	if err != nil {
+		t.Fatalf("ApplyDelta with a zero block size and no ops at all returned error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ApplyDelta result = %q, want empty", got)
 	}
 }
 

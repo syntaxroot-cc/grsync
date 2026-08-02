@@ -24,7 +24,7 @@ type receiveContext struct {
 	ropts    ReceiverOptions
 
 	stats    *Stats            // nil unless ropts.Stats
-	progress *progressReporter // nil unless ropts.Progress (and never during DryRun - see writeFileWithProgress)
+	progress *progressReporter // nil unless ropts.Progress (and never during DryRun - see writeToTempFileWithProgress)
 
 	totalFiles int // every entry in the received list, all types
 	processed  int // entries handled so far, for filesLeft = totalFiles - processed
@@ -47,7 +47,8 @@ type receiveContext struct {
 // comparison against the destination's current state, stats
 // accumulation) still runs exactly as it would for a real transfer - see
 // the individual receive* helpers below for the specific guarded calls,
-// all eight of them audited: two os.MkdirAll calls and an os.WriteFile in
+// all of them audited: two os.MkdirAll calls and a
+// writeToTempFileWithProgress+os.Rename pair (see partial.go) in
 // receiveRegularFile, an os.MkdirAll and sync.ApplyAttributes (which
 // itself calls os.Symlink for a symlink entry, not just chmod/chtimes)
 // in receiveSymlink, sync.ApplyAttributes for a directory in the
@@ -56,7 +57,10 @@ type receiveContext struct {
 // a dry run: it specifically measures bytes committed to disk (see
 // progress.go's own doc comment for why, given grsync's non-streaming
 // wire protocol), and dry-run skips that write entirely, so there is
-// nothing for it to report.
+// nothing for it to report. ropts.Partial/PartialDir are likewise
+// meaningless during a dry run: with no temp file ever created, there is
+// nothing for either to keep or discard - see partial.go's own package
+// doc comment for the full write-path design.
 //
 // A destination file not mentioned in the sender's list is never touched
 // at all: Receiver only ever acts on paths that appear in the received
@@ -254,27 +258,86 @@ func receiveSymlink(ctx *receiveContext, destPath string, entry sync.FileEntry) 
 // delta, and reconstructs what the file's bytes would become - all of
 // this runs identically in dry-run mode, since it's exactly the planning
 // work needed to report accurate itemize/stats output; only the final
-// write (os.WriteFile/os.MkdirAll/sync.ApplyAttributes, and any progress
-// reporting about it) is skipped.
+// write (via a temp file - see partial.go - and sync.ApplyAttributes, and
+// any progress reporting about either) is skipped.
+//
+// --append/--append-verify (SC-12) share the same two eligibility rules,
+// verified against real rsync's own source (generator.c) rather than
+// assumed: a file that doesn't exist at the destination yet is
+// transferred completely normally - append semantics only ever apply to
+// an existing, shorter file, matching real rsync's own documented "new
+// files are transferred" rule. A destination that's already at least as
+// long as the source is skipped entirely and unconditionally - not
+// compared, not touched at all - matching real rsync's own documented
+// behavior exactly (and generator.c's own append_mode-gated skip).
+//
+// For a genuinely shorter destination file, the two flags diverge
+// exactly where real rsync's own source diverges (generate_and_send_sums:
+// plain --append returns immediately after writing only a header,
+// sending zero real block checksums; --append-verify falls through to
+// the completely normal per-block signature loop): --append blindly
+// trusts the existing prefix - no sync.GenerateSignature call for it at
+// all, Sender is told (via appendTail) to send only the literal tail -
+// while --append-verify runs the exact same sync.GenerateSignature/
+// GenerateDelta/ApplyDelta pipeline as an entirely normal sync, needing
+// no new algorithm at all: the eligibility gate above is the only thing
+// --append-verify actually adds on top of a vanilla transfer.
 func receiveRegularFile(ctx *receiveContext, rw io.ReadWriter, destPath string, entry sync.FileEntry) error {
 	old, existed, err := lstatExisting(destPath)
 	if err != nil {
 		return fmt.Errorf("checking existing %q: %w", entry.Path, err)
 	}
 
-	oldData, err := os.ReadFile(destPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reading existing %q: %w", entry.Path, err)
+	// usedPartialBasis is deliberately never true under append mode:
+	// --append/--append-verify are entirely about the REAL destination
+	// file's own existing bytes (trusted or verified), and mixing that
+	// with a --partial-dir staging file's content would blur two
+	// separately-reasoned-about features together for no real benefit -
+	// see partial.go's loadPartialBasis for the resume mechanism this
+	// skips here.
+	usedPartialBasis := false
+	var oldData []byte
+	if !ctx.ropts.AppendMode() {
+		if data, ok := loadPartialBasis(destPath, ctx.ropts, entry.Path); ok {
+			oldData, usedPartialBasis = data, true
+		}
+	}
+	if !usedPartialBasis {
+		oldData, err = os.ReadFile(destPath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("reading existing %q: %w", entry.Path, err)
+		}
 	}
 	// oldData is nil when the file doesn't exist yet at the destination
-	// (the new-file case). sync.GenerateSignature on nil/empty data
-	// naturally produces a Signature with zero Blocks, which makes
-	// sync.GenerateDelta emit a single all-DataOp delta (nothing to match
-	// against) - exactly the "new file" behavior needed, falling directly
-	// out of the existing SC-3 API with no special-casing required here.
-	sig := sync.GenerateSignature(oldData)
+	// and no partial-dir file was found either (the new-file case).
+	// sync.GenerateSignature on nil/empty data naturally produces a
+	// Signature with zero Blocks, which makes sync.GenerateDelta emit a
+	// single all-DataOp delta (nothing to match against) - exactly the
+	// "new file" behavior needed, falling directly out of the existing
+	// SC-3 API with no special-casing required here.
 
-	if err := sendSignature(rw, entry.Path, sig); err != nil {
+	action := appendNone
+	var sig sync.Signature
+	switch {
+	case !ctx.ropts.AppendMode() || !existed:
+		sig = sync.GenerateSignature(oldData)
+	case int64(len(oldData)) >= entry.Size:
+		// Append eligibility rule: skip entirely, don't even compute a
+		// real signature for potentially-huge existing data we're never
+		// going to consult - see this function's own doc comment.
+		action = appendSkip
+	case ctx.ropts.AppendVerify:
+		sig = sync.GenerateSignature(oldData)
+	default: // ctx.ropts.Append, and genuinely shorter than entry.Size
+		action = appendTail
+		// BlockSize carries the trusted offset, not a real block size -
+		// see appendTail's own doc comment. Blocks is left empty:
+		// Sender never reads it for this action, since nothing here is
+		// verified at all.
+		sig = sync.Signature{BlockSize: len(oldData)}
+	}
+
+	if err := sendSignature(rw, entry.Path, sig, action); err != nil {
 		return fmt.Errorf("sending signature for %q: %w", entry.Path, err)
 	}
 
@@ -286,9 +349,22 @@ func receiveRegularFile(ctx *receiveContext, rw io.ReadWriter, destPath string, 
 		return fmt.Errorf("delta arrived out of order: got %q, want %q", deltaPath, entry.Path)
 	}
 
-	newData, err := sync.ApplyDelta(oldData, ops, sig)
-	if err != nil {
-		return fmt.Errorf("applying delta for %q: %w", entry.Path, err)
+	var newData []byte
+	if action == appendSkip {
+		// Unconditional skip: real rsync's own documented rule for a
+		// destination that's already not shorter than the source is to
+		// leave it alone entirely, not to compare and possibly find it
+		// already matches byte for byte - so newData is oldData,
+		// verbatim, not the result of applying Sender's (empty) delta to
+		// it (which sync.ApplyDelta would otherwise reduce to nothing at
+		// all, since it never implicitly copies oldData forward on its
+		// own - see its own doc comment).
+		newData = oldData
+	} else {
+		newData, err = sync.ApplyDelta(oldData, ops, sig)
+		if err != nil {
+			return fmt.Errorf("applying delta for %q: %w", entry.Path, err)
+		}
 	}
 	// ApplyDelta is pure in-memory work - computing it, and this
 	// comparison, costs nothing extra and runs the same whether or not
@@ -298,7 +374,7 @@ func receiveRegularFile(ctx *receiveContext, rw io.ReadWriter, destPath string, 
 	// codebase doesn't otherwise have (see the README's Dry-Run Mode
 	// section for why that's a deliberate, disclosed choice, not an
 	// oversight).
-	contentChanged := !bytes.Equal(oldData, newData)
+	contentChanged := action != appendSkip && !bytes.Equal(oldData, newData)
 	// transferred is deliberately not just contentChanged: a brand-new
 	// *empty* file has oldData == nil and newData == nil (ApplyDelta's
 	// accumulator is never appended to when there are no ops at all), so
@@ -308,7 +384,9 @@ func receiveRegularFile(ctx *receiveContext, rw io.ReadWriter, destPath string, 
 	// count. itemizeFile doesn't have this problem since it checks
 	// !existed as its own first, higher-priority branch (see its own
 	// code) - this mirrors that same priority for stats/xfer purposes.
-	transferred := !existed || contentChanged
+	// appendSkip is never "transferred" by definition - nothing was even
+	// compared, let alone changed.
+	transferred := action != appendSkip && (!existed || contentChanged)
 
 	if ctx.stats != nil {
 		literal, matched := deltaByteCounts(ops, sig.BlockSize, len(oldData))
@@ -339,10 +417,17 @@ func receiveRegularFile(ctx *receiveContext, rw io.ReadWriter, destPath string, 
 
 		if transferred {
 			ctx.xferNum++
+			tmpPath, werr := writeToTempFileWithProgress(destPath, newData, ctx.progress, entry.Path, ctx.xferNum, ctx.totalFiles, ctx.totalFiles-ctx.processed-1)
+			if err := finishRegularFileWrite(tmpPath, destPath, werr, ctx.ropts, entry.Path, usedPartialBasis); err != nil {
+				return fmt.Errorf("writing %q: %w", entry.Path, err)
+			}
 		}
-		if err := writeFileWithProgress(destPath, newData, ctx.progress, entry.Path, ctx.xferNum, ctx.totalFiles, ctx.totalFiles-ctx.processed-1); err != nil {
-			return fmt.Errorf("writing %q: %w", entry.Path, err)
-		}
+		// Applied regardless of transferred: real rsync's own documented
+		// --append behavior explicitly "does not interfere with the
+		// updating of a file's non-content attributes... when the file
+		// does not need to be transferred" - an appendSkip'd file (or
+		// any other untransferred-but-existing file) still gets its
+		// permissions/times/etc. brought in line if requested.
 		if _, err := sync.ApplyAttributes(entry, destPath, ctx.attrOpts); err != nil {
 			return fmt.Errorf("applying attributes to %q: %w", entry.Path, err)
 		}
@@ -376,54 +461,6 @@ func deltaByteCounts(ops []sync.DeltaOp, blockSize int, oldDataLen int) (literal
 		}
 	}
 	return literal, matched
-}
-
-// writeFileWithProgress writes data to destPath, reporting progress
-// through progress (nil-safe: with nil progress - including always
-// during a dry run, see Receiver's own doc comment - this behaves as a
-// plain os.WriteFile with no extra syscalls). Small files are written in
-// a single call even with progress enabled - chunking a handful of
-// bytes would only add syscall overhead for a duration too short to
-// ever be visibly "in progress" - so chunking only kicks in once data
-// exceeds progressWriteChunkSize.
-func writeFileWithProgress(destPath string, data []byte, progress *progressReporter, path string, xferNum, totalFiles, filesLeft int) error {
-	if progress == nil || len(data) <= progressWriteChunkSize {
-		if err := os.WriteFile(destPath, data, 0o644); err != nil {
-			return err
-		}
-		if progress != nil {
-			progress.report(progressUpdate{
-				path: path, bytesDone: int64(len(data)), fileSize: int64(len(data)), done: true,
-				xferNum: xferNum, totalFiles: totalFiles, filesLeft: filesLeft,
-			})
-		}
-		return nil
-	}
-
-	f, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	total := int64(len(data))
-	var written int64
-	for written < total {
-		end := written + progressWriteChunkSize
-		if end > total {
-			end = total
-		}
-		n, werr := f.Write(data[written:end])
-		written += int64(n)
-		if werr != nil {
-			return werr
-		}
-		progress.report(progressUpdate{
-			path: path, bytesDone: written, fileSize: total, done: written == total,
-			xferNum: xferNum, totalFiles: totalFiles, filesLeft: filesLeft,
-		})
-	}
-	return nil
 }
 
 // lstatExisting is sync.LstatEntry with the "not found" case turned into

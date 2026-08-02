@@ -82,7 +82,7 @@ func TestSignatureRoundTrip(t *testing.T) {
 	sig := sync.GenerateSignatureWithBlockSize([]byte("AAAABBBBCCCC"), 4)
 
 	var buf bytes.Buffer
-	if err := sendSignature(&buf, "some/file.txt", sig); err != nil {
+	if err := sendSignature(&buf, "some/file.txt", sig, appendNone); err != nil {
 		t.Fatalf("sendSignature returned error: %v", err)
 	}
 	got, err := recvSignature(&buf)
