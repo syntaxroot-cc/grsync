@@ -11,8 +11,8 @@ really walks, filters, diffs, transfers, and reconstructs files, applying
 requested attributes along the way. See
 [End-to-End Sync Pipeline](#end-to-end-sync-pipeline) below for exactly
 how the pieces connect and, just as importantly, what's still explicitly
-out of scope (batch mode, full `--delete`, and device/special files) -
-this is real, working sync, not yet full feature parity. Hard links
+out of scope (full `--delete` and device/special files) - this is real,
+working sync, not yet full feature parity. Hard links
 *are* now preserved, opt-in via `-H`/`--hard-links` exactly like real
 rsync's own flag (see
 [File Attribute Preservation](#file-attribute-preservation) below), and
@@ -28,6 +28,17 @@ with zlib, including real rsync's own `--compress-level` and
 implemented too, with a real, disclosed scope boundary around what
 "partial" means in grsync's own architecture (see
 [Partial and Append Transfers](#partial-and-append-transfers) below).
+`--write-batch`/`--read-batch` are now implemented too - **but read this
+part carefully if batch-file interoperability with real rsync is why
+you're here**: they use grsync's own batch format, verified to be
+**incompatible with real rsync's actual batch files** (which are a raw
+capture of rsync's own binary wire protocol) - a deliberate decision,
+not an oversight, made for the same reason SC-6/SC-9/SC-16's own
+gob-vs-wire-format choices were: reimplementing real rsync's actual
+protocol is a separate, much larger effort this project has
+consistently declined to take on. See
+[Batch Mode](#batch-mode) below before relying on this for anything
+that needs to interoperate with a real `rsync` binary.
 
 `grsync --daemon` also now speaks a real subset of the rsync daemon
 protocol - `rsyncd.conf` parsing, the `@RSYNCD` greeting/handshake, module
@@ -1024,6 +1035,149 @@ structural fact still holds with `--append` enabled.
   one-time note when any of them is combined with an `rsync://`
   destination, the same pattern already established for
   itemize/verbose/progress/stats.
+
+## Batch Mode
+
+> **Format decision, stated as plainly as possible up front**:
+> `--write-batch=FILE`/`--read-batch=FILE` use **grsync's own batch
+> format - not real rsync's, and not byte-compatible with it.** A batch
+> file `grsync --write-batch` produces can only be read back by
+> `grsync --read-batch`; it is not a substitute for, and cannot be mixed
+> with, a real `rsync --write-batch`/`--read-batch` file in either
+> direction. If what you actually need is a batch file usable by (or
+> produced by) the real `rsync` binary, this feature does not provide
+> that, and nothing described below changes that fact.
+
+### Why: the same tension SC-6/SC-9/SC-16 already disclosed, made explicit
+
+This ticket's own brief asked for something genuinely different in kind
+from every other wire-touching ticket so far: not just "grsync talking
+to grsync" (already the disclosed scope of the gob-based protocol SC-16
+introduced, SC-6's daemon mode and SC-9's compression both built on top
+of), but literal byte-format interoperability with the real C
+implementation. Verified against real rsync's own source
+(`batch.c`) before writing any code, not assumed: a real `--write-batch`
+file is not a separate serialization format at all - `batch_fd` is
+wired directly into the exact same low-level protocol I/O functions
+(`write_int`, `write_sum_head`, ...) the live network connection uses.
+Concretely, a real batch file:
+
+- Is the literal multiplexed rsync wire-protocol byte stream, tied to a
+  specific negotiated protocol version (rsync refuses to read a batch
+  written by an incompatible one - "batch files changed format in
+  version 2.6.3")
+- Forces old-school MD4/MD5 checksums and classic zlib compression
+  regardless of what a modern rsync would otherwise negotiate ("not
+  compatible with newer compression choices such as zstd or lz4")
+- Encodes a bitmap of which data-stream-affecting flags were in effect
+  when it was written, since the reader must reconstruct the exact same
+  interpretation context
+
+Genuine byte-compatibility, in other words, **is** reimplementing real
+rsync's actual wire protocol - the exact effort SC-6, SC-9, and SC-16
+each separately, deliberately declined to take on. Presented as an
+explicit decision point (not defaulted into) and resolved in favor of
+grsync's own format: reusing the existing gob-based delta
+representation, consistent with every other wire-format decision this
+project has made, rather than a large, separate undertaking that would
+arguably deserve its own dedicated ticket(s) if ever pursued.
+
+### What a batch file actually is
+
+A pleasant consequence of grsync's existing architecture: `Sender` only
+ever *writes* two message types to its connection - `FrameFileList`
+once, then `FrameDelta` per regular file (everything else on that
+connection flows the other way, from `Receiver`'s own signature
+requests). A grsync batch file is exactly a byte-for-byte copy of that
+one-directional stream, captured with the exact same
+`transport.WriteFrame`/`ReadFrame` functions already used for the live
+wire - not a new, separate format needing its own codec at all.
+
+- **`--write-batch=FILE`** performs a real sync (matching real rsync's
+  own plain `--write-batch`, which also updates its own destination -
+  unlike `--only-write-batch`, not implemented here, see below) *and*
+  tees `Sender`'s output into FILE via `io.MultiWriter`, installed after
+  any transport handshake completes so the batch never contains
+  handshake bytes. Requires exactly one source (a batch file's single
+  `FrameFileList` corresponds to exactly one `Sender`/`Receiver`
+  session; concatenating more would leave `--read-batch`'s single
+  `recvFileList` call unable to replay anything past the first).
+- **`--read-batch=FILE`** reuses `pipeline.Receiver` **completely
+  unchanged** - exactly what the ticket asked for. `Receiver` has no
+  idea, and no need to know, whether its `io.ReadWriter` is a live
+  connection or a replayed file: its own signature writes go to
+  `io.Discard` (there is no live sender to read them, and none is
+  needed - the recorded deltas were already computed against a real
+  signature at write-batch time), and its delta reads come from FILE
+  instead of a socket, in exactly the order `Sender` originally wrote
+  them. `FILE` may be `-` to read from stdin, matching real rsync's own
+  `--read-batch=-` convention (a CLI ergonomics choice, not a format
+  compatibility claim).
+
+### Verified interactions, not assumed
+
+- **Multiple receivers** (the ticket's own stated purpose - "applied
+  offline to multiple identical receivers"): one `--write-batch` run's
+  output file can be replayed via `--read-batch` against any number of
+  separate destinations independently.
+  `TestE2E_BatchUsableAgainstMultipleReceivers` proves this against
+  three.
+- **`--dry-run` + `--write-batch`**: verified against real rsync's own
+  source (`options.c`: `else if (dry_run) write_batch = 0`) rather than
+  assumed - real rsync **silently disables** batch writing entirely
+  under `--dry-run`, since a dry run never computes a real delta to
+  capture. grsync replicates that exact behavior, but - consistent with
+  this project's own preference for disclosure over silence - prints an
+  explicit one-time note rather than leaving it fully silent.
+- **`--dry-run` + `--read-batch`**: needed no special-casing at all and
+  received none - `Receiver` already treats planning and writing as
+  separate concerns regardless of where its bytes came from, so this is
+  just an ordinary dry-run receive: full itemize planning, zero
+  destination writes.
+- **A sync that fails partway through `--write-batch`**: the batch file
+  is removed entirely, not left behind truncated - a self-review finding
+  fixed before this shipped, since a half-written batch file would look
+  like a real deliverable but could only ever fail (or silently
+  under-apply) on a later replay.
+  `TestE2E_WriteBatchRemovedWhenSyncFailsPartway` locks this in.
+- **A malformed or foreign `--read-batch` file** (garbage bytes, a
+  truncated genuine batch, or a real-rsync-produced one) fails with a
+  clear, ordinary error from the same frame-decoding machinery a live
+  sync already relies on to reject a corrupted connection - there is no
+  separate batch-format validator to bypass, because there is no
+  separate batch format at all.
+  `TestE2E_ReadBatchOfMalformedFileFailsClearly` and
+  `TestE2E_ReadBatchOfTruncatedFileFailsClearly` both confirm a clean
+  error, not a panic or silent misbehavior.
+- **`--compress`** composes transparently: the batch file is a capture
+  of the same `deltaMessage` frames `Sender` always produces, which
+  already carry their own `Compressed` marker (see
+  [Compression](#compression)) - `Receiver` decompresses identically
+  regardless of whether those bytes came from a live connection or a
+  replayed file.
+
+### Across transports, and explicit scope reductions
+
+- **Local and SSH**: fully supported, via the same tap mechanism in
+  both cases (`io.MultiWriter` around whichever `io.Writer` `Sender`
+  would otherwise write to). Verified over a real SSH connection to
+  `127.0.0.1` by `TestE2E_WriteBatchOverRealSSH` (skipped gracefully
+  without a local `sshd`).
+- **`rsync://` daemon destinations**: **rejected outright** with a clear
+  error, not silently producing an empty or corrupt batch. Unlike SSH,
+  there is no clean tap point: `Sender`'s writes to a daemon connection
+  share the same `net.Conn` the greeting/auth handshake already used
+  (see `daemon.DialClient`), so isolating only the batch-worthy frames
+  would need real `internal/daemon` changes, not just a wrapped
+  `io.Writer` at the `internal/cli` call site the way the local/SSH
+  cases use.
+- **`--only-write-batch`** (skip updating the initial destination,
+  batch-only) and the companion `FILE.sh` replay script real rsync's own
+  `--write-batch` also produces are both **not implemented** - genuine,
+  disclosed scope reductions rather than silent gaps: this ticket's own
+  brief asked for `--write-batch`/`--read-batch` specifically, and a
+  Bourne-shell companion script doesn't map cleanly onto a tool that
+  also runs natively on Windows.
 
 ## rsync Daemon Mode
 
