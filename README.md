@@ -139,6 +139,12 @@ Real rsync scales its block size with file size; grsync currently uses a
 fixed block size, which is simpler but slightly less efficient on very
 large files.
 
+Re-syncing after a small change to an already-synced file only transfers
+the changed part, not the whole file again - here, appending one line to a
+130KB file re-sends 571 bytes instead of 130,071:
+
+![Re-sync after a small change, run on two real EC2 instances](docs/images/resync-after-change.png)
+
 ## What's preserved
 
 `--perms`, `--times`, `--owner`, `--group`, and `--links` each control one
@@ -203,6 +209,11 @@ the network. grsync has no such shortcut - it always runs the full delta
 comparison, dry run or not - so grsync's dry run does more work over the
 wire than real rsync's does, even though neither one writes to disk.
 
+`-n -i` together preview exactly what a real run would change, without
+changing anything:
+
+![Dry-run with itemize output, previewing a change before it's applied](docs/images/dry-run-itemize.png)
+
 ## Progress and Stats
 
 `--progress` prints a live line per file as it's written to disk, and
@@ -214,6 +225,8 @@ doesn't fire during `--dry-run` for the same reason; `--stats` isn't
 affected, since all its numbers come from planning data that a dry run
 still computes.
 
+![Live --progress output syncing three files to a remote host](docs/images/progress-output.png)
+
 ## Compression
 
 `--compress`/`-z` compresses a file's changed data with zlib before
@@ -221,6 +234,8 @@ sending it; `--compress-level` (1-9, default 6) and `--skip-compress`
 (a suffix list of already-compressed formats to leave alone) match real
 rsync's own documented behavior. If compressing wouldn't actually shrink
 the data, grsync sends it uncompressed instead.
+
+![Compressed sync with --stats showing the reduced bytes sent](docs/images/compression.png)
 
 ## Partial and Append Transfers
 
@@ -272,6 +287,8 @@ behavior.
 ```sh
 grsync --daemon --config rsyncd.conf --port 8730
 ```
+
+![Daemon started on one EC2 instance, synced to from another over rsync://](docs/images/daemon-transport.png)
 
 ### rsyncd.conf
 

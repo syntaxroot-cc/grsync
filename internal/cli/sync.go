@@ -352,7 +352,14 @@ func syncToRemote(rsh, src string, remote transport.RemotePath, walkOpts sync.Wa
 	}
 
 	if err := transport.Handshake(session); err != nil {
-		_ = session.Close()
+		if closeErr := session.Close(); closeErr != nil {
+			// The subprocess itself exited with an error - Session.Close
+			// already captured its stderr, which is almost always more
+			// useful here than the frame-level EOF the handshake saw as a
+			// downstream symptom of that same failure (e.g. the remote
+			// shell couldn't find or run the target command at all).
+			return fmt.Errorf("handshake with %s failed: remote command may have failed (%s)", remote.Host, closeErr)
+		}
 		return fmt.Errorf("handshake with %s failed: %w", remote.Host, err)
 	}
 
