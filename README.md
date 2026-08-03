@@ -120,6 +120,7 @@ Flags are grouped the same way `grsync --help` groups them.
 | `--delete` | | delete extraneous files from destination |
 
 ## How syncing works
+![alt text](<docs/images/--help output.png>)
 
 For each file, grsync avoids re-sending data that hasn't changed:
 
